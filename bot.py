@@ -412,6 +412,13 @@ def main():
     init_db()
     state = load_state()
     state = reset_daily_counters_if_needed(state)
+    # One-time backfill: if we have an open position but no last_trade_day,
+# assume the entry was "today" for tracking/cooldown purposes.
+if state.get("position") is not None and state.get("last_trade_day") is None:
+    state["last_trade_day"] = utc_today_date()
+    state["trades_today"] = max(int(state.get("trades_today", 0)), 1)
+    state["last_trade_ts"] = state.get("last_trade_ts") or datetime.now(timezone.utc)
+
 
     closes = fetch_btc_closes_5m(LOOKBACK)
     if closes is None:

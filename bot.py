@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime, timezone, timedelta, date
+from typing import Optional, Tuple
 
 import requests
 import psycopg2
@@ -40,8 +41,12 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def utc_now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def utc_today_date() -> date:
-    return datetime.now(timezone.utc).date()
+    return utc_now_dt().date()
 
 
 def db_conn():
@@ -52,21 +57,19 @@ def db_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
-def _as_date(value) -> date | None:
-    """Normalize DB date-ish values (date or string) to a date."""
+def _as_date(value) -> Optional[date]:
     if value is None:
         return None
     if isinstance(value, date):
         return value
     try:
-        # value could be 'YYYY-MM-DD'
         return datetime.fromisoformat(str(value)).date()
     except Exception:
         return None
 
 
 def init_db():
-    """Create tables if they don't exist, and evolve schema for Day 2 controls."""
+    """Create tables if they don't exist, and evolve schema."""
     with db_conn() as conn:
         with conn.cursor() as cur:
             # Base tables
@@ -82,6 +85,7 @@ def init_db():
             );
             """
             )
+
             cur.execute(
                 """
             CREATE TABLE IF NOT EXISTS paper_trades (
@@ -97,7 +101,7 @@ def init_db():
             """
             )
 
-            # Day 2 columns (safe to run repeatedly)
+            # Day 2 columns
             cur.execute(
                 "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_ts TIMESTAMPTZ;"
             )
@@ -109,6 +113,23 @@ def init_db():
             )
             cur.execute(
                 "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS realized_pnl_today DOUBLE PRECISION NOT NULL DEFAULT 0;"
+            )
+
+            # Day 3 snapshots table
+            cur.execute(
+                """
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+              snapshot_id BIGSERIAL PRIMARY KEY,
+              ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              price DOUBLE PRECISION NOT NULL,
+              balance DOUBLE PRECISION NOT NULL,
+              position TEXT NULL,
+              entry_price DOUBLE PRECISION NULL,
+              stake DOUBLE PRECISION NOT NULL,
+              unrealized_pnl DOUBLE PRECISION NOT NULL,
+              equity DOUBLE PRECISION NOT NULL
+            );
+            """
             )
 
         conn.commit()
@@ -194,10 +215,7 @@ def log_trade(action, side=None, price=None, stake=None, fee=None, pnl=None):
 
 
 def reset_daily_counters_if_needed(state: dict) -> dict:
-    """
-    Reset trades_today and realized_pnl_today when UTC day changes.
-    We track the day using paper_state.last_trade_day.
-    """
+    """Reset trades_today and realized_pnl_today when UTC day changes."""
     today = utc_today_date()
     last_day = _as_date(state.get("last_trade_day"))
 
@@ -213,8 +231,7 @@ def cooldown_active(state: dict, cooldown_minutes: int) -> bool:
     ts = state.get("last_trade_ts")
     if ts is None:
         return False
-    # psycopg2 returns tz-aware datetime; compare in UTC
-    now = datetime.now(timezone.utc)
+    now = utc_now_dt()
     return now < (ts + timedelta(minutes=cooldown_minutes))
 
 
@@ -279,11 +296,18 @@ def decide(closes):
 
 
 def calc_pnl(entry_price: float, exit_price: float, side: str, stake: float) -> float:
+    """Directional paper PnL model."""
     if entry_price <= 0:
         return 0.0
     pct_move = (exit_price - entry_price) / entry_price
     direction = 1.0 if side == "YES" else -1.0
     return stake * pct_move * direction
+
+
+def calc_unrealized_pnl(position: Optional[str], entry_price: Optional[float], current_price: float, stake: float) -> float:
+    if position is None or entry_price is None or stake <= 0:
+        return 0.0
+    return calc_pnl(entry_price, current_price, position, stake)
 
 
 def paper_trade(
@@ -300,6 +324,7 @@ def paper_trade(
 ):
     """
     Executes a paper trade step. Updates daily counters ONLY on ENTER/EXIT.
+    realized_pnl_today is realized-only (changes only on EXIT).
     """
     if signal == "HOLD":
         return (
@@ -314,7 +339,7 @@ def paper_trade(
             realized_pnl_today,
         )
 
-    now_ts = datetime.now(timezone.utc)
+    now_ts = utc_now_dt()
     today = utc_today_date()
 
     # Enter if flat
@@ -339,7 +364,6 @@ def paper_trade(
 
         log_trade("ENTER", side=position, price=current_price, stake=stake, fee=FEE_PER_TRADE)
 
-        # Day 2 tracking
         trades_today += 1
         last_trade_ts = now_ts
         last_trade_day = today
@@ -370,8 +394,7 @@ def paper_trade(
             pnl=pnl,
         )
 
-        # Day 2 tracking
-        realized_pnl_today += pnl
+        realized_pnl_today += pnl  # realized ONLY
         trades_today += 1
         last_trade_ts = now_ts
         last_trade_day = today
@@ -406,19 +429,133 @@ def paper_trade(
 
 
 # =========================
+# PERFORMANCE (Day 3)
+# =========================
+def record_equity_snapshot(
+    price: float,
+    balance: float,
+    position: Optional[str],
+    entry_price: Optional[float],
+    stake: float,
+    unrealized_pnl: float,
+    equity: float,
+):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+            INSERT INTO equity_snapshots
+              (price, balance, position, entry_price, stake, unrealized_pnl, equity)
+            VALUES
+              (%s, %s, %s, %s, %s, %s, %s);
+            """,
+                (price, balance, position, entry_price, stake, unrealized_pnl, equity),
+            )
+        conn.commit()
+
+
+def get_realized_pnl_24h_and_trades_24h() -> Tuple[float, int]:
+    """Realized PnL over last 24h (EXIT pnl sum), and trade count (ENTER+EXIT) over last 24h."""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+            SELECT
+              COALESCE(SUM(CASE WHEN action='EXIT' THEN pnl ELSE 0 END), 0) AS pnl_24h,
+              COUNT(*)::int AS trades_24h
+            FROM paper_trades
+            WHERE ts >= (NOW() - INTERVAL '24 hours');
+            """
+            )
+            row = cur.fetchone()
+            pnl_24h = float(row[0] or 0.0)
+            trades_24h = int(row[1] or 0)
+            return pnl_24h, trades_24h
+
+
+def get_winrate_last_n_exits(n: int = 20) -> Optional[float]:
+    """Win rate over last N EXIT trades (pnl > 0). Returns 0..1, or None if no exits."""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+            SELECT pnl
+            FROM paper_trades
+            WHERE action='EXIT' AND pnl IS NOT NULL
+            ORDER BY ts DESC
+            LIMIT %s;
+            """,
+                (n,),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
+        return None
+
+    pnls = [float(r[0]) for r in rows]
+    wins = sum(1 for p in pnls if p > 0)
+    return wins / len(pnls)
+
+
+def get_drawdown_24h() -> Optional[float]:
+    """
+    Max drawdown over last 24h based on equity snapshots.
+    Returns drawdown as a positive number (e.g., 12.34 means -$12.34 from peak).
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+            SELECT ts, equity
+            FROM equity_snapshots
+            WHERE ts >= (NOW() - INTERVAL '24 hours')
+            ORDER BY ts ASC;
+            """
+            )
+            rows = cur.fetchall()
+
+    if len(rows) < 2:
+        return None
+
+    peak = float(rows[0][1])
+    max_dd = 0.0
+    for _, eq in rows:
+        eq = float(eq)
+        if eq > peak:
+            peak = eq
+        dd = peak - eq
+        if dd > max_dd:
+            max_dd = dd
+
+    return max_dd
+
+
+# =========================
 # MAIN
 # =========================
 def main():
     init_db()
     state = load_state()
     state = reset_daily_counters_if_needed(state)
-    # One-time backfill: if we have an open position but no last_trade_day,
-# assume the entry was "today" for tracking/cooldown purposes.
-if state.get("position") is not None and state.get("last_trade_day") is None:
-    state["last_trade_day"] = utc_today_date()
-    state["trades_today"] = max(int(state.get("trades_today", 0)), 1)
-    state["last_trade_ts"] = state.get("last_trade_ts") or datetime.now(timezone.utc)
 
+    # One-time backfill: if we have an open position but no last_trade_day,
+    # assume the entry was "today" for tracking/cooldown purposes.
+    if state.get("position") is not None and state.get("last_trade_day") is None:
+        state["last_trade_day"] = utc_today_date()
+        state["trades_today"] = max(int(state.get("trades_today", 0)), 1)
+        state["last_trade_ts"] = state.get("last_trade_ts") or utc_now_dt()
+
+        # persist the backfilled state immediately
+        save_state(
+            balance=float(state["balance"]),
+            position=state["position"],
+            entry_price=float(state["entry_price"]) if state["entry_price"] is not None else None,
+            stake=float(state["stake"]),
+            last_trade_ts=state.get("last_trade_ts"),
+            last_trade_day=_as_date(state.get("last_trade_day")),
+            trades_today=int(state.get("trades_today", 0)),
+            realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
+        )
 
     closes = fetch_btc_closes_5m(LOOKBACK)
     if closes is None:
@@ -439,7 +576,22 @@ if state.get("position") is not None and state.get("last_trade_day") is None:
     trades_today = int(state.get("trades_today", 0))
     realized_pnl_today = float(state.get("realized_pnl_today", 0.0))
 
-    # Gate trading if we would take an action (YES/NO), with Day 2 risk controls
+    # Day 3: compute unrealized + equity (pnl_today stays realized-only)
+    unrealized_pnl = calc_unrealized_pnl(position, entry_price, current_price, stake)
+    equity = balance + unrealized_pnl
+
+    # Record snapshot every run (for drawdown and 24h stats)
+    record_equity_snapshot(
+        price=current_price,
+        balance=balance,
+        position=position,
+        entry_price=entry_price,
+        stake=stake,
+        unrealized_pnl=unrealized_pnl,
+        equity=equity,
+    )
+
+    # Gate trading (Day 2 controls)
     blocked_reason = None
     if signal in ("YES", "NO"):
         if realized_pnl_today <= -MAX_DAILY_LOSS:
@@ -460,10 +612,22 @@ if state.get("position") is not None and state.get("last_trade_day") is None:
             trades_today=trades_today,
             realized_pnl_today=realized_pnl_today,
         )
+
+        pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
+        winrate20 = get_winrate_last_n_exits(20)
+        dd_24h = get_drawdown_24h()
+
         print(
             f"{utc_now_iso()} | price={current_price:.2f} | "
             f"signal={signal} | action=BLOCKED | reason={blocked_reason} | "
             f"balance={balance:.2f} | pos={position} | entry={entry_price}"
+        )
+        print(
+            f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
+            f"pnl_today(realized)={realized_pnl_today:.2f} | pnl_24h(realized)={pnl_24h:.2f} | "
+            f"trades_today={trades_today} | trades_24h={trades_24h} | "
+            f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
+            f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')}"
         )
         return
 
@@ -501,11 +665,25 @@ if state.get("position") is not None and state.get("last_trade_day") is None:
         realized_pnl_today=realized_pnl_today,
     )
 
+    # Recompute unrealized/equity after possible trade
+    unrealized_pnl = calc_unrealized_pnl(position, entry_price, current_price, stake)
+    equity = balance + unrealized_pnl
+
+    pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
+    winrate20 = get_winrate_last_n_exits(20)
+    dd_24h = get_drawdown_24h()
+
     print(
         f"{utc_now_iso()} | price={current_price:.2f} | "
         f"signal={signal} | action={action} | "
         f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-        f"trades_today={trades_today} | pnl_today={realized_pnl_today:.2f}"
+        f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f}"
+    )
+    print(
+        f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
+        f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
+        f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
+        f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')}"
     )
 
 

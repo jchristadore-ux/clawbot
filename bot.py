@@ -83,14 +83,13 @@ def save_state(state):
 # =========================
 def fetch_btc_closes_5m(lookback: int):
     """
-    CoinGecko market_chart returns many points; we take the last `lookback` prices.
-    Response shape: {"prices": [[ts_ms, price], ...], ...}
+    Fetch last `lookback` 5-minute closes from Kraken (free/public).
+    Kraken OHLC docs: /0/public/OHLC
     """
-    url = f"https://api.coingecko.com/api/v3/coins/{SYMBOL}/market_chart"
+    url = "https://api.kraken.com/0/public/OHLC"
     params = {
-        "vs_currency": VS_CURRENCY,
-        "days": "1",
-        "interval": "5m"
+        "pair": "XBTUSD",
+        "interval": 5  # 5-minute candles
     }
 
     last_error = None
@@ -99,19 +98,33 @@ def fetch_btc_closes_5m(lookback: int):
             r = requests.get(url, params=params, timeout=TIMEOUT_SEC)
             if r.status_code != 200:
                 last_error = f"HTTP {r.status_code}: {r.text[:200]}"
-                # Small backoff
                 time.sleep(1.5 * attempt)
                 continue
 
             data = r.json()
-            prices = data.get("prices", None)
 
-            if not isinstance(prices, list) or len(prices) < lookback:
-                last_error = f"Bad prices shape or insufficient points. prices_len={len(prices) if isinstance(prices, list) else 'n/a'}"
+            if data.get("error"):
+                last_error = f"Kraken error: {data['error']}"
                 time.sleep(1.0 * attempt)
                 continue
 
-            closes = [float(p[1]) for p in prices[-lookback:]]
+            result = data.get("result", {})
+            # result contains one key for the pair (e.g. "XXBTZUSD") plus "last"
+            pair_key = next((k for k in result.keys() if k != "last"), None)
+            if not pair_key or not isinstance(result.get(pair_key), list):
+                last_error = f"Unexpected result shape: {str(data)[:200]}"
+                time.sleep(1.0 * attempt)
+                continue
+
+            candles = result[pair_key]
+            if len(candles) < lookback:
+                last_error = f"Not enough candles: {len(candles)}"
+                time.sleep(1.0 * attempt)
+                continue
+
+            # Candle format:
+            # [ time, open, high, low, close, vwap, volume, count ]
+            closes = [float(c[4]) for c in candles[-lookback:]]
             return closes
 
         except Exception as e:
@@ -120,7 +133,6 @@ def fetch_btc_closes_5m(lookback: int):
 
     print(f"{utc_now_iso()} | WARN | Price fetch failed after retries: {last_error}")
     return None
-
 
 # =========================
 # STRATEGY

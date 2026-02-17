@@ -102,3 +102,150 @@ def fetch_btc_closes_5m(lookback: int):
                 # Small backoff
                 time.sleep(1.5 * attempt)
                 continue
+
+            data = r.json()
+            prices = data.get("prices", None)
+
+            if not isinstance(prices, list) or len(prices) < lookback:
+                last_error = f"Bad prices shape or insufficient points. prices_len={len(prices) if isinstance(prices, list) else 'n/a'}"
+                time.sleep(1.0 * attempt)
+                continue
+
+            closes = [float(p[1]) for p in prices[-lookback:]]
+            return closes
+
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(1.5 * attempt)
+
+    print(f"{utc_now_iso()} | WARN | Price fetch failed after retries: {last_error}")
+    return None
+
+
+# =========================
+# STRATEGY
+# =========================
+def decide(closes):
+    """
+    Simple rule:
+    - If last close > avg * UP_THRESHOLD => YES
+    - If last close < avg * DOWN_THRESHOLD => NO
+    - Else HOLD
+    """
+    avg = sum(closes) / len(closes)
+    last = closes[-1]
+
+    if last > avg * UP_THRESHOLD:
+        return "YES"
+    if last < avg * DOWN_THRESHOLD:
+        return "NO"
+    return "HOLD"
+
+
+# =========================
+# PAPER TRADING ENGINE
+# =========================
+def calc_pnl(entry_price: float, exit_price: float, side: str, stake: float) -> float:
+    """
+    Paper PnL model (simple directional exposure):
+    YES = long BTC; NO = short BTC
+
+    We scale PnL by stake in a simple way:
+    pnl = stake * (% move) * direction
+    """
+    if entry_price <= 0:
+        return 0.0
+    pct_move = (exit_price - entry_price) / entry_price
+    direction = 1.0 if side == "YES" else -1.0
+    return stake * pct_move * direction
+
+
+def paper_trade(state, signal, current_price):
+    """
+    Enter when flat and signal is YES/NO
+    Exit when in a position and signal flips to the opposite side
+    HOLD does nothing
+    """
+    # No action on HOLD
+    if signal == "HOLD":
+        return state, "HOLD"
+
+    pos = state["position"]
+
+    # Enter if flat
+    if pos is None:
+        if state["balance"] < TRADE_SIZE:
+            return state, "SKIP_INSUFFICIENT_BALANCE"
+
+        state["position"] = signal
+        state["entry_price"] = current_price
+        state["stake"] = TRADE_SIZE
+        state["balance"] -= (TRADE_SIZE + FEE_PER_TRADE)
+
+        state["history"].append({
+            "time": utc_now_iso(),
+            "action": "ENTER",
+            "side": signal,
+            "price": current_price,
+            "stake": TRADE_SIZE,
+            "fee": FEE_PER_TRADE
+        })
+        return state, f"ENTER_{signal}"
+
+    # If in position, exit only if opposite signal
+    if pos is not None and signal != pos:
+        entry = float(state["entry_price"])
+        stake = float(state.get("stake", TRADE_SIZE))
+
+        pnl = calc_pnl(entry, current_price, pos, stake)
+
+        # Return stake + pnl to balance, subtract fee
+        state["balance"] += (stake + pnl - FEE_PER_TRADE)
+
+        state["history"].append({
+            "time": utc_now_iso(),
+            "action": "EXIT",
+            "side": pos,
+            "price": current_price,
+            "pnl": pnl,
+            "stake": stake,
+            "fee": FEE_PER_TRADE
+        })
+
+        state["position"] = None
+        state["entry_price"] = None
+        state["stake"] = 0.0
+
+        return state, f"EXIT_{pos}"
+
+    return state, "HOLD_SAME_SIDE"
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    ensure_state_dir()
+    state = load_state()
+
+    closes = fetch_btc_closes_5m(LOOKBACK)
+    if closes is None:
+        # Exit cleanly so Railway doesn't crash-loop
+        print(f"{utc_now_iso()} | INFO | No data this run. balance={state['balance']:.2f} pos={state['position']}")
+        return
+
+    signal = decide(closes)
+    current_price = closes[-1]
+
+    state, action = paper_trade(state, signal, current_price)
+    save_state(state)
+
+    print(
+        f"{utc_now_iso()} | price={current_price:.2f} | "
+        f"signal={signal} | action={action} | "
+        f"balance={state['balance']:.2f} | pos={state['position']} | entry={state['entry_price']}"
+    )
+
+
+if __name__ == "__main__":
+    main()

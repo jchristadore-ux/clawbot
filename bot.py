@@ -28,6 +28,15 @@ MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8"))
 
+# Day 4 Polymarket-style probability mode (D)
+PROB_MODE = os.getenv("PROB_MODE", "true").lower() == "true"
+PROB_P_MIN = float(os.getenv("PROB_P_MIN", "0.05"))
+PROB_P_MAX = float(os.getenv("PROB_P_MAX", "0.95"))
+PROB_Z_SCALE = float(os.getenv("PROB_Z_SCALE", "2.5"))
+
+# One-time state reset for Day 4 cutover
+RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
+
 # Kraken
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_PAIR = "XBTUSD"
@@ -49,6 +58,10 @@ def utc_today_date() -> date:
     return utc_now_dt().date()
 
 
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError(
@@ -68,6 +81,9 @@ def _as_date(value) -> Optional[date]:
         return None
 
 
+# =========================
+# DB
+# =========================
 def init_db():
     """Create tables if they don't exist, and evolve schema."""
     with db_conn() as conn:
@@ -115,13 +131,18 @@ def init_db():
                 "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS realized_pnl_today DOUBLE PRECISION NOT NULL DEFAULT 0;"
             )
 
-            # Day 3 snapshots table
+            # Day 4: store a last_mark (we'll store YES mark here)
+            cur.execute(
+                "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_mark DOUBLE PRECISION;"
+            )
+
+            # Snapshots (store mark=YES mark for drawdown window)
             cur.execute(
                 """
             CREATE TABLE IF NOT EXISTS equity_snapshots (
               snapshot_id BIGSERIAL PRIMARY KEY,
               ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              price DOUBLE PRECISION NOT NULL,
+              mark DOUBLE PRECISION NOT NULL,
               balance DOUBLE PRECISION NOT NULL,
               position TEXT NULL,
               entry_price DOUBLE PRECISION NULL,
@@ -149,9 +170,9 @@ def load_state():
                 """
             INSERT INTO paper_state (
                 id, balance, position, entry_price, stake,
-                last_trade_ts, last_trade_day, trades_today, realized_pnl_today
+                last_trade_ts, last_trade_day, trades_today, realized_pnl_today, last_mark
             )
-            VALUES (1, %s, NULL, NULL, 0.0, NULL, NULL, 0, 0.0)
+            VALUES (1, %s, NULL, NULL, 0.0, NULL, NULL, 0, 0.0, NULL)
             RETURNING *;
             """,
                 (START_BALANCE,),
@@ -170,6 +191,7 @@ def save_state(
     last_trade_day,
     trades_today,
     realized_pnl_today,
+    last_mark,
 ):
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -184,6 +206,7 @@ def save_state(
                 last_trade_day=%s,
                 trades_today=%s,
                 realized_pnl_today=%s,
+                last_mark=%s,
                 updated_at=NOW()
             WHERE id=1;
             """,
@@ -196,6 +219,7 @@ def save_state(
                     last_trade_day,
                     trades_today,
                     realized_pnl_today,
+                    last_mark,
                 ),
             )
         conn.commit()
@@ -295,106 +319,109 @@ def decide(closes):
     return "HOLD"
 
 
-def calc_pnl(entry_price: float, exit_price: float, side: str, stake: float) -> float:
-    """Directional paper PnL model."""
-    if entry_price <= 0:
+# =========================
+# PROBABILITY MODE (Day 4)
+# =========================
+def prob_from_closes(closes) -> float:
+    """
+    Map last vs avg into a 0..1 probability-like price.
+    Linear mapping, scaled by PROB_Z_SCALE, then clamped.
+    """
+    avg = sum(closes) / len(closes)
+    last = closes[-1]
+    if avg <= 0:
+        return 0.5
+    dev = (last - avg) / avg  # e.g., 0.002 = +0.2%
+    p = 0.5 + (dev * PROB_Z_SCALE)
+    return clamp(p, PROB_P_MIN, PROB_P_MAX)
+
+
+def shares_for_stake(stake: float, price: float) -> float:
+    """Shares purchased with dollars at a given probability price."""
+    if price <= 0:
         return 0.0
-    pct_move = (exit_price - entry_price) / entry_price
-    direction = 1.0 if side == "YES" else -1.0
-    return stake * pct_move * direction
+    return stake / price
 
 
-def calc_unrealized_pnl(position: Optional[str], entry_price: Optional[float], current_price: float, stake: float) -> float:
+def calc_unrealized_pnl_polymarket(position: Optional[str], entry_price: Optional[float], mark: float, stake: float) -> float:
+    """
+    Polymarket-style mark-to-market:
+      shares = stake / entry_price
+      value_now = shares * mark
+      uPnL = value_now - stake
+    """
     if position is None or entry_price is None or stake <= 0:
         return 0.0
-    return calc_pnl(entry_price, current_price, position, stake)
+    sh = shares_for_stake(stake, entry_price)
+    value_now = sh * mark
+    return value_now - stake
 
 
-def paper_trade(
+def calc_realized_pnl_polymarket(entry_price: float, exit_price: float, stake: float) -> float:
+    sh = shares_for_stake(stake, entry_price)
+    value_exit = sh * exit_price
+    return value_exit - stake
+
+
+def paper_trade_prob(
     balance,
     position,
     entry_price,
     stake,
     signal,
-    current_price,
+    mark_yes,
+    mark_no,
     last_trade_ts,
     last_trade_day,
     trades_today,
     realized_pnl_today,
 ):
     """
-    Executes a paper trade step. Updates daily counters ONLY on ENTER/EXIT.
-    realized_pnl_today is realized-only (changes only on EXIT).
+    Paper trade using probability prices (0..1) like Polymarket.
+    Option 1: NO is tracked directly as its own price (entry_price stores NO price when pos=NO).
     """
     if signal == "HOLD":
         return (
-            balance,
-            position,
-            entry_price,
-            stake,
-            "HOLD",
-            last_trade_ts,
-            last_trade_day,
-            trades_today,
-            realized_pnl_today,
+            balance, position, entry_price, stake, "HOLD",
+            last_trade_ts, last_trade_day, trades_today, realized_pnl_today
         )
 
     now_ts = utc_now_dt()
     today = utc_today_date()
 
-    # Enter if flat
+    # ENTER if flat
     if position is None:
         if balance < (TRADE_SIZE + FEE_PER_TRADE):
             return (
-                balance,
-                position,
-                entry_price,
-                stake,
-                "SKIP_INSUFFICIENT_BALANCE",
-                last_trade_ts,
-                last_trade_day,
-                trades_today,
-                realized_pnl_today,
+                balance, position, entry_price, stake, "SKIP_INSUFFICIENT_BALANCE",
+                last_trade_ts, last_trade_day, trades_today, realized_pnl_today
             )
 
         balance -= (TRADE_SIZE + FEE_PER_TRADE)
         position = signal
-        entry_price = current_price
         stake = TRADE_SIZE
+        entry_price = mark_yes if position == "YES" else mark_no
 
-        log_trade("ENTER", side=position, price=current_price, stake=stake, fee=FEE_PER_TRADE)
+        log_trade("ENTER", side=position, price=entry_price, stake=stake, fee=FEE_PER_TRADE)
 
         trades_today += 1
         last_trade_ts = now_ts
         last_trade_day = today
 
         return (
-            balance,
-            position,
-            entry_price,
-            stake,
-            f"ENTER_{signal}",
-            last_trade_ts,
-            last_trade_day,
-            trades_today,
-            realized_pnl_today,
+            balance, position, entry_price, stake, f"ENTER_{signal}",
+            last_trade_ts, last_trade_day, trades_today, realized_pnl_today
         )
 
-    # Exit if opposite signal
+    # EXIT if opposite signal
     if signal != position:
-        pnl = calc_pnl(entry_price, current_price, position, stake)
+        exit_price = mark_yes if position == "YES" else mark_no
+        pnl = calc_realized_pnl_polymarket(entry_price, exit_price, stake)
+
         balance += (stake + pnl - FEE_PER_TRADE)
+        log_trade("EXIT", side=position, price=exit_price, stake=stake, fee=FEE_PER_TRADE, pnl=pnl)
 
-        log_trade(
-            "EXIT",
-            side=position,
-            price=current_price,
-            stake=stake,
-            fee=FEE_PER_TRADE,
-            pnl=pnl,
-        )
-
-        realized_pnl_today += pnl  # realized ONLY
+        realized_pnl_today += pnl  # realized only
         trades_today += 1
         last_trade_ts = now_ts
         last_trade_day = today
@@ -404,27 +431,13 @@ def paper_trade(
         stake = 0.0
 
         return (
-            balance,
-            position,
-            entry_price,
-            stake,
-            "EXIT",
-            last_trade_ts,
-            last_trade_day,
-            trades_today,
-            realized_pnl_today,
+            balance, position, entry_price, stake, "EXIT",
+            last_trade_ts, last_trade_day, trades_today, realized_pnl_today
         )
 
     return (
-        balance,
-        position,
-        entry_price,
-        stake,
-        "HOLD_SAME_SIDE",
-        last_trade_ts,
-        last_trade_day,
-        trades_today,
-        realized_pnl_today,
+        balance, position, entry_price, stake, "HOLD_SAME_SIDE",
+        last_trade_ts, last_trade_day, trades_today, realized_pnl_today
     )
 
 
@@ -432,7 +445,7 @@ def paper_trade(
 # PERFORMANCE (Day 3)
 # =========================
 def record_equity_snapshot(
-    price: float,
+    mark: float,
     balance: float,
     position: Optional[str],
     entry_price: Optional[float],
@@ -445,17 +458,16 @@ def record_equity_snapshot(
             cur.execute(
                 """
             INSERT INTO equity_snapshots
-              (price, balance, position, entry_price, stake, unrealized_pnl, equity)
+              (mark, balance, position, entry_price, stake, unrealized_pnl, equity)
             VALUES
               (%s, %s, %s, %s, %s, %s, %s);
             """,
-                (price, balance, position, entry_price, stake, unrealized_pnl, equity),
+                (mark, balance, position, entry_price, stake, unrealized_pnl, equity),
             )
         conn.commit()
 
 
 def get_realized_pnl_24h_and_trades_24h() -> Tuple[float, int]:
-    """Realized PnL over last 24h (EXIT pnl sum), and trade count (ENTER+EXIT) over last 24h."""
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -474,7 +486,6 @@ def get_realized_pnl_24h_and_trades_24h() -> Tuple[float, int]:
 
 
 def get_winrate_last_n_exits(n: int = 20) -> Optional[float]:
-    """Win rate over last N EXIT trades (pnl > 0). Returns 0..1, or None if no exits."""
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -498,10 +509,6 @@ def get_winrate_last_n_exits(n: int = 20) -> Optional[float]:
 
 
 def get_drawdown_24h() -> Optional[float]:
-    """
-    Max drawdown over last 24h based on equity snapshots.
-    Returns drawdown as a positive number (e.g., 12.34 means -$12.34 from peak).
-    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -536,32 +543,14 @@ def get_drawdown_24h() -> Optional[float]:
 def main():
     init_db()
     state = load_state()
-    if os.getenv("RESET_STATE", "false").lower() == "true":
-    # clear position + entry so Day 4 starts clean
-    save_state(
-        balance=float(state["balance"]),
-        position=None,
-        entry_price=None,
-        stake=0.0,
-        last_trade_ts=state.get("last_trade_ts"),
-        last_trade_day=_as_date(state.get("last_trade_day")),
-        trades_today=int(state.get("trades_today", 0)),
-        realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
-        last_mark=state.get("last_mark"),
-    )
-    print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared for Day 4.")
-    return
-
     state = reset_daily_counters_if_needed(state)
 
-    # One-time backfill: if we have an open position but no last_trade_day,
-    # assume the entry was "today" for tracking/cooldown purposes.
+    # If holding a legacy position (from old BTC-price mode) and no tracking day, backfill counters.
     if state.get("position") is not None and state.get("last_trade_day") is None:
         state["last_trade_day"] = utc_today_date()
         state["trades_today"] = max(int(state.get("trades_today", 0)), 1)
         state["last_trade_ts"] = state.get("last_trade_ts") or utc_now_dt()
 
-        # persist the backfilled state immediately
         save_state(
             balance=float(state["balance"]),
             position=state["position"],
@@ -571,7 +560,24 @@ def main():
             last_trade_day=_as_date(state.get("last_trade_day")),
             trades_today=int(state.get("trades_today", 0)),
             realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
+            last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
         )
+
+    # One-time reset switch for clean Day 4 cutover
+    if RESET_STATE:
+        save_state(
+            balance=float(state["balance"]),
+            position=None,
+            entry_price=None,
+            stake=0.0,
+            last_trade_ts=state.get("last_trade_ts"),
+            last_trade_day=_as_date(state.get("last_trade_day")),
+            trades_today=int(state.get("trades_today", 0)),
+            realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
+            last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
+        )
+        print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared for Day 4.")
+        return
 
     closes = fetch_btc_closes_5m(LOOKBACK)
     if closes is None:
@@ -579,7 +585,13 @@ def main():
         return
 
     signal = decide(closes)
-    current_price = closes[-1]
+
+    # Compute probability marks
+    p_yes = prob_from_closes(closes) if PROB_MODE else 0.5
+    p_yes = clamp(p_yes, PROB_P_MIN, PROB_P_MAX)
+    p_no = 1.0 - p_yes
+    # Mirror clamp for NO so it stays within [1-P_MAX, 1-P_MIN]
+    p_no = clamp(p_no, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
 
     # Pull state
     balance = float(state["balance"])
@@ -592,13 +604,19 @@ def main():
     trades_today = int(state.get("trades_today", 0))
     realized_pnl_today = float(state.get("realized_pnl_today", 0.0))
 
-    # Day 3: compute unrealized + equity (pnl_today stays realized-only)
-    unrealized_pnl = calc_unrealized_pnl(position, entry_price, current_price, stake)
+    # Day 4: unrealized PnL in probability space (realized pnl today stays realized-only)
+    if position == "YES":
+        unrealized_pnl = calc_unrealized_pnl_polymarket(position, entry_price, p_yes, stake)
+    elif position == "NO":
+        unrealized_pnl = calc_unrealized_pnl_polymarket(position, entry_price, p_no, stake)
+    else:
+        unrealized_pnl = 0.0
+
     equity = balance + unrealized_pnl
 
-    # Record snapshot every run (for drawdown and 24h stats)
+    # Snapshot & mark
     record_equity_snapshot(
-        price=current_price,
+        mark=p_yes,
         balance=balance,
         position=position,
         entry_price=entry_price,
@@ -607,7 +625,7 @@ def main():
         equity=equity,
     )
 
-    # Gate trading (Day 2 controls)
+    # Gate trading (Day 2)
     blocked_reason = None
     if signal in ("YES", "NO"):
         if realized_pnl_today <= -MAX_DAILY_LOSS:
@@ -627,6 +645,7 @@ def main():
             last_trade_day=last_trade_day,
             trades_today=trades_today,
             realized_pnl_today=realized_pnl_today,
+            last_mark=p_yes,
         )
 
         pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
@@ -634,14 +653,14 @@ def main():
         dd_24h = get_drawdown_24h()
 
         print(
-            f"{utc_now_iso()} | price={current_price:.2f} | "
+            f"{utc_now_iso()} | mark_yes={p_yes:.3f} | mark_no={p_no:.3f} | "
             f"signal={signal} | action=BLOCKED | reason={blocked_reason} | "
-            f"balance={balance:.2f} | pos={position} | entry={entry_price}"
+            f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
+            f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f}"
         )
         print(
             f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
-            f"pnl_today(realized)={realized_pnl_today:.2f} | pnl_24h(realized)={pnl_24h:.2f} | "
-            f"trades_today={trades_today} | trades_24h={trades_24h} | "
+            f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
             f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
             f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')}"
         )
@@ -657,13 +676,14 @@ def main():
         last_trade_day,
         trades_today,
         realized_pnl_today,
-    ) = paper_trade(
+    ) = paper_trade_prob(
         balance,
         position,
         entry_price,
         stake,
         signal,
-        current_price,
+        p_yes,
+        p_no,
         last_trade_ts,
         last_trade_day,
         trades_today,
@@ -679,10 +699,16 @@ def main():
         last_trade_day=last_trade_day,
         trades_today=trades_today,
         realized_pnl_today=realized_pnl_today,
+        last_mark=p_yes,
     )
 
     # Recompute unrealized/equity after possible trade
-    unrealized_pnl = calc_unrealized_pnl(position, entry_price, current_price, stake)
+    if position == "YES":
+        unrealized_pnl = calc_unrealized_pnl_polymarket(position, entry_price, p_yes, stake)
+    elif position == "NO":
+        unrealized_pnl = calc_unrealized_pnl_polymarket(position, entry_price, p_no, stake)
+    else:
+        unrealized_pnl = 0.0
     equity = balance + unrealized_pnl
 
     pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
@@ -690,7 +716,7 @@ def main():
     dd_24h = get_drawdown_24h()
 
     print(
-        f"{utc_now_iso()} | price={current_price:.2f} | "
+        f"{utc_now_iso()} | mark_yes={p_yes:.3f} | mark_no={p_no:.3f} | "
         f"signal={signal} | action={action} | "
         f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
         f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f}"

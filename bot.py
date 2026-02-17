@@ -536,6 +536,22 @@ def get_drawdown_24h() -> Optional[float]:
 def main():
     init_db()
     state = load_state()
+    if os.getenv("RESET_STATE", "false").lower() == "true":
+    # clear position + entry so Day 4 starts clean
+    save_state(
+        balance=float(state["balance"]),
+        position=None,
+        entry_price=None,
+        stake=0.0,
+        last_trade_ts=state.get("last_trade_ts"),
+        last_trade_day=_as_date(state.get("last_trade_day")),
+        trades_today=int(state.get("trades_today", 0)),
+        realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
+        last_mark=state.get("last_mark"),
+    )
+    print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared for Day 4.")
+    return
+
     state = reset_daily_counters_if_needed(state)
 
     # One-time backfill: if we have an open position but no last_trade_day,

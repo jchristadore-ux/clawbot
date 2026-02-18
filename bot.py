@@ -85,21 +85,40 @@ def _as_date(value) -> Optional[date]:
 # DB
 # =========================
 def init_db():
-    """Create tables if they don't exist, and evolve schema."""
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_state (...);""")
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_trades (...);""")
 
-            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_ts TIMESTAMPTZ;")
-            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_day DATE;")
-            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS trades_today INTEGER NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS realized_pnl_today DOUBLE PRECISION NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_mark DOUBLE PRECISION;")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS paper_state (
+              id INTEGER PRIMARY KEY,
+              balance DOUBLE PRECISION NOT NULL,
+              position TEXT NULL,
+              entry_price DOUBLE PRECISION NULL,
+              stake DOUBLE PRECISION NOT NULL,
+              last_trade_ts TIMESTAMPTZ,
+              last_trade_day DATE,
+              trades_today INTEGER NOT NULL DEFAULT 0,
+              realized_pnl_today DOUBLE PRECISION NOT NULL DEFAULT 0,
+              last_mark DOUBLE PRECISION,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """)
 
-            cur.execute("""CREATE TABLE IF NOT EXISTS equity_snapshots (...);""")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS paper_trades (
+              trade_id BIGSERIAL PRIMARY KEY,
+              ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              action TEXT NOT NULL,
+              side TEXT NULL,
+              price DOUBLE PRECISION NULL,
+              stake DOUBLE PRECISION NULL,
+              fee DOUBLE PRECISION NULL,
+              pnl DOUBLE PRECISION NULL
+            );
+            """)
 
         conn.commit()
+
 
 def load_state():
     """Load single-row state (id=1). If missing, create it."""

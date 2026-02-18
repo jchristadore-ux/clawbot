@@ -44,6 +44,7 @@ POLY_TIMEOUT_SEC = int(os.getenv("POLY_TIMEOUT_SEC", "20"))
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 CLOB_PRICE_URL = "https://clob.polymarket.com/price"
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
 # Optional performance snapshots (safe OFF by default)
 ENABLE_SNAPSHOTS = os.getenv("ENABLE_SNAPSHOTS", "false").lower() == "true"
@@ -360,66 +361,105 @@ def _get_market_by_slug(slug: str) -> Optional[dict]:
         return data
     return None
 
+def _get_event_by_slug(event_slug: str) -> Optional[dict]:
+    r = requests.get(GAMMA_EVENTS_URL, params={"slug": event_slug}, timeout=POLY_TIMEOUT_SEC)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict) and data:
+        return data
+    return None
 
-def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float]]:
+
+def _market_is_clob_enabled(m: dict) -> bool:
+    # Gamma sometimes uses enableOrderBook (camel) or enable_order_book (snake)
+    return bool(m.get("enableOrderBook") or m.get("enable_order_book"))
+
+
+def _extract_tokens_for_updown(m: dict) -> Optional[Tuple[str, str]]:
+    outcomes = _maybe_json_list(m.get("outcomes")) or _maybe_json_list(m.get("outcomeNames"))
+    token_ids = _maybe_json_list(m.get("clobTokenIds")) or _maybe_json_list(m.get("clobTokenIDs"))
+
+    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
+        return None
+    if len(outcomes) < 2 or len(token_ids) < 2:
+        return None
+
+    outcome_to_token = {str(name).strip().lower(): str(tid) for name, tid in zip(outcomes, token_ids)}
+    up_tid = outcome_to_token.get("up") or outcome_to_token.get("yes")
+    down_tid = outcome_to_token.get("down") or outcome_to_token.get("no")
+
+    if not up_tid or not down_tid:
+        return None
+    return up_tid, down_tid
+
+
+def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, float]]:
     """
-    Returns (p_up, p_down) using:
-      Gamma market -> outcomes + clobTokenIds
-      then CLOB /price per token_id
-    This avoids Gamma outcomePrices placeholders like ["0","1"].
+    Returns (p_up, p_down) from CLOB if an orderbook-enabled market is found.
+    Otherwise returns None (so caller can fall back to synthetic).
     """
-    slug = (slug or "").strip()
-    if not slug:
+    s = (slug_or_event_slug or "").strip()
+    if not s:
         return None
 
     last_error = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            m = _get_market_by_slug(slug)
-            if not m:
-                last_error = "gamma: no market found for slug"
+            # 1) Try slug as a MARKET slug
+            m = _get_market_by_slug(s)
+            candidate_markets = []
+
+            if m and isinstance(m, dict):
+                candidate_markets.append(m)
+
+            # 2) If market not found or not orderbook-enabled, try slug as EVENT slug and collect its markets
+            if not candidate_markets or not any(_market_is_clob_enabled(x) for x in candidate_markets):
+                ev = _get_event_by_slug(s)
+                if ev:
+                    # events often include "markets" as a list
+                    ev_markets = ev.get("markets")
+                    if isinstance(ev_markets, list) and ev_markets:
+                        # they may already be market objects; add them
+                        candidate_markets.extend([x for x in ev_markets if isinstance(x, dict)])
+
+            # 3) pick first orderbook-enabled market that has clob token ids
+            chosen = None
+            for cm in candidate_markets:
+                if not _market_is_clob_enabled(cm):
+                    continue
+                toks = _extract_tokens_for_updown(cm)
+                if toks:
+                    chosen = cm
+                    up_tid, down_tid = toks
+                    break
+
+            if not chosen:
+                last_error = "no CLOB-enabled market with usable clobTokenIds for this slug/event"
                 time.sleep(1.0 * attempt)
                 continue
 
-            outcomes = _maybe_json_list(m.get("outcomes")) or _maybe_json_list(m.get("outcomeNames"))
-            token_ids = _maybe_json_list(m.get("clobTokenIds")) or _maybe_json_list(m.get("clobTokenIDs"))
-
-            if not isinstance(outcomes, list) or not isinstance(token_ids, list) or len(outcomes) < 2 or len(token_ids) < 2:
-                last_error = f"gamma: missing outcomes/token_ids outcomes={str(outcomes)[:80]} token_ids={str(token_ids)[:80]}"
-                time.sleep(1.0 * attempt)
-                continue
-
-            # Build map outcome_name -> token_id
-            outcome_to_token = {}
-            for name, tid in zip(outcomes, token_ids):
-                outcome_to_token[str(name).strip().lower()] = str(tid)
-
-            # Support either Up/Down or Yes/No naming
-            up_tid = outcome_to_token.get("up") or outcome_to_token.get("yes")
-            down_tid = outcome_to_token.get("down") or outcome_to_token.get("no")
-
-            if not up_tid or not down_tid:
-                last_error = f"gamma: could not map Up/Down tokens outcomes={outcomes}"
-                time.sleep(1.0 * attempt)
-                continue
-
-            # Pull live prices from CLOB
+            # 4) Fetch live prices from CLOB
             p_up = _fetch_clob_price(up_tid, side="buy")
             p_down = _fetch_clob_price(down_tid, side="buy")
 
-            # Sanity clamp
             p_up = clamp(p_up, 0.001, 0.999)
             p_down = clamp(p_down, 0.001, 0.999)
 
             return p_up, p_down
 
         except Exception as e:
-            last_error = f"exception: {str(e)[:200]}"
+            last_error = str(e)[:200]
             time.sleep(1.0 * attempt)
 
     print(f"{utc_now_iso()} | WARN | Polymarket fetch failed after retries: {last_error}")
     return None
+
+
+
 
 # =========================
 # PNL (Polymarket-style)

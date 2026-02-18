@@ -486,15 +486,15 @@ def paper_trade_prob(
 # =========================
 # PERFORMANCE (Day 3)
 # =========================
-def record_equity_snapshot(
-    mark: float,
-    balance: float,
-    position: Optional[str],
-    entry_price: Optional[float],
-    stake: float,
-    unrealized_pnl: float,
-    equity: float,
-):
+#def record_equity_snapshot(
+#    mark: float,
+#    balance: float,
+#    position: Optional[str],
+#    entry_price: Optional[float],
+#    stake: float,
+#    unrealized_pnl: float,
+#    equity: float,
+#):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(

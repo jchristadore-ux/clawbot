@@ -321,6 +321,10 @@ def prob_from_closes(closes: list) -> float:
 # =========================
 # POLYMARKET HELPERS
 # =========================
+# =========================
+# POLYMARKET HELPERS (Gamma + CLOB)
+# =========================
+
 def _maybe_json_list(x):
     """
     Gamma sometimes returns JSON arrays as strings.
@@ -357,6 +361,17 @@ def _get_market_by_slug(slug: str) -> Optional[dict]:
     return None
 
 
+def _get_market_by_id(market_id: int) -> Optional[dict]:
+    """
+    Hydrate full market object (event->markets are often partial objects).
+    """
+    r = requests.get(f"{GAMMA_MARKETS_URL}/{market_id}", timeout=POLY_TIMEOUT_SEC)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    return data if isinstance(data, dict) else None
+
+
 def _get_event_by_slug(event_slug: str) -> Optional[dict]:
     r = requests.get(GAMMA_EVENTS_URL, params={"slug": event_slug}, timeout=POLY_TIMEOUT_SEC)
     if r.status_code != 200:
@@ -384,10 +399,9 @@ def _extract_updown_from_market(m: dict) -> Optional[Dict[str, Any]]:
     if not isinstance(outcomes, list) or len(outcomes) < 2:
         return None
 
-    # Normalize outcomes to lowercase names
     norm_outcomes = [str(o).strip().lower() for o in outcomes]
 
-    # Build price map from Gamma outcomePrices if possible
+    # Gamma outcomePrices (may be missing in partial market objects)
     gamma_price_map: Dict[str, float] = {}
     if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
         for name, px in zip(norm_outcomes, outcome_prices):
@@ -395,15 +409,11 @@ def _extract_updown_from_market(m: dict) -> Optional[Dict[str, Any]]:
             if f is not None:
                 gamma_price_map[name] = f
 
-    # Build token map if possible
+    # CLOB token IDs (may be missing in partial market objects)
     token_map: Dict[str, str] = {}
     if isinstance(token_ids, list) and len(token_ids) >= 2:
         for name, tid in zip(norm_outcomes, token_ids):
             token_map[name] = str(tid)
-
-    # Identify up/down token IDs and gamma prices
-    up_name = "up" if "up" in token_map or "up" in gamma_price_map else "yes"
-    dn_name = "down" if "down" in token_map or "down" in gamma_price_map else "no"
 
     up_tid = token_map.get("up") or token_map.get("yes")
     dn_tid = token_map.get("down") or token_map.get("no")
@@ -448,9 +458,90 @@ def _clob_book_exists(token_id: str) -> bool:
     if r.status_code == 404:
         return False
     if r.status_code != 200:
-        # treat non-200 as unknown; we'll let price call decide/fail
+        # treat non-200 as unknown
         return True
     return True
+
+
+def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, float, str]]:
+    """
+    Returns (p_up, p_down, source) where source is:
+      - "clob"  (live /price)
+      - "gamma" (Gamma outcomePrices)
+    If neither works, returns None.
+    """
+    s = (slug_or_event_slug or "").strip()
+    if not s:
+        return None
+
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            candidate_markets = []
+
+            # 1) Try slug as a MARKET slug
+            m = _get_market_by_slug(s)
+            if m and isinstance(m, dict):
+                candidate_markets.append(m)
+
+            # 2) If not market slug (or insufficient fields), treat as EVENT slug and hydrate its markets
+            if not candidate_markets or not any(_market_is_clob_enabled(x) for x in candidate_markets):
+                ev = _get_event_by_slug(s)
+                if ev:
+                    ev_markets = ev.get("markets")
+                    if isinstance(ev_markets, list) and ev_markets:
+                        for x in ev_markets:
+                            if not isinstance(x, dict):
+                                continue
+                            mid = x.get("id")
+                            if mid is None:
+                                continue
+                            full = _get_market_by_id(int(mid))
+                            candidate_markets.append(full if full else x)
+
+            # 3) Pick first market with usable data
+            chosen_info = None
+            for cm in candidate_markets:
+                if not isinstance(cm, dict):
+                    continue
+                info = _extract_updown_from_market(cm)
+                if not info:
+                    continue
+
+                # Prefer clob if we have token IDs, otherwise gamma outcomePrices
+                if info.get("up_tid") and info.get("dn_tid"):
+                    chosen_info = ("clob", info)
+                    break
+                if info.get("up_gamma") is not None and info.get("dn_gamma") is not None:
+                    chosen_info = ("gamma", info)
+                    break
+
+            if not chosen_info:
+                last_error = "no usable market found (need clobTokenIds or outcomePrices)"
+                _sleep_backoff(attempt)
+                continue
+
+            mode, info = chosen_info
+
+            # 4) If we can try CLOB, do it (and fall back to Gamma if book missing)
+            if mode == "clob":
+                up_tid = info["up_tid"]
+                dn_tid = info["dn_tid"]
+
+                if not _clob_book_exists(up_tid) or not _clob_book_exists(dn_tid):
+                    if info.get("up_gamma") is not None and info.get("dn_gamma") is not None:
+                        p_up = float(info["up_gamma"])
+                        p_down = float(info["dn_gamma"])
+                        return clamp(p_up, 0.001, 0.999), clamp(p_down, 0.001, 0.999), "gamma"
+                    last_error = "CLOB book missing (404) and no gamma outcomePrices available"
+                    _sleep_backoff(attempt)
+                    continue
+
+                p_up = _fetch_clob_price(up_tid, side="BUY")
+                p_down = _fetch_clob_price(dn_tid, side="BUY")
+                return clamp(p_up, 0.001, 0.999), clamp(p_down, 0.001, 0.999), "c
+
 
 
 def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, float, str]]:
@@ -480,8 +571,19 @@ def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, flo
                 if ev:
                     ev_markets = ev.get("markets")
                     if isinstance(ev_markets, list) and ev_markets:
-                        candidate_markets.extend([x for x in ev_markets if isinstance(x, dict)])
-
+                        for x in ev_markets:
+                            if not isinstance(x, dict):
+                                continue
+                            mid = x.get("id")
+                            if mid is None:
+                                continue
+                            full = _get_market_by_id(int(mid))
+                            if full:
+                                candidate_markets.append(full)
+                            else:
+                                # fallback: still keep the partial object
+                               candidate_markets.append(x)
+                                
             # Pick first market that has either:
             # - usable CLOB token IDs, OR
             # - usable outcomePrices

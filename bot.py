@@ -540,9 +540,7 @@ def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, flo
 
                 p_up = _fetch_clob_price(up_tid, side="BUY")
                 p_down = _fetch_clob_price(dn_tid, side="BUY")
-                return clamp(p_up, 0.001, 0.999), clamp(p_down, 0.001, 0.999), "c
-
-
+                return clamp(p_up, 0.001, 0.999), clamp(p_down, 0.001, 0.999), "clob"
 
 def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, float, str]]:
     """

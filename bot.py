@@ -43,6 +43,7 @@ POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()  # e.g. btc-updown-5m
 POLY_TIMEOUT_SEC = int(os.getenv("POLY_TIMEOUT_SEC", "20"))
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
+CLOB_PRICE_URL = "https://clob.polymarket.com/price"
 
 # Optional performance snapshots (safe OFF by default)
 ENABLE_SNAPSHOTS = os.getenv("ENABLE_SNAPSHOTS", "false").lower() == "true"
@@ -301,8 +302,10 @@ def prob_from_closes(closes: list) -> float:
 
 
 # =========================
-# POLYMARKET MARKS (Gamma)
+# POLYMARKET MARKS (Gamma -> CLOB price)
 # =========================
+CLOB_PRICE_URL = "https://clob.polymarket.com/price"
+
 def _maybe_json_list(x):
     if x is None:
         return None
@@ -312,155 +315,111 @@ def _maybe_json_list(x):
         s = x.strip()
         if not s:
             return None
+        # Gamma sometimes returns JSON arrays as strings
         if s.startswith("[") and s.endswith("]"):
             try:
                 return json.loads(s)
             except Exception:
                 return None
+        # fallback: comma-separated
         if "," in s:
             return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
         return [s]
     return None
 
 
-def _extract_up_down_prices_from_market(m: dict) -> Optional[Tuple[float, float]]:
+def _fetch_clob_price(token_id: str, side: str = "buy") -> float:
     """
-    Returns (p_up, p_down) mapped to (p_yes, p_no) signals.
-    Supports outcomes: Yes/No or Up/Down.
-    Handles outcomes/outcomePrices that may be JSON strings.
-    Filters out broken 0/1 results.
+    Fetch current price from Polymarket CLOB for a token_id.
+    side: buy or sell (we use buy as a conservative "entry" proxy)
     """
-    p_yes = None
-    p_no = None
+    r = requests.get(
+        CLOB_PRICE_URL,
+        params={"token_id": token_id, "side": side},
+        timeout=POLY_TIMEOUT_SEC,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"CLOB price HTTP {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    if "price" not in data:
+        raise RuntimeError(f"CLOB price missing field: {str(data)[:200]}")
+    return float(data["price"])
 
-    outcomes = _maybe_json_list(m.get("outcomes") or m.get("outcomeNames"))
-    prices = _maybe_json_list(m.get("outcomePrices"))
 
-    # Convert prices to floats where possible
-    if isinstance(prices, list):
-        prices_f = []
-        for p in prices:
-            try:
-                prices_f.append(float(p))
-            except Exception:
-                prices_f.append(None)
-        prices = prices_f
-
-    # Case: outcomes list of dicts with embedded prices (rare)
-    if isinstance(outcomes, list) and outcomes and isinstance(outcomes[0], dict):
-        for o in outcomes:
-            name = (o.get("name") or o.get("outcome") or "").strip().lower()
-            try:
-                pr = float(o.get("price"))
-            except Exception:
-                continue
-            if name in ("yes", "up"):
-                p_yes = pr
-            elif name in ("no", "down"):
-                p_no = pr
-
-    # Common case: outcomes ["Up","Down"] and prices [0.52,0.48]
-    if (p_yes is None or p_no is None) and isinstance(outcomes, list) and isinstance(prices, list):
-        if len(outcomes) == len(prices) and len(prices) >= 2:
-            for nm, pr in zip(outcomes, prices):
-                if pr is None:
-                    continue
-                nml = str(nm).strip().lower()
-                if nml in ("yes", "up"):
-                    p_yes = float(pr)
-                elif nml in ("no", "down"):
-                    p_no = float(pr)
-
-    # Infer missing side
-    if p_yes is None and p_no is not None:
-        p_yes = 1.0 - p_no
-    if p_no is None and p_yes is not None:
-        p_no = 1.0 - p_yes
-
-    if p_yes is None or p_no is None:
+def _get_market_by_slug(slug: str) -> Optional[dict]:
+    """
+    Pull market object from Gamma. Prefer markets?slug=... which returns a list.
+    """
+    r = requests.get(GAMMA_MARKETS_URL, params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
+    if r.status_code != 200:
         return None
-
-    # Filter obvious garbage like 0/1
-    if (p_yes <= 0.001 and p_no >= 0.999) or (p_no <= 0.001 and p_yes >= 0.999):
-        return None
-
-    p_yes = clamp(float(p_yes), 0.001, 0.999)
-    p_no = clamp(float(p_no), 0.001, 0.999)
-    return p_yes, p_no
+    data = r.json()
+    if isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict) and data:
+        return data
+    return None
 
 
 def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float]]:
     """
-    Returns (p_up, p_down) for the event/market slug.
-    Tries multiple endpoints and returns the first valid pair.
+    Returns (p_up, p_down) using:
+      Gamma market -> outcomes + clobTokenIds
+      then CLOB /price per token_id
+    This avoids Gamma outcomePrices placeholders like ["0","1"].
     """
     slug = (slug or "").strip()
     if not slug:
         return None
 
     last_error = None
-    candidates = [
-        ("markets_query", GAMMA_MARKETS_URL, {"slug": slug}),
-        ("markets_slug", f"{GAMMA_MARKETS_URL}/slug/{slug}", None),
-        ("events_query", GAMMA_EVENTS_URL, {"slug": slug}),
-    ]
 
     for attempt in range(1, MAX_RETRIES + 1):
-        for label, url, params in candidates:
-            try:
-                r = requests.get(url, params=params, timeout=POLY_TIMEOUT_SEC)
-                if r.status_code != 200:
-                    last_error = f"{label} HTTP {r.status_code}: {r.text[:200]}"
-                    continue
-
-                data = r.json()
-
-                # Normalize to a market dict m
-                m = None
-                if label == "markets_query":
-                    if isinstance(data, list) and data:
-                        m = data[0]
-                    elif isinstance(data, dict) and data:
-                        m = data
-
-                elif label == "markets_slug":
-                    if isinstance(data, dict) and data:
-                        m = data
-
-                elif label == "events_query":
-                    event = None
-                    if isinstance(data, list) and data:
-                        event = data[0]
-                    elif isinstance(data, dict) and data:
-                        event = data
-
-                    if event:
-                        markets = event.get("markets") or []
-                        if isinstance(markets, list) and markets:
-                            m = markets[0]
-
-                if not isinstance(m, dict) or not m:
-                    last_error = f"{label}: could not find market object"
-                    continue
-
-                parsed = _extract_up_down_prices_from_market(m)
-                if parsed is not None:
-                    return parsed
-
-                last_error = (
-                    f"{label}: parse failed outcomes={str(m.get('outcomes'))[:80]} "
-                    f"prices={str(m.get('outcomePrices'))[:80]}"
-                )
-
-            except Exception as e:
-                last_error = f"{label} exception: {str(e)[:200]}"
+        try:
+            m = _get_market_by_slug(slug)
+            if not m:
+                last_error = "gamma: no market found for slug"
+                time.sleep(1.0 * attempt)
                 continue
 
-        time.sleep(1.0 * attempt)
+            outcomes = _maybe_json_list(m.get("outcomes")) or _maybe_json_list(m.get("outcomeNames"))
+            token_ids = _maybe_json_list(m.get("clobTokenIds")) or _maybe_json_list(m.get("clobTokenIDs"))
+
+            if not isinstance(outcomes, list) or not isinstance(token_ids, list) or len(outcomes) < 2 or len(token_ids) < 2:
+                last_error = f"gamma: missing outcomes/token_ids outcomes={str(outcomes)[:80]} token_ids={str(token_ids)[:80]}"
+                time.sleep(1.0 * attempt)
+                continue
+
+            # Build map outcome_name -> token_id
+            outcome_to_token = {}
+            for name, tid in zip(outcomes, token_ids):
+                outcome_to_token[str(name).strip().lower()] = str(tid)
+
+            # Support either Up/Down or Yes/No naming
+            up_tid = outcome_to_token.get("up") or outcome_to_token.get("yes")
+            down_tid = outcome_to_token.get("down") or outcome_to_token.get("no")
+
+            if not up_tid or not down_tid:
+                last_error = f"gamma: could not map Up/Down tokens outcomes={outcomes}"
+                time.sleep(1.0 * attempt)
+                continue
+
+            # Pull live prices from CLOB
+            p_up = _fetch_clob_price(up_tid, side="buy")
+            p_down = _fetch_clob_price(down_tid, side="buy")
+
+            # Sanity clamp
+            p_up = clamp(p_up, 0.001, 0.999)
+            p_down = clamp(p_down, 0.001, 0.999)
+
+            return p_up, p_down
+
+        except Exception as e:
+            last_error = f"exception: {str(e)[:200]}"
+            time.sleep(1.0 * attempt)
 
     print(f"{utc_now_iso()} | WARN | Polymarket fetch failed after retries: {last_error}")
     return None
-
 
 # =========================
 # PNL (Polymarket-style)

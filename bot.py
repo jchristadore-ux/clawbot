@@ -2,7 +2,7 @@ import os
 import time
 import json
 from datetime import datetime, timezone, timedelta, date
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import requests
 import psycopg2
@@ -38,13 +38,16 @@ PROB_Z_SCALE = float(os.getenv("PROB_Z_SCALE", "2.5"))
 # One-time reset switch (set true for ONE run, then set back to false)
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
 
-# Polymarket (Gamma)
-POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()  # e.g. btc-updown-5m-1771293000
+# Polymarket (Gamma / CLOB)
+POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()  # event slug OR market slug
 POLY_TIMEOUT_SEC = int(os.getenv("POLY_TIMEOUT_SEC", "20"))
+
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-CLOB_PRICE_URL = "https://clob.polymarket.com/price"
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+
+CLOB_BASE = "https://clob.polymarket.com"
+CLOB_PRICE_URL = f"{CLOB_BASE}/price"
+CLOB_BOOK_URL = f"{CLOB_BASE}/book"
 
 # Optional performance snapshots (safe OFF by default)
 ENABLE_SNAPSHOTS = os.getenv("ENABLE_SNAPSHOTS", "false").lower() == "true"
@@ -90,6 +93,19 @@ def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set. Add Railway Postgres so DATABASE_URL is injected.")
     return psycopg2.connect(DATABASE_URL)
+
+
+def _sleep_backoff(attempt: int) -> None:
+    time.sleep(1.0 * attempt)
+
+
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 
 # =========================
@@ -247,13 +263,13 @@ def fetch_btc_closes_5m(lookback: int) -> Optional[list]:
             )
             if r.status_code != 200:
                 last_error = f"HTTP {r.status_code}: {r.text[:200]}"
-                time.sleep(1.0 * attempt)
+                _sleep_backoff(attempt)
                 continue
 
             data = r.json()
             if data.get("error"):
                 last_error = f"Kraken error: {data['error']}"
-                time.sleep(1.0 * attempt)
+                _sleep_backoff(attempt)
                 continue
 
             result = data.get("result", {})
@@ -262,7 +278,7 @@ def fetch_btc_closes_5m(lookback: int) -> Optional[list]:
 
             if not isinstance(candles, list) or len(candles) < lookback:
                 last_error = f"Not enough candles. candles_len={len(candles) if isinstance(candles, list) else 'n/a'}"
-                time.sleep(1.0 * attempt)
+                _sleep_backoff(attempt)
                 continue
 
             closes = [float(c[4]) for c in candles[-lookback:]]
@@ -270,7 +286,7 @@ def fetch_btc_closes_5m(lookback: int) -> Optional[list]:
 
         except Exception as e:
             last_error = str(e)
-            time.sleep(1.0 * attempt)
+            _sleep_backoff(attempt)
 
     print(f"{utc_now_iso()} | WARN | Price fetch failed after retries: {last_error}")
     return None
@@ -303,11 +319,13 @@ def prob_from_closes(closes: list) -> float:
 
 
 # =========================
-# POLYMARKET MARKS (Gamma -> CLOB price)
+# POLYMARKET HELPERS
 # =========================
-CLOB_PRICE_URL = "https://clob.polymarket.com/price"
-
 def _maybe_json_list(x):
+    """
+    Gamma sometimes returns JSON arrays as strings.
+    e.g. '["Yes","No"]' or '["0.496","0.504"]'
+    """
     if x is None:
         return None
     if isinstance(x, list):
@@ -316,41 +334,18 @@ def _maybe_json_list(x):
         s = x.strip()
         if not s:
             return None
-        # Gamma sometimes returns JSON arrays as strings
         if s.startswith("[") and s.endswith("]"):
             try:
                 return json.loads(s)
             except Exception:
                 return None
-        # fallback: comma-separated
         if "," in s:
             return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
         return [s]
     return None
 
 
-def _fetch_clob_price(token_id: str, side: str = "buy") -> float:
-    """
-    Fetch current price from Polymarket CLOB for a token_id.
-    side: buy or sell (we use buy as a conservative "entry" proxy)
-    """
-    r = requests.get(
-        CLOB_PRICE_URL,
-        params={"token_id": token_id, "side": side},
-        timeout=POLY_TIMEOUT_SEC,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"CLOB price HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    if "price" not in data:
-        raise RuntimeError(f"CLOB price missing field: {str(data)[:200]}")
-    return float(data["price"])
-
-
 def _get_market_by_slug(slug: str) -> Optional[dict]:
-    """
-    Pull market object from Gamma. Prefer markets?slug=... which returns a list.
-    """
     r = requests.get(GAMMA_MARKETS_URL, params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
     if r.status_code != 200:
         return None
@@ -360,6 +355,7 @@ def _get_market_by_slug(slug: str) -> Optional[dict]:
     if isinstance(data, dict) and data:
         return data
     return None
+
 
 def _get_event_by_slug(event_slug: str) -> Optional[dict]:
     r = requests.get(GAMMA_EVENTS_URL, params={"slug": event_slug}, timeout=POLY_TIMEOUT_SEC)
@@ -374,32 +370,95 @@ def _get_event_by_slug(event_slug: str) -> Optional[dict]:
 
 
 def _market_is_clob_enabled(m: dict) -> bool:
-    # Gamma sometimes uses enableOrderBook (camel) or enable_order_book (snake)
     return bool(m.get("enableOrderBook") or m.get("enable_order_book"))
 
 
-def _extract_tokens_for_updown(m: dict) -> Optional[Tuple[str, str]]:
+def _extract_updown_from_market(m: dict) -> Optional[Dict[str, Any]]:
+    """
+    Returns mapping with token IDs (if present) and Gamma outcomePrices (if present).
+    """
     outcomes = _maybe_json_list(m.get("outcomes")) or _maybe_json_list(m.get("outcomeNames"))
     token_ids = _maybe_json_list(m.get("clobTokenIds")) or _maybe_json_list(m.get("clobTokenIDs"))
+    outcome_prices = _maybe_json_list(m.get("outcomePrices"))
 
-    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
+    if not isinstance(outcomes, list) or len(outcomes) < 2:
         return None
-    if len(outcomes) < 2 or len(token_ids) < 2:
-        return None
 
-    outcome_to_token = {str(name).strip().lower(): str(tid) for name, tid in zip(outcomes, token_ids)}
-    up_tid = outcome_to_token.get("up") or outcome_to_token.get("yes")
-    down_tid = outcome_to_token.get("down") or outcome_to_token.get("no")
+    # Normalize outcomes to lowercase names
+    norm_outcomes = [str(o).strip().lower() for o in outcomes]
 
-    if not up_tid or not down_tid:
-        return None
-    return up_tid, down_tid
+    # Build price map from Gamma outcomePrices if possible
+    gamma_price_map: Dict[str, float] = {}
+    if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
+        for name, px in zip(norm_outcomes, outcome_prices):
+            f = _safe_float(px)
+            if f is not None:
+                gamma_price_map[name] = f
+
+    # Build token map if possible
+    token_map: Dict[str, str] = {}
+    if isinstance(token_ids, list) and len(token_ids) >= 2:
+        for name, tid in zip(norm_outcomes, token_ids):
+            token_map[name] = str(tid)
+
+    # Identify up/down token IDs and gamma prices
+    up_name = "up" if "up" in token_map or "up" in gamma_price_map else "yes"
+    dn_name = "down" if "down" in token_map or "down" in gamma_price_map else "no"
+
+    up_tid = token_map.get("up") or token_map.get("yes")
+    dn_tid = token_map.get("down") or token_map.get("no")
+
+    up_px = gamma_price_map.get("up") or gamma_price_map.get("yes")
+    dn_px = gamma_price_map.get("down") or gamma_price_map.get("no")
+
+    return {
+        "up_tid": up_tid,
+        "dn_tid": dn_tid,
+        "up_gamma": up_px,
+        "dn_gamma": dn_px,
+    }
 
 
-def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, float]]:
+def _fetch_clob_price(token_id: str, side: str = "BUY") -> float:
     """
-    Returns (p_up, p_down) from CLOB if an orderbook-enabled market is found.
-    Otherwise returns None (so caller can fall back to synthetic).
+    GET /price requires side BUY/SELL (uppercase).
+    """
+    r = requests.get(
+        CLOB_PRICE_URL,
+        params={"token_id": token_id, "side": side},
+        timeout=POLY_TIMEOUT_SEC,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"CLOB price HTTP {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    if "price" not in data:
+        raise RuntimeError(f"CLOB price missing field: {str(data)[:200]}")
+    return float(data["price"])
+
+
+def _clob_book_exists(token_id: str) -> bool:
+    """
+    If /book returns 404 => no orderbook exists for that token.
+    """
+    r = requests.get(
+        CLOB_BOOK_URL,
+        params={"token_id": token_id},
+        timeout=POLY_TIMEOUT_SEC,
+    )
+    if r.status_code == 404:
+        return False
+    if r.status_code != 200:
+        # treat non-200 as unknown; we'll let price call decide/fail
+        return True
+    return True
+
+
+def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, float, str]]:
+    """
+    Returns (p_up, p_down, source) where source is:
+      - "clob"  (live /price)
+      - "gamma" (Gamma outcomePrices)
+    If neither works, returns None.
     """
     s = (slug_or_event_slug or "").strip()
     if not s:
@@ -409,56 +468,78 @@ def fetch_polymarket_marks(slug_or_event_slug: str) -> Optional[Tuple[float, flo
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # 1) Try slug as a MARKET slug
-            m = _get_market_by_slug(s)
             candidate_markets = []
 
+            m = _get_market_by_slug(s)
             if m and isinstance(m, dict):
                 candidate_markets.append(m)
 
-            # 2) If market not found or not orderbook-enabled, try slug as EVENT slug and collect its markets
+            # If not a market slug, try event slug and pull its markets
             if not candidate_markets or not any(_market_is_clob_enabled(x) for x in candidate_markets):
                 ev = _get_event_by_slug(s)
                 if ev:
-                    # events often include "markets" as a list
                     ev_markets = ev.get("markets")
                     if isinstance(ev_markets, list) and ev_markets:
-                        # they may already be market objects; add them
                         candidate_markets.extend([x for x in ev_markets if isinstance(x, dict)])
 
-            # 3) pick first orderbook-enabled market that has clob token ids
-            chosen = None
+            # Pick first market that has either:
+            # - usable CLOB token IDs, OR
+            # - usable outcomePrices
+            chosen_info = None
             for cm in candidate_markets:
-                if not _market_is_clob_enabled(cm):
+                info = _extract_updown_from_market(cm)
+                if not info:
                     continue
-                toks = _extract_tokens_for_updown(cm)
-                if toks:
-                    chosen = cm
-                    up_tid, down_tid = toks
+                if info.get("up_tid") and info.get("dn_tid"):
+                    chosen_info = ("clob", info)
+                    break
+                if info.get("up_gamma") is not None and info.get("dn_gamma") is not None:
+                    chosen_info = ("gamma", info)
                     break
 
-            if not chosen:
-                last_error = "no CLOB-enabled market with usable clobTokenIds for this slug/event"
-                time.sleep(1.0 * attempt)
+            if not chosen_info:
+                last_error = "no usable market found (need clobTokenIds or outcomePrices)"
+                _sleep_backoff(attempt)
                 continue
 
-            # 4) Fetch live prices from CLOB
-            p_up = _fetch_clob_price(up_tid, side="buy")
-            p_down = _fetch_clob_price(down_tid, side="buy")
+            mode, info = chosen_info
 
-            p_up = clamp(p_up, 0.001, 0.999)
-            p_down = clamp(p_down, 0.001, 0.999)
+            # Try CLOB first if we have token IDs
+            if mode == "clob" and info.get("up_tid") and info.get("dn_tid"):
+                up_tid = info["up_tid"]
+                dn_tid = info["dn_tid"]
 
-            return p_up, p_down
+                # Fast check: if orderbook doesn't exist, fall back to Gamma prices if available
+                if not _clob_book_exists(up_tid) or not _clob_book_exists(dn_tid):
+                    if info.get("up_gamma") is not None and info.get("dn_gamma") is not None:
+                        p_up = float(info["up_gamma"])
+                        p_down = float(info["dn_gamma"])
+                        return clamp(p_up, 0.001, 0.999), clamp(p_down, 0.001, 0.999), "gamma"
+                    last_error = "CLOB book missing (404) and no gamma outcomePrices available"
+                    _sleep_backoff(attempt)
+                    continue
+
+                # Live prices
+                p_up = _fetch_clob_price(up_tid, side="BUY")
+                p_down = _fetch_clob_price(dn_tid, side="BUY")
+
+                return clamp(p_up, 0.001, 0.999), clamp(p_down, 0.001, 0.999), "clob"
+
+            # Otherwise use Gamma outcomePrices
+            if info.get("up_gamma") is not None and info.get("dn_gamma") is not None:
+                p_up = float(info["up_gamma"])
+                p_down = float(info["dn_gamma"])
+                return clamp(p_up, 0.001, 0.999), clamp(p_down, 0.001, 0.999), "gamma"
+
+            last_error = "chosen market had neither usable CLOB nor usable Gamma prices"
+            _sleep_backoff(attempt)
 
         except Exception as e:
             last_error = str(e)[:200]
-            time.sleep(1.0 * attempt)
+            _sleep_backoff(attempt)
 
     print(f"{utc_now_iso()} | WARN | Polymarket fetch failed after retries: {last_error}")
     return None
-
-
 
 
 # =========================
@@ -469,12 +550,6 @@ def shares_for_stake(stake: float, price: float) -> float:
 
 
 def calc_unrealized_pnl(position: Optional[str], entry_price: Optional[float], mark: float, stake: float) -> float:
-    """
-    Mark-to-market:
-      shares = stake / entry_price
-      value_now = shares * mark
-      uPnL = value_now - stake
-    """
     if position is None or entry_price is None or stake <= 0:
         return 0.0
     sh = shares_for_stake(stake, entry_price)
@@ -502,10 +577,6 @@ def paper_trade_prob(
     trades_today: int,
     realized_pnl_today: float,
 ) -> Tuple[float, Optional[str], Optional[float], float, str, object, object, int, float]:
-    """
-    signal: YES/NO/HOLD  (YES=Up, NO=Down)
-    entry_price stores p_up when pos=YES, stores p_down when pos=NO
-    """
     if signal == "HOLD":
         return (balance, position, entry_price, stake, "HOLD",
                 last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
@@ -697,12 +768,14 @@ def main():
 
     signal = decide(closes)
 
-    # MARKS: prefer real Polymarket marks; fallback to synthetic
+    # MARKS: prefer Polymarket (CLOB -> Gamma), fallback to synthetic
     source = "synthetic"
+    p_up = None
+    p_down = None
+
     pm = fetch_polymarket_marks(POLY_EVENT_SLUG) if POLY_EVENT_SLUG else None
     if pm is not None:
-        p_up, p_down = pm
-        source = "polymarket"
+        p_up, p_down, source = pm
     else:
         p_up = prob_from_closes(closes) if PROB_MODE else 0.5
         p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
@@ -722,16 +795,16 @@ def main():
 
     # Mark-to-market uPnL
     if position == "YES":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_up, stake)
+        unrealized_pnl = calc_unrealized_pnl(position, entry_price, float(p_up), stake)
     elif position == "NO":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_down, stake)
+        unrealized_pnl = calc_unrealized_pnl(position, entry_price, float(p_down), stake)
     else:
         unrealized_pnl = 0.0
     equity = balance + unrealized_pnl
 
     # Optional snapshot (uses p_up as the mark)
     record_equity_snapshot(
-        mark=p_up,
+        mark=float(p_up),
         balance=balance,
         position=position,
         entry_price=entry_price,
@@ -760,21 +833,21 @@ def main():
             last_trade_day=last_trade_day,
             trades_today=trades_today,
             realized_pnl_today=realized_pnl_today,
-            last_mark=p_up,
+            last_mark=float(p_up),
         )
 
         pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
         winrate20 = get_winrate_last_n_exits(20)
         dd_24h = get_drawdown_24h()
 
-        label_up = "poly_up" if source == "polymarket" else "mark_up"
-        label_dn = "poly_down" if source == "polymarket" else "mark_down"
+        label_up = "poly_up" if source in ("clob", "gamma") else "mark_up"
+        label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
 
         print(
-            f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
+            f"{utc_now_iso()} | {label_up}={float(p_up):.3f} | {label_dn}={float(p_down):.3f} | "
             f"signal={signal} | action=BLOCKED | reason={blocked_reason} | "
             f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-            f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f}"
+            f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | src={source}"
         )
         print(
             f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
@@ -801,8 +874,8 @@ def main():
         entry_price,
         stake,
         signal,
-        p_up,
-        p_down,
+        float(p_up),
+        float(p_down),
         last_trade_ts,
         last_trade_day,
         trades_today,
@@ -818,14 +891,14 @@ def main():
         last_trade_day=last_trade_day,
         trades_today=trades_today,
         realized_pnl_today=realized_pnl_today,
-        last_mark=p_up,
+        last_mark=float(p_up),
     )
 
     # Recompute uPnL after trade
     if position == "YES":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_up, stake)
+        unrealized_pnl = calc_unrealized_pnl(position, entry_price, float(p_up), stake)
     elif position == "NO":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_down, stake)
+        unrealized_pnl = calc_unrealized_pnl(position, entry_price, float(p_down), stake)
     else:
         unrealized_pnl = 0.0
     equity = balance + unrealized_pnl
@@ -834,14 +907,14 @@ def main():
     winrate20 = get_winrate_last_n_exits(20)
     dd_24h = get_drawdown_24h()
 
-    label_up = "poly_up" if source == "polymarket" else "mark_up"
-    label_dn = "poly_down" if source == "polymarket" else "mark_down"
+    label_up = "poly_up" if source in ("clob", "gamma") else "mark_up"
+    label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
 
     print(
-        f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
+        f"{utc_now_iso()} | {label_up}={float(p_up):.3f} | {label_dn}={float(p_down):.3f} | "
         f"signal={signal} | action={action} | "
         f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-        f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f}"
+        f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | src={source}"
     )
     print(
         f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
@@ -853,3 +926,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

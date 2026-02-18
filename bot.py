@@ -44,6 +44,10 @@ KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_PAIR = "XBTUSD"
 KRAKEN_INTERVAL = 5  # minutes
 
+# Polymarket (Gamma)
+POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()
+POLY_TIMEOUT_SEC = int(os.getenv("POLY_TIMEOUT_SEC", "20"))
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 
 # =========================
 # UTIL
@@ -581,6 +585,115 @@ def get_drawdown_24h() -> Optional[float]:
         if dd > max_dd:
             max_dd = dd
     return max_dd
+def fetch_polymarket_marks(event_slug: str) -> Optional[Tuple[float, float]]:
+    """
+    Returns (p_yes, p_no) from Polymarket for the given event slug.
+    Uses Gamma API. We look for the market/outcomes and grab best-effort prices.
+
+    If we can't fetch or parse, returns None.
+    """
+    if not event_slug:
+        print(f"{utc_now_iso()} | WARN | POLY_EVENT_SLUG not set")
+        return None
+
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.get(
+                GAMMA_EVENTS_URL,
+                params={"slug": event_slug},
+                timeout=POLY_TIMEOUT_SEC,
+            )
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}: {r.text[:200]}"
+                time.sleep(1.0 * attempt)
+                continue
+
+            data = r.json()
+
+            # Gamma commonly returns a list of events
+            if isinstance(data, list):
+                if not data:
+                    last_error = "Empty events list"
+                    time.sleep(1.0 * attempt)
+                    continue
+                event = data[0]
+            elif isinstance(data, dict):
+                event = data
+            else:
+                last_error = f"Unexpected JSON type: {type(data)}"
+                time.sleep(1.0 * attempt)
+                continue
+
+            markets = event.get("markets") or []
+            if not markets:
+                last_error = "No markets found on event"
+                time.sleep(1.0 * attempt)
+                continue
+
+            # Many up/down markets have exactly 1 market with YES/NO outcomes
+            m0 = markets[0]
+            outcomes = m0.get("outcomes") or m0.get("outcomePrices") or []
+
+            # Handle a couple common shapes:
+            # - outcomes: [{"name":"Yes","price":0.52},{"name":"No","price":0.48}]
+            # - or outcomes: [{"outcome":"Yes","price":"0.52"}, ...]
+            # - or outcomePrices: ["0.52","0.48"] with outcomeNames: ["Yes","No"]
+            p_yes = None
+            p_no = None
+
+            if isinstance(outcomes, list) and outcomes and isinstance(outcomes[0], dict):
+                for o in outcomes:
+                    name = (o.get("name") or o.get("outcome") or "").strip().lower()
+                    price = o.get("price")
+                    try:
+                        price_f = float(price)
+                    except Exception:
+                        continue
+                    if name == "yes":
+                        p_yes = price_f
+                    elif name == "no":
+                        p_no = price_f
+
+            # Alternative shape: outcomePrices + outcomeNames
+            if (p_yes is None or p_no is None) and isinstance(m0.get("outcomePrices"), list):
+                prices = m0.get("outcomePrices")
+                names = m0.get("outcomeNames") or m0.get("outcomes")
+                if isinstance(names, list) and len(names) == len(prices):
+                    for nm, pr in zip(names, prices):
+                        try:
+                            prf = float(pr)
+                        except Exception:
+                            continue
+                        nml = str(nm).strip().lower()
+                        if nml == "yes":
+                            p_yes = prf
+                        elif nml == "no":
+                            p_no = prf
+
+            # Fallback: if we only got one side, infer the other
+            if p_yes is None and p_no is not None:
+                p_yes = 1.0 - p_no
+            if p_no is None and p_yes is not None:
+                p_no = 1.0 - p_yes
+
+            if p_yes is None or p_no is None:
+                last_error = f"Could not parse yes/no prices from market data"
+                time.sleep(1.0 * attempt)
+                continue
+
+            # Clamp to sane range
+            p_yes = clamp(p_yes, 0.001, 0.999)
+            p_no = clamp(p_no, 0.001, 0.999)
+
+            return p_yes, p_no
+
+        except Exception as e:
+            last_error = str(e)
+            time.sleep(1.0 * attempt)
+
+    print(f"{utc_now_iso()} | WARN | Polymarket fetch failed after retries: {last_error}")
+    return None
 
 
 
@@ -619,11 +732,19 @@ def main():
 
     signal = decide(closes)
 
-    # Probability marks
-    p_yes = prob_from_closes(closes) if PROB_MODE else 0.5
-    p_yes = clamp(p_yes, PROB_P_MIN, PROB_P_MAX)
-    p_no = 1.0 - p_yes
-    p_no = clamp(p_no, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
+    # Probability marks (Day 5: use real Polymarket marks if available)
+    p_yes = None
+    p_no = None
+
+    pm = fetch_polymarket_marks(POLY_EVENT_SLUG)
+    if pm is not None:
+        p_yes, p_no = pm
+    else:
+        # fallback to synthetic mark from Kraken closes
+        p_yes = prob_from_closes(closes) if PROB_MODE else 0.5
+        p_yes = clamp(p_yes, PROB_P_MIN, PROB_P_MAX)
+        p_no = 1.0 - p_yes
+        p_no = clamp(p_no, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
 
     # Pull state
     balance = float(state["balance"])
@@ -685,7 +806,7 @@ def main():
         dd_24h = get_drawdown_24h()
 
         print(
-            f"{utc_now_iso()} | mark_yes={p_yes:.3f} | mark_no={p_no:.3f} | "
+            f"{utc_now_iso()} | poly_yes={p_yes:.3f} | poly_no={p_no:.3f} | "
             f"signal={signal} | action=BLOCKED | reason={blocked_reason} | "
             f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
             f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f}"

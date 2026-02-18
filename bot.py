@@ -711,30 +711,28 @@ def fetch_polymarket_marks(event_or_market_slug: str) -> Optional[Tuple[float, f
                             p_yes = price_f
                         elif name == "no":
                             p_no = price_f
-                    if p_yes is not None or p_no is not None:
-                        if p_yes is None and p_no is not None:
-                            p_yes = 1.0 - p_no
-                        if p_no is None and p_yes is not None:
-                            p_no = 1.0 - p_yes
-                        return (clamp(float(p_yes), 0.001, 0.999), clamp(float(p_no), 0.001, 0.999))
+                # Filter out obviously broken prices like 0/1
+                if p_yes is not None and p_no is not None:
+                    if (p_yes <= 0.0 and p_no >= 1.0) or (p_no <= 0.0 and p_yes >= 1.0):
+                        last_error = f"{label}: ignoring broken prices p_yes={p_yes} p_no={p_no}"
+                        continue
+                return (clamp(float(p_yes), 0.001, 0.999), clamp(float(p_no), 0.001, 0.999))
 
                 # Common case: outcomes=["Yes","No"], prices=[0.49,0.51]
                 if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices) and len(prices) >= 2:
                     p_yes = p_no = None
                     for nm, pr in zip(outcomes, prices):
                         nml = str(nm).strip().lower()
-                        if nml == "yes":
+                        if nml in ("yes", "up"):
                             p_yes = float(pr)
-                        elif nml == "no":
+                        elif nml in ("no", "down"):
                             p_no = float(pr)
 
-                    if p_yes is None and p_no is not None:
-                        p_yes = 1.0 - p_no
-                    if p_no is None and p_yes is not None:
-                        p_no = 1.0 - p_yes
-
-                    if p_yes is not None and p_no is not None:
-                        return (clamp(p_yes, 0.001, 0.999), clamp(p_no, 0.001, 0.999))
+                if p_yes is not None and p_no is not None:
+                    if (p_yes <= 0.0 and p_no >= 1.0) or (p_no <= 0.0 and p_yes >= 1.0):
+                        last_error = f"{label}: ignoring broken prices p_yes={p_yes} p_no={p_no}"
+                        continue
+                return (clamp(p_yes, 0.001, 0.999), clamp(p_no, 0.001, 0.999))
 
                 # If we got here, parsing failed for this endpoint
                 last_error = f"{label}: Could not parse outcomes/prices. outcomes={str(m.get('outcomes'))[:120]} prices={str(m.get('outcomePrices'))[:120]}"

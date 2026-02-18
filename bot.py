@@ -611,15 +611,15 @@ def main():
     equity = balance + unrealized_pnl
 
     # Snapshot for drawdown window (mark=YES mark)
-    record_equity_snapshot(
-        mark=p_yes,
-        balance=balance,
-        position=position,
-        entry_price=entry_price,
-        stake=stake,
-        unrealized_pnl=unrealized_pnl,
-        equity=equity,
-    )
+  # record_equity_snapshot(
+#     mark=p_yes,
+#     balance=balance,
+#     position=position,
+#     entry_price=entry_price,
+#     stake=stake,
+#     unrealized_pnl=unrealized_pnl,
+#     equity=equity,
+# )
 
     # Gates (use realized pnl today only)
     blocked_reason = None

@@ -415,6 +415,11 @@ def fetch_polymarket_marks(slug: str):
         m = _get_market_by_slug(slug)
         if m:
             candidate_markets.append(m)
+            
+    print(f"{utc_now_iso()} | DEBUG | candidate_markets={len(candidate_markets)}")
+    if candidate_markets:
+        cm0 = candidate_markets[0]
+        print(f"{utc_now_iso()} | DEBUG | sample_market_keys={list(cm0.keys())[:20]}")
 
         # Try event slug and hydrate
         if not candidate_markets:
@@ -447,7 +452,8 @@ def fetch_polymarket_marks(slug: str):
 
     except Exception as e:
         print(f"{utc_now_iso()} | WARN | Polymarket error: {str(e)[:200]}")
-
+    
+    print(f"{utc_now_iso()} | DEBUG | polymarket_marks=None for slug={slug}")
     return None
 
 

@@ -126,21 +126,23 @@ def init_db():
             cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_mark DOUBLE PRECISION;")
 
             # Day 3 snapshots
-            cur.execute(
-                """
-            CREATE TABLE IF NOT EXISTS equity_snapshots (
-              snapshot_id BIGSERIAL PRIMARY KEY,
-              ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              mark DOUBLE PRECISION NOT NULL,
-              balance DOUBLE PRECISION NOT NULL,
-              position TEXT NULL,
-              entry_price DOUBLE PRECISION NULL,
-              stake DOUBLE PRECISION NOT NULL,
-              unrealized_pnl DOUBLE PRECISION NOT NULL,
-              equity DOUBLE PRECISION NOT NULL
-            );
-            """
-            )
+            cur.execute("""
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+  snapshot_id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  mark DOUBLE PRECISION NOT NULL,
+  balance DOUBLE PRECISION NOT NULL,
+  position TEXT NULL,
+  entry_price DOUBLE PRECISION NULL,
+  stake DOUBLE PRECISION NOT NULL,
+  unrealized_pnl DOUBLE PRECISION NOT NULL,
+  equity DOUBLE PRECISION NOT NULL
+);
+""")
+
+cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS mark DOUBLE PRECISION;")
+cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS unrealized_pnl DOUBLE PRECISION;")
+
 
         conn.commit()
 

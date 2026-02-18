@@ -1,5 +1,6 @@
 import os
 import time
+import json
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional, Tuple
 
@@ -585,117 +586,167 @@ def get_drawdown_24h() -> Optional[float]:
         if dd > max_dd:
             max_dd = dd
     return max_dd
-def fetch_polymarket_marks(event_slug: str) -> Optional[Tuple[float, float]]:
+def _maybe_json_list(x):
     """
-    Returns (p_yes, p_no) from Polymarket for the given event slug.
-    Uses Gamma API. We look for the market/outcomes and grab best-effort prices.
+    Gamma sometimes returns fields like outcomes/outcomePrices as JSON-encoded strings.
+    This helper converts:
+      - '["Yes","No"]' -> ["Yes","No"]
+      - ["Yes","No"] -> ["Yes","No"]
+      - None -> None
+      - 'Yes,No' -> ["Yes","No"] (fallback)
+    """
+    if x is None:
+        return None
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        # Try JSON list
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+            try:
+                return json.loads(s)
+            except Exception:
+                pass
+        # Fallback: comma-separated
+        if "," in s:
+            return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
+        return [s]
+    return None
 
-    If we can't fetch or parse, returns None.
+
+def fetch_polymarket_marks(event_or_market_slug: str) -> Optional[Tuple[float, float]]:
     """
-    if not event_slug:
+    Return (p_yes, p_no) for a Yes/No market.
+
+    IMPORTANT:
+    - Your URL slug is an *event* slug: /event/<slug>
+    - Gamma's Market object often stores outcomes/outcomePrices as JSON-encoded strings.
+    - We'll try multiple endpoints and normalize shapes.
+    """
+    slug = (event_or_market_slug or "").strip()
+    if not slug:
         print(f"{utc_now_iso()} | WARN | POLY_EVENT_SLUG not set")
         return None
 
     last_error = None
+
+    # Try endpoints in order:
+    # 1) markets?slug=<slug>  (often works even if slug came from event)
+    # 2) markets/slug/<slug>  (explicit market slug endpoint)
+    # 3) events?slug=<slug>   (event lookup; then take first market)
+    candidates = [
+        ("markets_query", "https://gamma-api.polymarket.com/markets", {"slug": slug}),
+        ("markets_slug",  f"https://gamma-api.polymarket.com/markets/slug/{slug}", None),
+        ("events_query",  "https://gamma-api.polymarket.com/events", {"slug": slug}),
+    ]
+
     for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(
-                GAMMA_EVENTS_URL,
-                params={"slug": event_slug},
-                timeout=POLY_TIMEOUT_SEC,
-            )
-            if r.status_code != 200:
-                last_error = f"HTTP {r.status_code}: {r.text[:200]}"
-                time.sleep(1.0 * attempt)
-                continue
-
-            data = r.json()
-
-            # Gamma commonly returns a list of events
-            if isinstance(data, list):
-                if not data:
-                    last_error = "Empty events list"
-                    time.sleep(1.0 * attempt)
+        for label, url, params in candidates:
+            try:
+                r = requests.get(url, params=params, timeout=POLY_TIMEOUT_SEC)
+                if r.status_code != 200:
+                    last_error = f"{label} HTTP {r.status_code}: {r.text[:200]}"
                     continue
-                event = data[0]
-            elif isinstance(data, dict):
-                event = data
-            else:
-                last_error = f"Unexpected JSON type: {type(data)}"
-                time.sleep(1.0 * attempt)
-                continue
 
-            markets = event.get("markets") or []
-            if not markets:
-                last_error = "No markets found on event"
-                time.sleep(1.0 * attempt)
-                continue
+                data = r.json()
 
-            # Many up/down markets have exactly 1 market with YES/NO outcomes
-            m0 = markets[0]
-            outcomes = m0.get("outcomes") or m0.get("outcomePrices") or []
+                # Normalize to a "market dict" m
+                m = None
 
-            # Handle a couple common shapes:
-            # - outcomes: [{"name":"Yes","price":0.52},{"name":"No","price":0.48}]
-            # - or outcomes: [{"outcome":"Yes","price":"0.52"}, ...]
-            # - or outcomePrices: ["0.52","0.48"] with outcomeNames: ["Yes","No"]
-            p_yes = None
-            p_no = None
+                # /markets?slug=... -> often list
+                if label == "markets_query":
+                    if isinstance(data, list) and data:
+                        m = data[0]
+                    elif isinstance(data, dict) and data:
+                        m = data
 
-            if isinstance(outcomes, list) and outcomes and isinstance(outcomes[0], dict):
-                for o in outcomes:
-                    name = (o.get("name") or o.get("outcome") or "").strip().lower()
-                    price = o.get("price")
-                    try:
-                        price_f = float(price)
-                    except Exception:
-                        continue
-                    if name == "yes":
-                        p_yes = price_f
-                    elif name == "no":
-                        p_no = price_f
+                # /markets/slug/<slug> -> dict
+                elif label == "markets_slug":
+                    if isinstance(data, dict) and data:
+                        m = data
 
-            # Alternative shape: outcomePrices + outcomeNames
-            if (p_yes is None or p_no is None) and isinstance(m0.get("outcomePrices"), list):
-                prices = m0.get("outcomePrices")
-                names = m0.get("outcomeNames") or m0.get("outcomes")
-                if isinstance(names, list) and len(names) == len(prices):
-                    for nm, pr in zip(names, prices):
+                # /events?slug=... -> list of events; take first market inside first event
+                elif label == "events_query":
+                    event = None
+                    if isinstance(data, list) and data:
+                        event = data[0]
+                    elif isinstance(data, dict) and data:
+                        event = data
+
+                    if event:
+                        markets = event.get("markets") or []
+                        if isinstance(markets, list) and markets:
+                            m = markets[0]
+
+                if not isinstance(m, dict) or not m:
+                    last_error = f"{label}: could not find market object"
+                    continue
+
+                # Pull outcomes + prices (often JSON-encoded strings)
+                outcomes = _maybe_json_list(m.get("outcomes") or m.get("outcomeNames"))
+                prices = _maybe_json_list(m.get("outcomePrices"))
+
+                # If prices came back as strings inside a list, convert to float
+                if isinstance(prices, list):
+                    prices_f = []
+                    for p in prices:
                         try:
-                            prf = float(pr)
+                            prices_f.append(float(p))
+                        except Exception:
+                            pass
+                    prices = prices_f
+
+                # Handle dict-style outcomes (rare, but keep it)
+                if isinstance(outcomes, list) and outcomes and isinstance(outcomes[0], dict):
+                    p_yes = p_no = None
+                    for o in outcomes:
+                        name = (o.get("name") or o.get("outcome") or "").strip().lower()
+                        try:
+                            price_f = float(o.get("price"))
                         except Exception:
                             continue
+                        if name == "yes":
+                            p_yes = price_f
+                        elif name == "no":
+                            p_no = price_f
+                    if p_yes is not None or p_no is not None:
+                        if p_yes is None and p_no is not None:
+                            p_yes = 1.0 - p_no
+                        if p_no is None and p_yes is not None:
+                            p_no = 1.0 - p_yes
+                        return (clamp(float(p_yes), 0.001, 0.999), clamp(float(p_no), 0.001, 0.999))
+
+                # Common case: outcomes=["Yes","No"], prices=[0.49,0.51]
+                if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) == len(prices) and len(prices) >= 2:
+                    p_yes = p_no = None
+                    for nm, pr in zip(outcomes, prices):
                         nml = str(nm).strip().lower()
                         if nml == "yes":
-                            p_yes = prf
+                            p_yes = float(pr)
                         elif nml == "no":
-                            p_no = prf
+                            p_no = float(pr)
 
-            # Fallback: if we only got one side, infer the other
-            if p_yes is None and p_no is not None:
-                p_yes = 1.0 - p_no
-            if p_no is None and p_yes is not None:
-                p_no = 1.0 - p_yes
+                    if p_yes is None and p_no is not None:
+                        p_yes = 1.0 - p_no
+                    if p_no is None and p_yes is not None:
+                        p_no = 1.0 - p_yes
 
-            if p_yes is None or p_no is None:
-                last_error = f"Could not parse yes/no prices from market data"
-                time.sleep(1.0 * attempt)
+                    if p_yes is not None and p_no is not None:
+                        return (clamp(p_yes, 0.001, 0.999), clamp(p_no, 0.001, 0.999))
+
+                # If we got here, parsing failed for this endpoint
+                last_error = f"{label}: Could not parse outcomes/prices. outcomes={str(m.get('outcomes'))[:120]} prices={str(m.get('outcomePrices'))[:120]}"
+
+            except Exception as e:
+                last_error = f"{label} exception: {str(e)[:200]}"
                 continue
 
-            # Clamp to sane range
-            p_yes = clamp(p_yes, 0.001, 0.999)
-            p_no = clamp(p_no, 0.001, 0.999)
-
-            return p_yes, p_no
-
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(1.0 * attempt)
+        time.sleep(1.0 * attempt)
 
     print(f"{utc_now_iso()} | WARN | Polymarket fetch failed after retries: {last_error}")
     return None
-
-
 
 # =========================
 # MAIN

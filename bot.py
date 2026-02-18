@@ -23,18 +23,18 @@ DOWN_THRESHOLD = float(os.getenv("DOWN_THRESHOLD", "0.998"))  # -0.2%
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "20"))
 
-# Day 2 Risk Controls (A + B + trade cap)
+# Day 2 Risk Controls
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8"))
 
-# Day 4 Polymarket-style probability mode (D)
+# Day 4 Polymarket-style probability mode
 PROB_MODE = os.getenv("PROB_MODE", "true").lower() == "true"
 PROB_P_MIN = float(os.getenv("PROB_P_MIN", "0.05"))
 PROB_P_MAX = float(os.getenv("PROB_P_MAX", "0.95"))
 PROB_Z_SCALE = float(os.getenv("PROB_Z_SCALE", "2.5"))
 
-# One-time state reset for Day 4 cutover
+# One-time state reset switch (set true for ONE run, then false)
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
 
 # Kraken
@@ -101,7 +101,6 @@ def init_db():
             );
             """
             )
-
             cur.execute(
                 """
             CREATE TABLE IF NOT EXISTS paper_trades (
@@ -117,26 +116,16 @@ def init_db():
             """
             )
 
-            # Day 2 columns
-            cur.execute(
-                "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_ts TIMESTAMPTZ;"
-            )
-            cur.execute(
-                "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_day DATE;"
-            )
-            cur.execute(
-                "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS trades_today INTEGER NOT NULL DEFAULT 0;"
-            )
-            cur.execute(
-                "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS realized_pnl_today DOUBLE PRECISION NOT NULL DEFAULT 0;"
-            )
+            # Day 2 state columns
+            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_ts TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_day DATE;")
+            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS trades_today INTEGER NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS realized_pnl_today DOUBLE PRECISION NOT NULL DEFAULT 0;")
 
-            # Day 4: store a last_mark (we'll store YES mark here)
-            cur.execute(
-                "ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_mark DOUBLE PRECISION;"
-            )
+            # Day 4: last mark (store YES mark)
+            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_mark DOUBLE PRECISION;")
 
-            # Snapshots (store mark=YES mark for drawdown window)
+            # Day 3 snapshots
             cur.execute(
                 """
             CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -242,12 +231,10 @@ def reset_daily_counters_if_needed(state: dict) -> dict:
     """Reset trades_today and realized_pnl_today when UTC day changes."""
     today = utc_today_date()
     last_day = _as_date(state.get("last_trade_day"))
-
     if last_day is None or last_day != today:
         state["last_trade_day"] = today
         state["trades_today"] = 0
         state["realized_pnl_today"] = 0.0
-
     return state
 
 
@@ -255,8 +242,22 @@ def cooldown_active(state: dict, cooldown_minutes: int) -> bool:
     ts = state.get("last_trade_ts")
     if ts is None:
         return False
-    now = utc_now_dt()
-    return now < (ts + timedelta(minutes=cooldown_minutes))
+    return utc_now_dt() < (ts + timedelta(minutes=cooldown_minutes))
+
+
+def maybe_backfill_legacy_open_position(state: dict) -> dict:
+    """
+    If you had an open position from older versions (or counters missing),
+    ensure day + trades_today are coherent so gates work.
+    """
+    if state.get("position") is not None:
+        # If last_trade_day isn't set, set it to today and count at least 1 trade.
+        if state.get("last_trade_day") is None:
+            state["last_trade_day"] = utc_today_date()
+            state["trades_today"] = max(int(state.get("trades_today", 0)), 1)
+            state["last_trade_ts"] = state.get("last_trade_ts") or utc_now_dt()
+
+    return state
 
 
 # =========================
@@ -325,25 +326,29 @@ def decide(closes):
 def prob_from_closes(closes) -> float:
     """
     Map last vs avg into a 0..1 probability-like price.
-    Linear mapping, scaled by PROB_Z_SCALE, then clamped.
+    Linear mapping scaled by PROB_Z_SCALE, then clamped.
     """
     avg = sum(closes) / len(closes)
     last = closes[-1]
     if avg <= 0:
         return 0.5
-    dev = (last - avg) / avg  # e.g., 0.002 = +0.2%
+    dev = (last - avg) / avg
     p = 0.5 + (dev * PROB_Z_SCALE)
     return clamp(p, PROB_P_MIN, PROB_P_MAX)
 
 
 def shares_for_stake(stake: float, price: float) -> float:
-    """Shares purchased with dollars at a given probability price."""
     if price <= 0:
         return 0.0
     return stake / price
 
 
-def calc_unrealized_pnl_polymarket(position: Optional[str], entry_price: Optional[float], mark: float, stake: float) -> float:
+def calc_unrealized_pnl_polymarket(
+    position: Optional[str],
+    entry_price: Optional[float],
+    mark: float,
+    stake: float,
+) -> float:
     """
     Polymarket-style mark-to-market:
       shares = stake / entry_price
@@ -364,17 +369,17 @@ def calc_realized_pnl_polymarket(entry_price: float, exit_price: float, stake: f
 
 
 def paper_trade_prob(
-    balance,
-    position,
-    entry_price,
-    stake,
-    signal,
-    mark_yes,
-    mark_no,
+    balance: float,
+    position: Optional[str],
+    entry_price: Optional[float],
+    stake: float,
+    signal: str,
+    mark_yes: float,
+    mark_no: float,
     last_trade_ts,
     last_trade_day,
-    trades_today,
-    realized_pnl_today,
+    trades_today: int,
+    realized_pnl_today: float,
 ):
     """
     Paper trade using probability prices (0..1) like Polymarket.
@@ -382,8 +387,15 @@ def paper_trade_prob(
     """
     if signal == "HOLD":
         return (
-            balance, position, entry_price, stake, "HOLD",
-            last_trade_ts, last_trade_day, trades_today, realized_pnl_today
+            balance,
+            position,
+            entry_price,
+            stake,
+            "HOLD",
+            last_trade_ts,
+            last_trade_day,
+            trades_today,
+            realized_pnl_today,
         )
 
     now_ts = utc_now_dt()
@@ -393,8 +405,15 @@ def paper_trade_prob(
     if position is None:
         if balance < (TRADE_SIZE + FEE_PER_TRADE):
             return (
-                balance, position, entry_price, stake, "SKIP_INSUFFICIENT_BALANCE",
-                last_trade_ts, last_trade_day, trades_today, realized_pnl_today
+                balance,
+                position,
+                entry_price,
+                stake,
+                "SKIP_INSUFFICIENT_BALANCE",
+                last_trade_ts,
+                last_trade_day,
+                trades_today,
+                realized_pnl_today,
             )
 
         balance -= (TRADE_SIZE + FEE_PER_TRADE)
@@ -409,8 +428,15 @@ def paper_trade_prob(
         last_trade_day = today
 
         return (
-            balance, position, entry_price, stake, f"ENTER_{signal}",
-            last_trade_ts, last_trade_day, trades_today, realized_pnl_today
+            balance,
+            position,
+            entry_price,
+            stake,
+            f"ENTER_{signal}",
+            last_trade_ts,
+            last_trade_day,
+            trades_today,
+            realized_pnl_today,
         )
 
     # EXIT if opposite signal
@@ -431,13 +457,27 @@ def paper_trade_prob(
         stake = 0.0
 
         return (
-            balance, position, entry_price, stake, "EXIT",
-            last_trade_ts, last_trade_day, trades_today, realized_pnl_today
+            balance,
+            position,
+            entry_price,
+            stake,
+            "EXIT",
+            last_trade_ts,
+            last_trade_day,
+            trades_today,
+            realized_pnl_today,
         )
 
     return (
-        balance, position, entry_price, stake, "HOLD_SAME_SIDE",
-        last_trade_ts, last_trade_day, trades_today, realized_pnl_today
+        balance,
+        position,
+        entry_price,
+        stake,
+        "HOLD_SAME_SIDE",
+        last_trade_ts,
+        last_trade_day,
+        trades_today,
+        realized_pnl_today,
     )
 
 
@@ -480,9 +520,7 @@ def get_realized_pnl_24h_and_trades_24h() -> Tuple[float, int]:
             """
             )
             row = cur.fetchone()
-            pnl_24h = float(row[0] or 0.0)
-            trades_24h = int(row[1] or 0)
-            return pnl_24h, trades_24h
+            return float(row[0] or 0.0), int(row[1] or 0)
 
 
 def get_winrate_last_n_exits(n: int = 20) -> Optional[float]:
@@ -502,7 +540,6 @@ def get_winrate_last_n_exits(n: int = 20) -> Optional[float]:
 
     if not rows:
         return None
-
     pnls = [float(r[0]) for r in rows]
     wins = sum(1 for p in pnls if p > 0)
     return wins / len(pnls)
@@ -513,7 +550,7 @@ def get_drawdown_24h() -> Optional[float]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-            SELECT ts, equity
+            SELECT equity
             FROM equity_snapshots
             WHERE ts >= (NOW() - INTERVAL '24 hours')
             ORDER BY ts ASC;
@@ -524,16 +561,15 @@ def get_drawdown_24h() -> Optional[float]:
     if len(rows) < 2:
         return None
 
-    peak = float(rows[0][1])
+    peak = float(rows[0][0])
     max_dd = 0.0
-    for _, eq in rows:
+    for (eq,) in rows:
         eq = float(eq)
         if eq > peak:
             peak = eq
         dd = peak - eq
         if dd > max_dd:
             max_dd = dd
-
     return max_dd
 
 
@@ -542,56 +578,40 @@ def get_drawdown_24h() -> Optional[float]:
 # =========================
 def main():
     init_db()
+
     state = load_state()
     state = reset_daily_counters_if_needed(state)
+    state = maybe_backfill_legacy_open_position(state)
 
-    # If holding a legacy position (from old BTC-price mode) and no tracking day, backfill counters.
-    if state.get("position") is not None and state.get("last_trade_day") is None:
-        state["last_trade_day"] = utc_today_date()
-        state["trades_today"] = max(int(state.get("trades_today", 0)), 1)
-        state["last_trade_ts"] = state.get("last_trade_ts") or utc_now_dt()
-
+    # Apply reset switch once to clear any legacy open position/entry
+    if RESET_STATE:
         save_state(
             balance=float(state["balance"]),
-            position=state["position"],
-            entry_price=float(state["entry_price"]) if state["entry_price"] is not None else None,
-            stake=float(state["stake"]),
+            position=None,
+            entry_price=None,
+            stake=0.0,
             last_trade_ts=state.get("last_trade_ts"),
             last_trade_day=_as_date(state.get("last_trade_day")),
             trades_today=int(state.get("trades_today", 0)),
             realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
             last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
         )
-
-    # One-time reset switch for clean Day 4 cutover
-    if RESET_STATE:
-    save_state(
-        balance=float(state["balance"]),
-        position=None,
-        entry_price=None,
-        stake=0.0,
-        last_trade_ts=state.get("last_trade_ts"),
-        last_trade_day=_as_date(state.get("last_trade_day")),
-        trades_today=int(state.get("trades_today", 0)),
-        realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
-        last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
-    )
-    print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared for Day 4.")
-    return
-
+        print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared for Day 4.")
+        return
 
     closes = fetch_btc_closes_5m(LOOKBACK)
     if closes is None:
-        print(f"{utc_now_iso()} | INFO | No data this run. balance={float(state['balance']):.2f} pos={state['position']}")
+        print(
+            f"{utc_now_iso()} | INFO | No data this run. balance={float(state['balance']):.2f} pos={state['position']}"
+        )
         return
 
     signal = decide(closes)
 
-    # Compute probability marks
+    # Probability marks
     p_yes = prob_from_closes(closes) if PROB_MODE else 0.5
     p_yes = clamp(p_yes, PROB_P_MIN, PROB_P_MAX)
     p_no = 1.0 - p_yes
-    # Mirror clamp for NO so it stays within [1-P_MAX, 1-P_MIN]
     p_no = clamp(p_no, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
 
     # Pull state
@@ -605,7 +625,7 @@ def main():
     trades_today = int(state.get("trades_today", 0))
     realized_pnl_today = float(state.get("realized_pnl_today", 0.0))
 
-    # Day 4: unrealized PnL in probability space (realized pnl today stays realized-only)
+    # Unrealized PnL
     if position == "YES":
         unrealized_pnl = calc_unrealized_pnl_polymarket(position, entry_price, p_yes, stake)
     elif position == "NO":
@@ -615,7 +635,7 @@ def main():
 
     equity = balance + unrealized_pnl
 
-    # Snapshot & mark
+    # Snapshot for drawdown window (mark=YES mark)
     record_equity_snapshot(
         mark=p_yes,
         balance=balance,
@@ -626,7 +646,7 @@ def main():
         equity=equity,
     )
 
-    # Gate trading (Day 2)
+    # Gates (use realized pnl today only)
     blocked_reason = None
     if signal in ("YES", "NO"):
         if realized_pnl_today <= -MAX_DAILY_LOSS:
@@ -703,7 +723,7 @@ def main():
         last_mark=p_yes,
     )
 
-    # Recompute unrealized/equity after possible trade
+    # Recompute after trade
     if position == "YES":
         unrealized_pnl = calc_unrealized_pnl_polymarket(position, entry_price, p_yes, stake)
     elif position == "NO":

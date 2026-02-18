@@ -120,7 +120,10 @@ def init_db():
             """)
 
         conn.commit()
-init_snapshots_table()
+
+    # 👇 This MUST be indented inside the function
+    init_snapshots_table()
+
 
 def load_state():
     """Load single-row state (id=1). If missing, create it."""

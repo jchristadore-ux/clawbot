@@ -36,6 +36,8 @@ PROB_Z_SCALE = float(os.getenv("PROB_Z_SCALE", "2.5"))
 
 # One-time state reset switch (set true for ONE run, then false)
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
+ENABLE_SNAPSHOTS = os.getenv("ENABLE_SNAPSHOTS", "false").lower() == "true"
+ENABLE_DRAWDOWN = os.getenv("ENABLE_DRAWDOWN", "false").lower() == "true"
 
 # Kraken
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
@@ -118,7 +120,7 @@ def init_db():
             """)
 
         conn.commit()
-
+init_snapshots_table()
 
 def load_state():
     """Load single-row state (id=1). If missing, create it."""
@@ -459,15 +461,42 @@ def paper_trade_prob(
 # =========================
 # PERFORMANCE (Day 3)
 # =========================
-#def record_equity_snapshot(
-#    mark: float,
-#    balance: float,
-#    position: Optional[str],
-#    entry_price: Optional[float],
-#    stake: float,
-#    unrealized_pnl: float,
-#    equity: float,
-#):
+# =========================
+# PERFORMANCE (optional)
+# =========================
+def init_snapshots_table():
+    """Create equity_snapshots table only if enabled."""
+    if not ENABLE_SNAPSHOTS:
+        return
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+              snapshot_id BIGSERIAL PRIMARY KEY,
+              ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              mark DOUBLE PRECISION NOT NULL,
+              balance DOUBLE PRECISION NOT NULL,
+              position TEXT NULL,
+              entry_price DOUBLE PRECISION NULL,
+              stake DOUBLE PRECISION NOT NULL,
+              unrealized_pnl DOUBLE PRECISION NOT NULL,
+              equity DOUBLE PRECISION NOT NULL
+            );
+            """)
+        conn.commit()
+
+
+def record_equity_snapshot(
+    mark: float,
+    balance: float,
+    position: Optional[str],
+    entry_price: Optional[float],
+    stake: float,
+    unrealized_pnl: float,
+    equity: float,
+):
+    if not ENABLE_SNAPSHOTS:
+        return
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -521,6 +550,9 @@ def get_winrate_last_n_exits(n: int = 20) -> Optional[float]:
 
 
 def get_drawdown_24h() -> Optional[float]:
+    if not ENABLE_DRAWDOWN or not ENABLE_SNAPSHOTS:
+        return None
+
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -546,6 +578,7 @@ def get_drawdown_24h() -> Optional[float]:
         if dd > max_dd:
             max_dd = dd
     return max_dd
+
 
 
 # =========================

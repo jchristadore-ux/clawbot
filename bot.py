@@ -61,6 +61,31 @@ KRAKEN_INTERVAL = 5  # minutes
 # =========================
 # UTIL
 # =========================
+def current_btc_5m_slug(now: Optional[datetime] = None) -> str:
+    # Polymarket short-interval slugs use a unix timestamp (seconds) aligned to the interval.
+    # Use UTC to avoid timezone drift.
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # floor to the current 5-minute boundary
+    floored = now.replace(second=0, microsecond=0)
+    minute = (floored.minute // 5) * 5
+    floored = floored.replace(minute=minute)
+
+    ts = int(floored.timestamp())
+    return f"btc-updown-5m-{ts}"
+
+def current_btc_5m_slug(now: Optional[datetime] = None) -> str:
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    floored = now.replace(second=0, microsecond=0)
+    minute = (floored.minute // 5) * 5
+    floored = floored.replace(minute=minute)
+
+    ts = int(floored.timestamp())
+    return f"btc-updown-5m-{ts}"
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -736,7 +761,12 @@ def main():
 
     # MARKS: prefer Polymarket (CLOB/Gamma), fallback to synthetic
     source = "synthetic"
-    pm = fetch_polymarket_marks(POLY_EVENT_SLUG) if POLY_EVENT_SLUG else None
+
+    # Compute current 5-minute BTC slug dynamically
+    poly_slug = current_btc_5m_slug()
+    print(f"{utc_now_iso()} | INFO | poly_slug={poly_slug}", flush=True)
+
+    pm = fetch_polymarket_marks(poly_slug) 
 
     if pm is not None:
         p_up, p_down, source = pm

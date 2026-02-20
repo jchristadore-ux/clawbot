@@ -11,6 +11,8 @@ from psycopg2.extras import RealDictCursor
 # =========================
 # CONFIG
 # =========================
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.06"))   # 6% edge required to enter
+EDGE_EXIT  = float(os.getenv("EDGE_EXIT", "0.02"))    # 2% edge to hold; below this we exit
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
@@ -578,21 +580,35 @@ def paper_trade_prob(
     signal: str,
     p_up: float,
     p_down: float,
+    edge: float,
     last_trade_ts,
     last_trade_day,
     trades_today: int,
     realized_pnl_today: float,
 ) -> Tuple[float, Optional[str], Optional[float], float, str, object, object, int, float]:
+    """
+    High-conviction mode:
+    - ENTER only when signal != HOLD (signal computed from edge threshold)
+    - EXIT not only on opposite signal, but also when edge collapses:
+        * if holding YES and edge < EDGE_EXIT -> exit
+        * if holding NO and edge > -EDGE_EXIT -> exit
 
-    if signal == "HOLD":
+    entry_price stores p_up when pos=YES, stores p_down when pos=NO
+    """
+
+    if signal == "HOLD" and position is None:
         return (balance, position, entry_price, stake, "HOLD",
                 last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
 
     now_ts = utc_now_dt()
     today = utc_today_date()
 
-    # ENTER if flat
+    # ENTER if flat and we have a non-HOLD signal
     if position is None:
+        if signal == "HOLD":
+            return (balance, position, entry_price, stake, "HOLD",
+                    last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
+
         if balance < (TRADE_SIZE + FEE_PER_TRADE):
             return (balance, position, entry_price, stake, "SKIP_INSUFFICIENT_BALANCE",
                     last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
@@ -611,8 +627,16 @@ def paper_trade_prob(
         return (balance, position, entry_price, stake, f"ENTER_{signal}",
                 last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
 
-    # EXIT if opposite signal (always allowed)
-    if signal != position:
+    # Edge-collapse exit (high conviction)
+    # If our advantage is mostly gone, exit even without an opposite signal.
+    edge_collapse = False
+    if position == "YES" and edge < EDGE_EXIT:
+        edge_collapse = True
+    elif position == "NO" and edge > -EDGE_EXIT:
+        edge_collapse = True
+
+    # EXIT if opposite signal OR edge collapses
+    if (signal != "HOLD" and signal != position) or edge_collapse:
         exit_price = p_up if position == "YES" else p_down
         pnl = calc_realized_pnl(entry_price, exit_price, stake)
 
@@ -633,7 +657,6 @@ def paper_trade_prob(
 
     return (balance, position, entry_price, stake, "HOLD_SAME_SIDE",
             last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
-
 
 # =========================
 # PERFORMANCE: optional snapshots/drawdown
@@ -776,21 +799,36 @@ def main():
     signal = decide(closes)
 
     # MARKS: prefer Polymarket (CLOB/Gamma), fallback to synthetic
-    source = "synthetic"
+source = "synthetic"
 
-    # Compute current 5-minute BTC slug dynamically
-    poly_slug = current_btc_5m_slug()
-    print(f"{utc_now_iso()} | INFO | poly_slug={poly_slug}", flush=True)
+# Compute current 5-minute BTC slug dynamically (for 5m markets)
+poly_slug = current_btc_5m_slug()
+print(f"{utc_now_iso()} | INFO | poly_slug={poly_slug}", flush=True)
 
-    pm = fetch_polymarket_marks(poly_slug) 
+pm = fetch_polymarket_marks(poly_slug)
+if pm is not None:
+    p_up, p_down, source = pm
+else:
+    # synthetic market proxy if polymarket data unavailable
+    p_up = prob_from_closes(closes) if PROB_MODE else 0.5
+    p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
+    p_down = 1.0 - p_up
+    p_down = clamp(p_down, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
 
-    if pm is not None:
-        p_up, p_down, source = pm
-    else:
-        p_up = prob_from_closes(closes) if PROB_MODE else 0.5
-        p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
-        p_down = 1.0 - p_up
-        p_down = clamp(p_down, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
+# FAIR value from Kraken (your model)
+fair_up = prob_from_closes(closes)
+fair_up = clamp(fair_up, PROB_P_MIN, PROB_P_MAX)
+
+# EDGE = model - market (positive means Up is cheap / attractive)
+edge = fair_up - p_up
+
+# High-conviction signal from edge thresholds
+if edge >= EDGE_ENTER:
+    signal = "YES"
+elif edge <= -EDGE_ENTER:
+    signal = "NO"
+else:
+    signal = "HOLD"
 
     # State fields
     balance = float(state["balance"])
@@ -879,17 +917,18 @@ def main():
         trades_today,
         realized_pnl_today,
     ) = paper_trade_prob(
-        balance,
-        position,
-        entry_price,
-        stake,
-        signal,
-        p_up,
-        p_down,
-        last_trade_ts,
-        last_trade_day,
-        trades_today,
-        realized_pnl_today,
+    balance,
+    position,
+    entry_price,
+    stake,
+    signal,
+    p_up,
+    p_down,
+    edge,
+    last_trade_ts,
+    last_trade_day,
+    trades_today,
+    realized_pnl_today,
     )
 
     save_state(
@@ -921,10 +960,10 @@ def main():
     label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
 
     print(
-        f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
-        f"signal={signal} | action={action} | "
-        f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-        f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | src={source}"
+    f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
+    f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
+    f"signal={signal} | action={action} | "
+    ...
     )
     print(
         f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "

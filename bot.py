@@ -11,8 +11,6 @@ from psycopg2.extras import RealDictCursor
 # =========================
 # CONFIG
 # =========================
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.06"))   # 6% edge required to enter
-EDGE_EXIT  = float(os.getenv("EDGE_EXIT", "0.02"))    # 2% edge to hold; below this we exit
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
@@ -20,8 +18,6 @@ TRADE_SIZE = float(os.getenv("TRADE_SIZE", "25"))
 FEE_PER_TRADE = float(os.getenv("FEE_PER_TRADE", "0"))
 
 LOOKBACK = int(os.getenv("LOOKBACK", "5"))
-UP_THRESHOLD = float(os.getenv("UP_THRESHOLD", "1.002"))     # +0.2%
-DOWN_THRESHOLD = float(os.getenv("DOWN_THRESHOLD", "0.998"))  # -0.2%
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "20"))
@@ -37,24 +33,26 @@ PROB_P_MIN = float(os.getenv("PROB_P_MIN", "0.05"))
 PROB_P_MAX = float(os.getenv("PROB_P_MAX", "0.95"))
 PROB_Z_SCALE = float(os.getenv("PROB_Z_SCALE", "2.5"))
 
+# High-conviction parameters
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.06"))  # 6% edge to ENTER
+EDGE_EXIT  = float(os.getenv("EDGE_EXIT", "0.02"))   # 2% edge to EXIT when edge collapses
+
 # One-time reset switch (set true for ONE run, then set back to false)
 RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
 
 # Polymarket (Gamma + CLOB)
-POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()  # event slug OR market slug
 POLY_TIMEOUT_SEC = int(os.getenv("POLY_TIMEOUT_SEC", "20"))
 DEBUG_POLY = os.getenv("DEBUG_POLY", "false").lower() == "true"
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-
 CLOB_PRICE_URL = "https://clob.polymarket.com/price"
 
 # Optional performance snapshots (safe OFF by default)
 ENABLE_SNAPSHOTS = os.getenv("ENABLE_SNAPSHOTS", "false").lower() == "true"
 ENABLE_DRAWDOWN = os.getenv("ENABLE_DRAWDOWN", "false").lower() == "true"
 
-# Kraken (for strategy + fallback marks)
+# Kraken (for closes + fallback model)
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_PAIR = "XBTUSD"
 KRAKEN_INTERVAL = 5  # minutes
@@ -63,31 +61,6 @@ KRAKEN_INTERVAL = 5  # minutes
 # =========================
 # UTIL
 # =========================
-def current_btc_5m_slug(now: Optional[datetime] = None) -> str:
-    # Polymarket short-interval slugs use a unix timestamp (seconds) aligned to the interval.
-    # Use UTC to avoid timezone drift.
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    # floor to the current 5-minute boundary
-    floored = now.replace(second=0, microsecond=0)
-    minute = (floored.minute // 5) * 5
-    floored = floored.replace(minute=minute)
-
-    ts = int(floored.timestamp())
-    return f"btc-updown-5m-{ts}"
-
-def current_btc_5m_slug(now: Optional[datetime] = None) -> str:
-    if now is None:
-        now = datetime.now(timezone.utc)
-
-    floored = now.replace(second=0, microsecond=0)
-    minute = (floored.minute // 5) * 5
-    floored = floored.replace(minute=minute)
-
-    ts = int(floored.timestamp())
-    return f"btc-updown-5m-{ts}"
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -126,6 +99,20 @@ def _safe_float(x) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def current_btc_5m_slug(now: Optional[datetime] = None) -> str:
+    """
+    Polymarket 5m markets rotate. Slug format: btc-updown-5m-<unix_ts_floored_to_5m>
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    floored = now.replace(second=0, microsecond=0)
+    minute = (floored.minute // 5) * 5
+    floored = floored.replace(minute=minute)
+    ts = int(floored.timestamp())
+    return f"btc-updown-5m-{ts}"
 
 
 def db_conn():
@@ -314,25 +301,12 @@ def fetch_btc_closes_5m(lookback: int) -> Optional[list]:
             last_error = str(e)
             _sleep_backoff(attempt)
 
-    print(f"{utc_now_iso()} | WARN | Price fetch failed after retries: {last_error}")
+    print(f"{utc_now_iso()} | WARN | Price fetch failed after retries: {last_error}", flush=True)
     return None
 
 
 # =========================
-# STRATEGY: signal from closes
-# =========================
-def decide(closes: list) -> str:
-    avg = sum(closes) / len(closes)
-    last = closes[-1]
-    if last > avg * UP_THRESHOLD:
-        return "YES"   # Up
-    if last < avg * DOWN_THRESHOLD:
-        return "NO"    # Down
-    return "HOLD"
-
-
-# =========================
-# SYNTHETIC MARKS: probability from closes
+# MODEL: synthetic probability from closes
 # =========================
 def prob_from_closes(closes: list) -> float:
     avg = sum(closes) / len(closes)
@@ -347,11 +321,7 @@ def prob_from_closes(closes: list) -> float:
 # =========================
 # POLYMARKET HELPERS (Gamma + CLOB)
 # =========================
-
 def _maybe_json_list(x):
-    """
-    Gamma sometimes returns JSON arrays as strings: '["Yes","No"]'
-    """
     if x is None:
         return None
     if isinstance(x, list):
@@ -434,9 +404,6 @@ def _extract_updown_from_market(m: dict) -> Optional[Dict[str, Any]]:
 
 
 def _fetch_clob_price(token_id: str, side: str = "BUY") -> float:
-    """
-    CLOB /price expects side BUY/SELL (uppercase)
-    """
     r = requests.get(
         CLOB_PRICE_URL,
         params={"token_id": token_id, "side": side},
@@ -452,10 +419,8 @@ def _fetch_clob_price(token_id: str, side: str = "BUY") -> float:
 
 def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
     """
-    Attempts (per market candidate):
-      1) CLOB prices via clobTokenIds -> source 'clob' (with sanity check)
-      2) Gamma outcomePrices -> source 'gamma'
-    Returns None if unusable (caller falls back to synthetic).
+    Returns (p_up, p_down, source) where source is 'clob' or 'gamma'.
+    Returns None if unusable.
     """
     s = (slug or "").strip()
     if not s:
@@ -467,12 +432,12 @@ def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
         try:
             candidate_markets: list = []
 
-            # 1) Try as MARKET slug
+            # Try as MARKET slug
             m = _get_market_by_slug(s)
             if isinstance(m, dict) and m:
                 candidate_markets.append(m)
 
-            # 2) Try as EVENT slug and hydrate markets
+            # Try as EVENT slug and hydrate markets
             if not candidate_markets:
                 ev = _get_event_by_slug(s)
                 if isinstance(ev, dict) and ev:
@@ -489,16 +454,7 @@ def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
 
             if DEBUG_POLY:
                 print(f"{utc_now_iso()} | DEBUG | poly_slug={s} candidate_markets={len(candidate_markets)}", flush=True)
-                if candidate_markets and isinstance(candidate_markets[0], dict):
-                    cm0 = candidate_markets[0]
-                    print(
-                        f"{utc_now_iso()} | DEBUG | sample_market_id={cm0.get('id')} "
-                        f"has_outcomePrices={'outcomePrices' in cm0} "
-                        f"has_clobTokenIds={('clobTokenIds' in cm0 or 'clobTokenIDs' in cm0)}",
-                        flush=True
-                    )
 
-            # 3) Evaluate candidates
             for cm in candidate_markets:
                 if not isinstance(cm, dict):
                     continue
@@ -510,29 +466,29 @@ def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
                 up_tid = info.get("up_tid")
                 dn_tid = info.get("dn_tid")
 
-                # 3a) Try CLOB if we have token IDs
+                # Try CLOB
                 if up_tid and dn_tid:
                     try:
                         p_up = _fetch_clob_price(up_tid, side="BUY")
                         p_dn = _fetch_clob_price(dn_tid, side="BUY")
 
-                        # Sanity check: two-outcome markets should roughly sum to ~1.0
-                        if abs((p_up + p_dn) - 1.0) > 0.15:
+                        # sanity: two-outcome markets should sum near 1.0 (allow spread)
+                        if abs((p_up + p_dn) - 1.0) <= 0.15:
+                            return clamp(p_up, 0.001, 0.999), clamp(p_dn, 0.001, 0.999), "clob"
+                        else:
                             if DEBUG_POLY:
                                 print(
                                     f"{utc_now_iso()} | DEBUG | clob_sanity_failed "
-                                    f"p_up={p_up:.3f} p_dn={p_dn:.3f} sum={(p_up + p_dn):.3f}",
-                                    flush=True
+                                    f"p_up={p_up:.3f} p_dn={p_dn:.3f} sum={(p_up+p_dn):.3f}",
+                                    flush=True,
                                 )
                             # fall through to Gamma
-                        else:
-                            return clamp(p_up, 0.001, 0.999), clamp(p_dn, 0.001, 0.999), "clob"
 
                     except Exception as e:
                         last_error = str(e)[:200]
                         # fall through to Gamma
 
-                # 3b) Try Gamma outcomePrices if present
+                # Try Gamma outcomePrices
                 up_g = info.get("up_gamma")
                 dn_g = info.get("dn_gamma")
                 if up_g is not None and dn_g is not None:
@@ -570,7 +526,7 @@ def calc_realized_pnl(entry_price: float, exit_price: float, stake: float) -> fl
 
 
 # =========================
-# PAPER TRADE: probability marks (Up/Down)
+# PAPER TRADE: high-conviction edge-based
 # =========================
 def paper_trade_prob(
     balance: float,
@@ -586,19 +542,6 @@ def paper_trade_prob(
     trades_today: int,
     realized_pnl_today: float,
 ) -> Tuple[float, Optional[str], Optional[float], float, str, object, object, int, float]:
-    """
-    High-conviction mode:
-    - ENTER only when signal != HOLD (signal computed from edge threshold)
-    - EXIT not only on opposite signal, but also when edge collapses:
-        * if holding YES and edge < EDGE_EXIT -> exit
-        * if holding NO and edge > -EDGE_EXIT -> exit
-
-    entry_price stores p_up when pos=YES, stores p_down when pos=NO
-    """
-
-    if signal == "HOLD" and position is None:
-        return (balance, position, entry_price, stake, "HOLD",
-                last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
 
     now_ts = utc_now_dt()
     today = utc_today_date()
@@ -627,15 +570,13 @@ def paper_trade_prob(
         return (balance, position, entry_price, stake, f"ENTER_{signal}",
                 last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
 
-    # Edge-collapse exit (high conviction)
-    # If our advantage is mostly gone, exit even without an opposite signal.
+    # EXIT if opposite signal OR edge collapses
     edge_collapse = False
     if position == "YES" and edge < EDGE_EXIT:
         edge_collapse = True
     elif position == "NO" and edge > -EDGE_EXIT:
         edge_collapse = True
 
-    # EXIT if opposite signal OR edge collapses
     if (signal != "HOLD" and signal != position) or edge_collapse:
         exit_price = p_up if position == "YES" else p_down
         pnl = calc_realized_pnl(entry_price, exit_price, stake)
@@ -657,6 +598,7 @@ def paper_trade_prob(
 
     return (balance, position, entry_price, stake, "HOLD_SAME_SIDE",
             last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
+
 
 # =========================
 # PERFORMANCE: optional snapshots/drawdown
@@ -788,49 +730,41 @@ def main():
             realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
             last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
         )
-        print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared.")
+        print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared.", flush=True)
         return
 
     closes = fetch_btc_closes_5m(LOOKBACK)
     if closes is None:
-        print(f"{utc_now_iso()} | INFO | No data this run. balance={float(state['balance']):.2f} pos={state['position']}")
+        print(f"{utc_now_iso()} | INFO | No data this run. balance={float(state['balance']):.2f} pos={state['position']}", flush=True)
         return
 
-    signal = decide(closes)
+    # --- Marks: Polymarket preferred, synthetic fallback ---
+    source = "synthetic"
+    poly_slug = current_btc_5m_slug()
+    print(f"{utc_now_iso()} | INFO | poly_slug={poly_slug}", flush=True)
 
-    # MARKS: prefer Polymarket (CLOB/Gamma), fallback to synthetic
-source = "synthetic"
+    pm = fetch_polymarket_marks(poly_slug)
+    if pm is not None:
+        p_up, p_down, source = pm
+    else:
+        p_up = prob_from_closes(closes) if PROB_MODE else 0.5
+        p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
+        p_down = 1.0 - p_up
+        p_down = clamp(p_down, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
 
-# Compute current 5-minute BTC slug dynamically (for 5m markets)
-poly_slug = current_btc_5m_slug()
-print(f"{utc_now_iso()} | INFO | poly_slug={poly_slug}", flush=True)
+    # --- Fair + edge + high-conviction signal ---
+    fair_up = prob_from_closes(closes)
+    fair_up = clamp(fair_up, PROB_P_MIN, PROB_P_MAX)
+    edge = fair_up - p_up
 
-pm = fetch_polymarket_marks(poly_slug)
-if pm is not None:
-    p_up, p_down, source = pm
-else:
-    # synthetic market proxy if polymarket data unavailable
-    p_up = prob_from_closes(closes) if PROB_MODE else 0.5
-    p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
-    p_down = 1.0 - p_up
-    p_down = clamp(p_down, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
+    if edge >= EDGE_ENTER:
+        signal = "YES"
+    elif edge <= -EDGE_ENTER:
+        signal = "NO"
+    else:
+        signal = "HOLD"
 
-# FAIR value from Kraken (your model)
-fair_up = prob_from_closes(closes)
-fair_up = clamp(fair_up, PROB_P_MIN, PROB_P_MAX)
-
-# EDGE = model - market (positive means Up is cheap / attractive)
-edge = fair_up - p_up
-
-# High-conviction signal from edge thresholds
-if edge >= EDGE_ENTER:
-    signal = "YES"
-elif edge <= -EDGE_ENTER:
-    signal = "NO"
-else:
-    signal = "HOLD"
-
-    # State fields
+    # --- State fields ---
     balance = float(state["balance"])
     position = state["position"]
     entry_price = float(state["entry_price"]) if state["entry_price"] is not None else None
@@ -893,15 +827,18 @@ else:
 
         print(
             f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
+            f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
             f"signal={signal} | action=BLOCKED | reason={blocked_reason} | "
             f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-            f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | src={source}"
+            f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | src={source}",
+            flush=True
         )
         print(
             f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
             f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
             f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
-            f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}"
+            f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}",
+            flush=True
         )
         return
 
@@ -917,18 +854,18 @@ else:
         trades_today,
         realized_pnl_today,
     ) = paper_trade_prob(
-    balance,
-    position,
-    entry_price,
-    stake,
-    signal,
-    p_up,
-    p_down,
-    edge,
-    last_trade_ts,
-    last_trade_day,
-    trades_today,
-    realized_pnl_today,
+        balance,
+        position,
+        entry_price,
+        stake,
+        signal,
+        p_up,
+        p_down,
+        edge,
+        last_trade_ts,
+        last_trade_day,
+        trades_today,
+        realized_pnl_today,
     )
 
     save_state(
@@ -960,16 +897,19 @@ else:
     label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
 
     print(
-    f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
-    f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
-    f"signal={signal} | action={action} | "
-    ...
+        f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
+        f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
+        f"signal={signal} | action={action} | "
+        f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
+        f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | src={source}",
+        flush=True
     )
     print(
         f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
         f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
         f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
-        f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}"
+        f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}",
+        flush=True
     )
 
 
@@ -983,4 +923,3 @@ if __name__ == "__main__":
         print("FATAL: bot.py crashed:", repr(e), flush=True)
         traceback.print_exc()
         raise
-

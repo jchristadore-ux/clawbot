@@ -780,7 +780,7 @@ def main():
         signal = "HOLD"
         
     if abs(edge) > 0.30:
-    signal = "HOLD"
+        signal = "HOLD"
     
     # --- State fields ---
     balance = float(state["balance"])

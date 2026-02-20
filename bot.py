@@ -733,19 +733,19 @@ def main():
     state = reset_daily_counters_if_needed(state)
 
     # One-time reset to clear open position
-    if RESET_STATE:
+    if RESET_DAILY:
         save_state(
             balance=float(state["balance"]),
-            position=None,
-            entry_price=None,
-            stake=0.0,
+            position=state["position"],
+            entry_price=float(state["entry_price"]) if state["entry_price"] is not None else None,
+            stake=float(state["stake"]),
             last_trade_ts=state.get("last_trade_ts"),
-            last_trade_day=_as_date(state.get("last_trade_day")),
-            trades_today=int(state.get("trades_today", 0)),
-            realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
+            last_trade_day=utc_today_date(),
+            trades_today=0,
+            realized_pnl_today=0.0,
             last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
         )
-        print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared.", flush=True)
+        print(f"{utc_now_iso()} | INFO | RESET_DAILY applied. Daily counters cleared.", flush=True)
         return
 
     closes = fetch_btc_closes_5m(LOOKBACK)

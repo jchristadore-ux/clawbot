@@ -345,6 +345,7 @@ def prob_from_closes(closes: list) -> float:
 # =========================
 # POLYMARKET HELPERS (Gamma + CLOB)
 # =========================
+
 def _maybe_json_list(x):
     """
     Gamma sometimes returns JSON arrays as strings: '["Yes","No"]'
@@ -449,8 +450,8 @@ def _fetch_clob_price(token_id: str, side: str = "BUY") -> float:
 
 def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
     """
-    Attempts:
-      1) CLOB prices via clobTokenIds -> source 'clob'
+    Attempts (per market candidate):
+      1) CLOB prices via clobTokenIds -> source 'clob' (with sanity check)
       2) Gamma outcomePrices -> source 'gamma'
     Returns None if unusable (caller falls back to synthetic).
     """
@@ -464,12 +465,12 @@ def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
         try:
             candidate_markets: list = []
 
-            # Try as MARKET slug
+            # 1) Try as MARKET slug
             m = _get_market_by_slug(s)
             if isinstance(m, dict) and m:
                 candidate_markets.append(m)
 
-            # Try as EVENT slug and hydrate markets
+            # 2) Try as EVENT slug and hydrate markets
             if not candidate_markets:
                 ev = _get_event_by_slug(s)
                 if isinstance(ev, dict) and ev:
@@ -485,18 +486,21 @@ def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
                             candidate_markets.append(full if full else x)
 
             if DEBUG_POLY:
-                print(f"{utc_now_iso()} | DEBUG | poly_slug={s} candidate_markets={len(candidate_markets)}")
+                print(f"{utc_now_iso()} | DEBUG | poly_slug={s} candidate_markets={len(candidate_markets)}", flush=True)
                 if candidate_markets and isinstance(candidate_markets[0], dict):
                     cm0 = candidate_markets[0]
                     print(
                         f"{utc_now_iso()} | DEBUG | sample_market_id={cm0.get('id')} "
                         f"has_outcomePrices={'outcomePrices' in cm0} "
-                        f"has_clobTokenIds={('clobTokenIds' in cm0 or 'clobTokenIDs' in cm0)}"
+                        f"has_clobTokenIds={('clobTokenIds' in cm0 or 'clobTokenIDs' in cm0)}",
+                        flush=True
                     )
 
+            # 3) Evaluate candidates
             for cm in candidate_markets:
                 if not isinstance(cm, dict):
                     continue
+
                 info = _extract_updown_from_market(cm)
                 if not info:
                     continue
@@ -504,17 +508,29 @@ def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
                 up_tid = info.get("up_tid")
                 dn_tid = info.get("dn_tid")
 
-                # 1) Try CLOB if we have token IDs
+                # 3a) Try CLOB if we have token IDs
                 if up_tid and dn_tid:
                     try:
                         p_up = _fetch_clob_price(up_tid, side="BUY")
                         p_dn = _fetch_clob_price(dn_tid, side="BUY")
-                        return clamp(p_up, 0.001, 0.999), clamp(p_dn, 0.001, 0.999), "clob"
+
+                        # Sanity check: two-outcome markets should roughly sum to ~1.0
+                        if abs((p_up + p_dn) - 1.0) > 0.15:
+                            if DEBUG_POLY:
+                                print(
+                                    f"{utc_now_iso()} | DEBUG | clob_sanity_failed "
+                                    f"p_up={p_up:.3f} p_dn={p_dn:.3f} sum={(p_up + p_dn):.3f}",
+                                    flush=True
+                                )
+                            # fall through to Gamma
+                        else:
+                            return clamp(p_up, 0.001, 0.999), clamp(p_dn, 0.001, 0.999), "clob"
+
                     except Exception as e:
                         last_error = str(e)[:200]
                         # fall through to Gamma
 
-                # 2) Try Gamma outcomePrices if present
+                # 3b) Try Gamma outcomePrices if present
                 up_g = info.get("up_gamma")
                 dn_g = info.get("dn_gamma")
                 if up_g is not None and dn_g is not None:
@@ -528,7 +544,7 @@ def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
             _sleep_backoff(attempt)
 
     if DEBUG_POLY:
-        print(f"{utc_now_iso()} | DEBUG | fetch_polymarket_marks failed: {last_error}")
+        print(f"{utc_now_iso()} | DEBUG | fetch_polymarket_marks failed: {last_error}", flush=True)
     return None
 
 

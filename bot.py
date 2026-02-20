@@ -253,21 +253,6 @@ def reset_daily_counters_if_needed(state: dict) -> dict:
         state["realized_pnl_today"] = 0.0
     return state
 
-if RESET_DAILY:
-    save_state(
-        balance=float(state["balance"]),
-        position=state["position"],
-        entry_price=float(state["entry_price"]) if state["entry_price"] is not None else None,
-        stake=float(state["stake"]),
-        last_trade_ts=state.get("last_trade_ts"),
-        last_trade_day=utc_today_date(),
-        trades_today=0,
-        realized_pnl_today=0.0,
-        last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
-    )
-    print(f"{utc_now_iso()} | INFO | RESET_DAILY applied. Daily counters cleared.", flush=True)
-    return
-
 def cooldown_active(last_trade_ts, cooldown_minutes: int) -> bool:
     if last_trade_ts is None:
         return False

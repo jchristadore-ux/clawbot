@@ -802,7 +802,7 @@ def main():
         equity=equity,
     )
 
-       blocked_reason = None
+    blocked_reason = None
     if position is None and signal in ("YES", "NO"):
         if realized_pnl_today <= -MAX_DAILY_LOSS:
             blocked_reason = f"MAX_DAILY_LOSS hit (pnl_today={realized_pnl_today:.2f} <= -{MAX_DAILY_LOSS})"

@@ -802,25 +802,38 @@ def main():
         equity=equity,
     )
 
+        # Risk gates apply ONLY to ENTER (position is None)
     blocked_reason = None
     if position is None and signal in ("YES", "NO"):
+
+        whale_ok = (ALLOW_WHALE_AFTER_CAP and abs(edge) >= WHALE_EDGE)
+
         if realized_pnl_today <= -MAX_DAILY_LOSS:
             blocked_reason = f"MAX_DAILY_LOSS hit (pnl_today={realized_pnl_today:.2f} <= -{MAX_DAILY_LOSS})"
 
         elif trades_today >= MAX_TRADES_PER_DAY:
-            # Whale override: after hitting the daily cap, only allow trades with huge edge
-            if not (ALLOW_WHALE_AFTER_CAP and abs(edge) >= WHALE_EDGE):
+            # After hitting the daily cap, only allow whale trades
+            if not whale_ok:
                 blocked_reason = f"MAX_TRADES_PER_DAY hit (trades_today={trades_today} >= {MAX_TRADES_PER_DAY})"
             else:
                 if DEBUG_POLY:
                     print(
-                        f"{utc_now_iso()} | DEBUG | whale_override "
+                        f"{utc_now_iso()} | DEBUG | whale_override_after_cap "
                         f"trades_today={trades_today} edge={edge:+.3f} >= {WHALE_EDGE}",
                         flush=True
                     )
 
         elif cooldown_active(last_trade_ts, COOLDOWN_MINUTES):
-            blocked_reason = f"COOLDOWN active ({COOLDOWN_MINUTES}m since last trade)"
+            # During cooldown, only allow whale trades
+            if not whale_ok:
+                blocked_reason = f"COOLDOWN active ({COOLDOWN_MINUTES}m since last trade)"
+            else:
+                if DEBUG_POLY:
+                    print(
+                        f"{utc_now_iso()} | DEBUG | whale_override_cooldown "
+                        f"edge={edge:+.3f} >= {WHALE_EDGE}",
+                        flush=True
+                    )
 
     if blocked_reason:
         save_state(

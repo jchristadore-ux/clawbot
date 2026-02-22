@@ -27,6 +27,10 @@ MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))          # realized onl
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8"))
 
+# Whale override (allows only huge-edge trades after daily cap)
+ALLOW_WHALE_AFTER_CAP = os.getenv("ALLOW_WHALE_AFTER_CAP", "true").lower() == "true"
+WHALE_EDGE = float(os.getenv("WHALE_EDGE", "0.18"))  # only override cap if abs(edge) >= this
+
 # Synthetic probability fallback (from Kraken closes)
 PROB_MODE = os.getenv("PROB_MODE", "true").lower() == "true"
 PROB_P_MIN = float(os.getenv("PROB_P_MIN", "0.05"))
@@ -798,13 +802,23 @@ def main():
         equity=equity,
     )
 
-    # Risk gates apply ONLY to ENTER (position is None)
-    blocked_reason = None
+       blocked_reason = None
     if position is None and signal in ("YES", "NO"):
         if realized_pnl_today <= -MAX_DAILY_LOSS:
             blocked_reason = f"MAX_DAILY_LOSS hit (pnl_today={realized_pnl_today:.2f} <= -{MAX_DAILY_LOSS})"
+
         elif trades_today >= MAX_TRADES_PER_DAY:
-            blocked_reason = f"MAX_TRADES_PER_DAY hit (trades_today={trades_today} >= {MAX_TRADES_PER_DAY})"
+            # Whale override: after hitting the daily cap, only allow trades with huge edge
+            if not (ALLOW_WHALE_AFTER_CAP and abs(edge) >= WHALE_EDGE):
+                blocked_reason = f"MAX_TRADES_PER_DAY hit (trades_today={trades_today} >= {MAX_TRADES_PER_DAY})"
+            else:
+                if DEBUG_POLY:
+                    print(
+                        f"{utc_now_iso()} | DEBUG | whale_override "
+                        f"trades_today={trades_today} edge={edge:+.3f} >= {WHALE_EDGE}",
+                        flush=True
+                    )
+
         elif cooldown_active(last_trade_ts, COOLDOWN_MINUTES):
             blocked_reason = f"COOLDOWN active ({COOLDOWN_MINUTES}m since last trade)"
 

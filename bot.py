@@ -12,7 +12,7 @@ from psycopg2.extras import RealDictCursor
 # CONFIG
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
+STATS_ONLY = os.getenv("STATS_ONLY", "false").lower() == "true"
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "25"))
 FEE_PER_TRADE = float(os.getenv("FEE_PER_TRADE", "0"))
@@ -710,13 +710,70 @@ def get_drawdown_24h() -> Optional[float]:
         if dd > max_dd:
             max_dd = dd
     return max_dd
+    
+def print_db_stats():
+    """
+    Prints go-live dashboard stats from Postgres, then returns.
+    Safe to run inside Railway since the app has DB access.
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            # Core: exits total, exits 24h, pnl 24h
+            cur.execute("""
+                SELECT
+                  COUNT(*) FILTER (WHERE action='EXIT') AS exits_total,
+                  COUNT(*) FILTER (WHERE action='EXIT' AND ts >= NOW() - INTERVAL '24 hours') AS exits_24h,
+                  COALESCE(SUM(pnl) FILTER (WHERE action='EXIT' AND ts >= NOW() - INTERVAL '24 hours'),0) AS pnl_24h,
+                  COUNT(*) FILTER (WHERE ts >= NOW() - INTERVAL '24 hours') AS trades_24h
+                FROM paper_trades;
+            """)
+            exits_total, exits_24h, pnl_24h, trades_24h = cur.fetchone()
 
+            # Last 10 days breakdown
+            cur.execute("""
+                SELECT
+                  (ts AT TIME ZONE 'UTC')::date AS day_utc,
+                  COUNT(*) FILTER (WHERE action='EXIT') AS exits,
+                  COALESCE(SUM(pnl) FILTER (WHERE action='EXIT'),0) AS realized_pnl
+                FROM paper_trades
+                GROUP BY 1
+                ORDER BY 1 DESC
+                LIMIT 10;
+            """)
+            daily_rows = cur.fetchall()
+
+            # Winrate on last 20 exits (should match your existing function, but this is self-contained)
+            cur.execute("""
+                SELECT pnl
+                FROM paper_trades
+                WHERE action='EXIT' AND pnl IS NOT NULL
+                ORDER BY ts DESC
+                LIMIT 20;
+            """)
+            pnls = [float(r[0]) for r in cur.fetchall()]
+            winrate20 = None
+            if pnls:
+                wins = sum(1 for p in pnls if p > 0)
+                winrate20 = wins / len(pnls)
+
+    print(f"{utc_now_iso()} | STATS | exits_total={int(exits_total)} exits_24h={int(exits_24h)} "
+          f"pnl_24h(realized)={float(pnl_24h):.2f} trades_24h={int(trades_24h)} "
+          f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')}",
+          flush=True)
+
+    print(f"{utc_now_iso()} | STATS | last_10_days (UTC):", flush=True)
+    for day_utc, exits, realized_pnl in daily_rows:
+        print(f"{utc_now_iso()} | STATS | {day_utc} | exits={int(exits)} | realized_pnl={float(realized_pnl):.2f}", flush=True)
 
 # =========================
 # MAIN
 # =========================
 def main():
     init_db()
+
+    if STATS_ONLY:
+        print_db_stats()
+        return
 
     state = load_state()
     state = reset_daily_counters_if_needed(state)

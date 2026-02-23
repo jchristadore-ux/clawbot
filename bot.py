@@ -1,1086 +1,131 @@
-# bot.py
-import os
-import time
-import json
-from datetime import datetime, timezone, timedelta, date
-from typing import Optional, Tuple, Dict, Any, List
+from datetime import datetime, timezone
 
-import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from clawbot import config
+from clawbot.alerts import FailureTracker, maybe_alert_on_failures, send_alert
+from clawbot.data import current_btc_5m_slug, fetch_btc_closes_5m, fetch_polymarket_marks
+from clawbot.execution import place_live_order, reconcile_order
+from clawbot.risk import should_block_enter
+from clawbot.state import (
+    calc_unrealized_pnl,
+    init_db,
+    load_state,
+    log_trade,
+    paper_trade_step,
+    reserve_interval,
+    reset_daily_counters_if_needed,
+    save_state,
+)
+from clawbot.strategy import build_signal, calc_edge, marks_look_sane_for_live, prob_from_closes
 
-# =========================
-# CONFIG
-# =========================
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-# Modes
-STATS_ONLY = os.getenv("STATS_ONLY", "false").lower() == "true"
-RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"   # clears open position only
-RESET_DAILY = os.getenv("RESET_DAILY", "false").lower() == "true"   # clears daily counters only
-
-# Paper defaults
-START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
-TRADE_SIZE = float(os.getenv("TRADE_SIZE", "25"))
-FEE_PER_TRADE = float(os.getenv("FEE_PER_TRADE", "0"))
-
-# Synthetic model (Kraken)
-LOOKBACK = int(os.getenv("LOOKBACK", "5"))
-PROB_MODE = os.getenv("PROB_MODE", "true").lower() == "true"
-PROB_P_MIN = float(os.getenv("PROB_P_MIN", "0.05"))
-PROB_P_MAX = float(os.getenv("PROB_P_MAX", "0.95"))
-PROB_Z_SCALE = float(os.getenv("PROB_Z_SCALE", "2.5"))
-
-# High-conviction thresholds (paper defaults)
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.08"))  # enter when |edge| >= this
-EDGE_EXIT = float(os.getenv("EDGE_EXIT", "0.04"))    # exit when edge collapses below this
-
-# Risk controls (paper defaults)
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))       # realized only
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8")) # counts ENTER+EXIT events
-
-# LIVE mode safety pack (overrides when LIVE_MODE=true)
-LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() == "true"
-KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
-
-LIVE_TRADE_SIZE = float(os.getenv("LIVE_TRADE_SIZE", "5"))
-LIVE_MAX_TRADES_PER_DAY = int(os.getenv("LIVE_MAX_TRADES_PER_DAY", "10"))
-LIVE_MAX_DAILY_LOSS = float(os.getenv("LIVE_MAX_DAILY_LOSS", "15"))
-LIVE_COOLDOWN_MINUTES = int(os.getenv("LIVE_COOLDOWN_MINUTES", "20"))
-
-LIVE_MIN_EDGE_ENTER = float(os.getenv("LIVE_MIN_EDGE_ENTER", "0.10"))
-LIVE_MIN_EDGE_EXIT = float(os.getenv("LIVE_MIN_EDGE_EXIT", "0.04"))
-
-LIVE_MIN_MARK_SUM = float(os.getenv("LIVE_MIN_MARK_SUM", "0.85"))
-LIVE_MAX_MARK_SUM = float(os.getenv("LIVE_MAX_MARK_SUM", "1.15"))
-LIVE_MIN_PRICE = float(os.getenv("LIVE_MIN_PRICE", "0.03"))
-LIVE_MAX_PRICE = float(os.getenv("LIVE_MAX_PRICE", "0.97"))
-
-LIVE_DAILY_PROFIT_LOCK = float(os.getenv("LIVE_DAILY_PROFIT_LOCK", "0"))  # 0 disables
-
-# Whale override (bypass cooldown ONLY)
-WHALE_COOLDOWN_OVERRIDE = os.getenv("WHALE_COOLDOWN_OVERRIDE", "true").lower() == "true"
-WHALE_EDGE_OVERRIDE = float(os.getenv("WHALE_EDGE_OVERRIDE", "0.20"))  # abs(edge) >= this bypasses cooldown
-
-# HTTP
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
-TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "20"))
-
-# Polymarket (Gamma + CLOB)
-POLY_TIMEOUT_SEC = int(os.getenv("POLY_TIMEOUT_SEC", "20"))
-DEBUG_POLY = os.getenv("DEBUG_POLY", "false").lower() == "true"
-
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-CLOB_PRICE_URL = "https://clob.polymarket.com/price"
-
-# Optional snapshots/drawdown
-ENABLE_SNAPSHOTS = os.getenv("ENABLE_SNAPSHOTS", "false").lower() == "true"
-ENABLE_DRAWDOWN = os.getenv("ENABLE_DRAWDOWN", "false").lower() == "true"
-
-# Kraken OHLC
-KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
-KRAKEN_PAIR = "XBTUSD"
-KRAKEN_INTERVAL = 5  # minutes
-
-
-# =========================
-# UTIL
-# =========================
-def utc_now_dt() -> datetime:
-    return datetime.now(timezone.utc)
 
 def utc_now_iso() -> str:
-    return utc_now_dt().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def utc_today_date() -> date:
-    return utc_now_dt().date()
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+def _act_live(signal: str, p_up: float, p_down: float, stake: float, symbol: str):
+    if signal not in ("YES", "NO"):
+        return "HOLD", None, None
+    px = p_up if signal == "YES" else p_down
+    res = place_live_order(side=signal, price=px, stake=stake, symbol=symbol)
+    rec = reconcile_order(res.order_id) if res.order_id else res
+    log_trade("LIVE_ORDER", side=signal, price=px, stake=stake, order_id=res.order_id, order_status=rec.status)
+    return f"LIVE_{rec.status.upper()}", res.order_id, rec.status
 
-def _as_date(value) -> Optional[date]:
-    if value is None:
-        return None
-    if isinstance(value, date):
-        return value
-    try:
-        return datetime.fromisoformat(str(value)).date()
-    except Exception:
-        return None
 
-def _sleep_backoff(attempt: int) -> None:
-    time.sleep(1.0 * attempt)
-
-def _safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def cooldown_active(last_trade_ts, cooldown_minutes: int) -> bool:
-    if last_trade_ts is None:
-        return False
-    try:
-        return utc_now_dt() < (last_trade_ts + timedelta(minutes=cooldown_minutes))
-    except Exception:
-        return False
-
-def current_btc_5m_slug(now: Optional[datetime] = None) -> str:
-    if now is None:
-        now = utc_now_dt()
-    floored = now.replace(second=0, microsecond=0)
-    minute = (floored.minute // 5) * 5
-    floored = floored.replace(minute=minute)
-    ts = int(floored.timestamp())
-    return f"btc-updown-5m-{ts}"
-
-# Effective (paper vs live)
-def effective_trade_size() -> float:
-    return LIVE_TRADE_SIZE if LIVE_MODE else TRADE_SIZE
-
-def effective_edge_enter() -> float:
-    return LIVE_MIN_EDGE_ENTER if LIVE_MODE else EDGE_ENTER
-
-def effective_edge_exit() -> float:
-    return LIVE_MIN_EDGE_EXIT if LIVE_MODE else EDGE_EXIT
-
-def effective_max_trades_per_day() -> int:
-    return LIVE_MAX_TRADES_PER_DAY if LIVE_MODE else MAX_TRADES_PER_DAY
-
-def effective_max_daily_loss() -> float:
-    return LIVE_MAX_DAILY_LOSS if LIVE_MODE else MAX_DAILY_LOSS
-
-def effective_cooldown_minutes() -> int:
-    return LIVE_COOLDOWN_MINUTES if LIVE_MODE else COOLDOWN_MINUTES
-
-def marks_look_sane_for_live(p_up: float, p_down: float) -> bool:
-    if not LIVE_MODE:
-        return True
-    s = p_up + p_down
-    if s < LIVE_MIN_MARK_SUM or s > LIVE_MAX_MARK_SUM:
-        return False
-    if not (LIVE_MIN_PRICE <= p_up <= LIVE_MAX_PRICE):
-        return False
-    if not (LIVE_MIN_PRICE <= p_down <= LIVE_MAX_PRICE):
-        return False
-    return True
-
-
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set. Add Railway Postgres so DATABASE_URL is injected.")
-    return psycopg2.connect(DATABASE_URL)
-
-
-# =========================
-# DB: schema + state + trades
-# =========================
-def init_db():
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS paper_state (
-              id INTEGER PRIMARY KEY,
-              balance DOUBLE PRECISION NOT NULL,
-              position TEXT NULL,
-              entry_price DOUBLE PRECISION NULL,
-              stake DOUBLE PRECISION NOT NULL,
-
-              last_trade_ts TIMESTAMPTZ,
-              last_trade_day DATE,
-              trades_today INTEGER NOT NULL DEFAULT 0,
-              realized_pnl_today DOUBLE PRECISION NOT NULL DEFAULT 0,
-
-              last_mark DOUBLE PRECISION,
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """)
-
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS paper_trades (
-              trade_id BIGSERIAL PRIMARY KEY,
-              ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              action TEXT NOT NULL,
-              side TEXT NULL,
-              price DOUBLE PRECISION NULL,
-              stake DOUBLE PRECISION NULL,
-              fee DOUBLE PRECISION NULL,
-              pnl DOUBLE PRECISION NULL
-            );
-            """)
-        conn.commit()
-
-    init_snapshots_table()
-
-
-def load_state() -> dict:
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM paper_state WHERE id=1;")
-            row = cur.fetchone()
-            if row:
-                return row
-
-            cur.execute(
-                """
-                INSERT INTO paper_state (
-                    id, balance, position, entry_price, stake,
-                    last_trade_ts, last_trade_day, trades_today, realized_pnl_today, last_mark
-                )
-                VALUES (1, %s, NULL, NULL, 0.0, NULL, NULL, 0, 0.0, NULL)
-                RETURNING *;
-                """,
-                (START_BALANCE,),
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return row
-
-
-def save_state(
-    balance: float,
-    position: Optional[str],
-    entry_price: Optional[float],
-    stake: float,
-    last_trade_ts,
-    last_trade_day,
-    trades_today: int,
-    realized_pnl_today: float,
-    last_mark: Optional[float],
-):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE paper_state
-                SET balance=%s,
-                    position=%s,
-                    entry_price=%s,
-                    stake=%s,
-                    last_trade_ts=%s,
-                    last_trade_day=%s,
-                    trades_today=%s,
-                    realized_pnl_today=%s,
-                    last_mark=%s,
-                    updated_at=NOW()
-                WHERE id=1;
-                """,
-                (
-                    balance,
-                    position,
-                    entry_price,
-                    stake,
-                    last_trade_ts,
-                    last_trade_day,
-                    trades_today,
-                    realized_pnl_today,
-                    last_mark,
-                ),
-            )
-        conn.commit()
-
-
-def log_trade(action: str, side=None, price=None, stake=None, fee=None, pnl=None):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO paper_trades (action, side, price, stake, fee, pnl)
-                VALUES (%s, %s, %s, %s, %s, %s);
-                """,
-                (action, side, price, stake, fee, pnl),
-            )
-        conn.commit()
-
-
-def reset_daily_counters_if_needed(state: dict) -> dict:
-    today = utc_today_date()
-    last_day = _as_date(state.get("last_trade_day"))
-    if last_day is None or last_day != today:
-        state["last_trade_day"] = today
-        state["trades_today"] = 0
-        state["realized_pnl_today"] = 0.0
-    return state
-
-
-# =========================
-# DATA: Kraken closes
-# =========================
-def fetch_btc_closes_5m(lookback: int) -> Optional[List[float]]:
-    last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(
-                KRAKEN_OHLC_URL,
-                params={"pair": KRAKEN_PAIR, "interval": KRAKEN_INTERVAL},
-                timeout=TIMEOUT_SEC,
-            )
-            if r.status_code != 200:
-                last_error = f"HTTP {r.status_code}: {r.text[:200]}"
-                _sleep_backoff(attempt)
-                continue
-
-            data = r.json()
-            if data.get("error"):
-                last_error = f"Kraken error: {data['error']}"
-                _sleep_backoff(attempt)
-                continue
-
-            result = data.get("result", {})
-            pair_key = next((k for k in result.keys() if k != "last"), None)
-            candles = result.get(pair_key, [])
-
-            if not isinstance(candles, list) or len(candles) < lookback:
-                last_error = f"Not enough candles. candles_len={len(candles) if isinstance(candles, list) else 'n/a'}"
-                _sleep_backoff(attempt)
-                continue
-
-            closes = [float(c[4]) for c in candles[-lookback:]]
-            return closes
-
-        except Exception as e:
-            last_error = str(e)
-            _sleep_backoff(attempt)
-
-    print(f"{utc_now_iso()} | WARN | Price fetch failed after retries: {last_error}", flush=True)
-    return None
-
-
-# =========================
-# SYNTHETIC FAIR: probability from closes
-# =========================
-def prob_from_closes(closes: List[float]) -> float:
-    avg = sum(closes) / len(closes)
-    last = closes[-1]
-    if avg <= 0:
-        return 0.5
-    dev = (last - avg) / avg
-    p = 0.5 + (dev * PROB_Z_SCALE)
-    return clamp(p, PROB_P_MIN, PROB_P_MAX)
-
-
-# =========================
-# POLYMARKET HELPERS (Gamma + CLOB)
-# =========================
-def _maybe_json_list(x):
-    """
-    Gamma sometimes returns JSON arrays as strings: '["Yes","No"]'
-    """
-    if x is None:
-        return None
-    if isinstance(x, list):
-        return x
-    if isinstance(x, str):
-        s = x.strip()
-        if not s:
-            return None
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                return json.loads(s)
-            except Exception:
-                return None
-        if "," in s:
-            return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
-        return [s]
-    return None
-
-
-def _get_market_by_slug(slug: str) -> Optional[dict]:
-    r = requests.get(GAMMA_MARKETS_URL, params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict):
-        return data
-    return None
-
-
-def _get_market_by_id(mid: int) -> Optional[dict]:
-    r = requests.get(f"{GAMMA_MARKETS_URL}/{mid}", timeout=POLY_TIMEOUT_SEC)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    return data if isinstance(data, dict) else None
-
-
-def _get_event_by_slug(slug: str) -> Optional[dict]:
-    r = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    if isinstance(data, list) and data:
-        return data[0]
-    if isinstance(data, dict):
-        return data
-    return None
-
-
-def _extract_updown_from_market(m: dict) -> Optional[Dict[str, Any]]:
-    outcomes = _maybe_json_list(m.get("outcomes")) or _maybe_json_list(m.get("outcomeNames"))
-    token_ids = _maybe_json_list(m.get("clobTokenIds")) or _maybe_json_list(m.get("clobTokenIDs"))
-    outcome_prices = _maybe_json_list(m.get("outcomePrices"))
-
-    if not isinstance(outcomes, list) or len(outcomes) < 2:
-        return None
-
-    norm = [str(o).strip().lower() for o in outcomes]
-
-    token_map: Dict[str, str] = {}
-    if isinstance(token_ids, list) and len(token_ids) >= 2:
-        for name, tid in zip(norm, token_ids):
-            token_map[name] = str(tid)
-
-    gamma_map: Dict[str, float] = {}
-    if isinstance(outcome_prices, list) and len(outcome_prices) >= 2:
-        for name, px in zip(norm, outcome_prices):
-            f = _safe_float(px)
-            if f is not None:
-                gamma_map[name] = f
-
-    return {
-        "up_tid": token_map.get("up") or token_map.get("yes"),
-        "dn_tid": token_map.get("down") or token_map.get("no"),
-        "up_gamma": gamma_map.get("up") or gamma_map.get("yes"),
-        "dn_gamma": gamma_map.get("down") or gamma_map.get("no"),
-    }
-
-
-def _fetch_clob_price(token_id: str, side: str = "BUY") -> float:
-    """
-    CLOB /price expects side BUY/SELL (uppercase)
-    """
-    r = requests.get(
-        CLOB_PRICE_URL,
-        params={"token_id": token_id, "side": side},
-        timeout=POLY_TIMEOUT_SEC,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"CLOB price HTTP {r.status_code}: {r.text[:200]}")
-    data = r.json()
-    if "price" not in data:
-        raise RuntimeError(f"CLOB price missing field: {str(data)[:200]}")
-    return float(data["price"])
-
-
-def fetch_polymarket_marks(slug: str) -> Optional[Tuple[float, float, str]]:
-    """
-    Attempts (per market candidate):
-      1) CLOB prices via clobTokenIds -> source 'clob' (with sanity check)
-      2) Gamma outcomePrices -> source 'gamma'
-    Returns None if unusable (caller falls back to synthetic).
-    """
-    s = (slug or "").strip()
-    if not s:
-        return None
-
-    last_error = None
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            candidate_markets: list = []
-
-            # 1) Try as MARKET slug
-            m = _get_market_by_slug(s)
-            if isinstance(m, dict) and m:
-                candidate_markets.append(m)
-
-            # 2) Try as EVENT slug and hydrate markets
-            if not candidate_markets:
-                ev = _get_event_by_slug(s)
-                if isinstance(ev, dict) and ev:
-                    ev_markets = ev.get("markets", [])
-                    if isinstance(ev_markets, list):
-                        for x in ev_markets:
-                            if not isinstance(x, dict):
-                                continue
-                            mid = x.get("id")
-                            if mid is None:
-                                continue
-                            full = _get_market_by_id(int(mid))
-                            candidate_markets.append(full if full else x)
-
-            if DEBUG_POLY:
-                print(f"{utc_now_iso()} | DEBUG | poly_slug={s} candidate_markets={len(candidate_markets)}", flush=True)
-
-            for cm in candidate_markets:
-                if not isinstance(cm, dict):
-                    continue
-                info = _extract_updown_from_market(cm)
-                if not info:
-                    continue
-
-                up_tid = info.get("up_tid")
-                dn_tid = info.get("dn_tid")
-
-                # 1) Try CLOB if we have token IDs
-                if up_tid and dn_tid:
-                    try:
-                        p_up = _fetch_clob_price(up_tid, side="BUY")
-                        p_dn = _fetch_clob_price(dn_tid, side="BUY")
-
-                        # sanity check: two-outcome markets should roughly sum to ~1.0
-                        if abs((p_up + p_dn) - 1.0) <= 0.15:
-                            return clamp(p_up, 0.001, 0.999), clamp(p_dn, 0.001, 0.999), "clob"
-                        else:
-                            last_error = f"clob sanity failed sum={(p_up+p_dn):.3f}"
-                            # fall through to Gamma
-
-                    except Exception as e:
-                        last_error = str(e)[:200]
-                        # fall through to Gamma
-
-                # 2) Try Gamma outcomePrices if present
-                up_g = info.get("up_gamma")
-                dn_g = info.get("dn_gamma")
-                if up_g is not None and dn_g is not None:
-                    return clamp(float(up_g), 0.001, 0.999), clamp(float(dn_g), 0.001, 0.999), "gamma"
-
-            last_error = last_error or "no usable market (missing tokenIds and outcomePrices)"
-            _sleep_backoff(attempt)
-
-        except Exception as e:
-            last_error = str(e)[:200]
-            _sleep_backoff(attempt)
-
-    if DEBUG_POLY:
-        print(f"{utc_now_iso()} | DEBUG | fetch_polymarket_marks failed: {last_error}", flush=True)
-    return None
-
-
-# =========================
-# PNL (Polymarket-style)
-# =========================
-def shares_for_stake(stake: float, price: float) -> float:
-    return 0.0 if price <= 0 else (stake / price)
-
-def calc_unrealized_pnl(position: Optional[str], entry_price: Optional[float], mark: float, stake: float) -> float:
-    if position is None or entry_price is None or stake <= 0:
-        return 0.0
-    sh = shares_for_stake(stake, entry_price)
-    return (sh * mark) - stake
-
-def calc_realized_pnl(entry_price: float, exit_price: float, stake: float) -> float:
-    sh = shares_for_stake(stake, entry_price)
-    return (sh * exit_price) - stake
-
-
-# =========================
-# PAPER TRADE ENGINE (conviction + edge-collapse exit)
-# =========================
-def paper_trade_prob(
-    balance: float,
-    position: Optional[str],
-    entry_price: Optional[float],
-    stake: float,
-    signal: str,
-    p_up: float,
-    p_down: float,
-    edge: float,
-    edge_exit: float,
-    trade_size: float,
-    last_trade_ts,
-    last_trade_day,
-    trades_today: int,
-    realized_pnl_today: float,
-) -> Tuple[float, Optional[str], Optional[float], float, str, object, object, int, float]:
-    """
-    signal: YES/NO/HOLD (YES=Up, NO=Down)
-    entry_price stores p_up when pos=YES, stores p_down when pos=NO
-
-    Exits:
-      - Opposite signal (if signal != HOLD and signal != position)
-      - Edge-collapse:
-          * if holding YES and edge < edge_exit -> exit
-          * if holding NO  and edge > -edge_exit -> exit
-    """
-    now_ts = utc_now_dt()
-    today = utc_today_date()
-
-    # If flat and HOLD: do nothing
-    if position is None and signal == "HOLD":
-        return (balance, position, entry_price, stake, "HOLD",
-                last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
-
-    # ENTER if flat and non-HOLD
-    if position is None:
-        if balance < (trade_size + FEE_PER_TRADE):
-            return (balance, position, entry_price, stake, "SKIP_INSUFFICIENT_BALANCE",
-                    last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
-
-        balance -= (trade_size + FEE_PER_TRADE)
-        position = signal
-        stake = trade_size
-        entry_price = p_up if position == "YES" else p_down
-
-        log_trade("ENTER", side=position, price=entry_price, stake=stake, fee=FEE_PER_TRADE)
-
-        trades_today += 1
-        last_trade_ts = now_ts
-        last_trade_day = today
-
-        return (balance, position, entry_price, stake, f"ENTER_{signal}",
-                last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
-
-    # Edge-collapse exit
-    edge_collapse = False
-    if position == "YES" and edge < edge_exit:
-        edge_collapse = True
-    elif position == "NO" and edge > -edge_exit:
-        edge_collapse = True
-
-    # EXIT if opposite signal or edge collapses
-    if (signal != "HOLD" and signal != position) or edge_collapse:
-        exit_price = p_up if position == "YES" else p_down
-        pnl = calc_realized_pnl(entry_price, exit_price, stake)
-
-        balance += (stake + pnl - FEE_PER_TRADE)
-        log_trade("EXIT", side=position, price=exit_price, stake=stake, fee=FEE_PER_TRADE, pnl=pnl)
-
-        realized_pnl_today += pnl
-        trades_today += 1
-        last_trade_ts = now_ts
-        last_trade_day = today
-
-        position = None
-        entry_price = None
-        stake = 0.0
-
-        return (balance, position, entry_price, stake, "EXIT",
-                last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
-
-    return (balance, position, entry_price, stake, "HOLD_SAME_SIDE",
-            last_trade_ts, last_trade_day, trades_today, realized_pnl_today)
-
-
-# =========================
-# PERFORMANCE: optional snapshots/drawdown
-# =========================
-def init_snapshots_table():
-    if not ENABLE_SNAPSHOTS:
-        return
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS equity_snapshots (
-              snapshot_id BIGSERIAL PRIMARY KEY,
-              ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              mark DOUBLE PRECISION NOT NULL,
-              balance DOUBLE PRECISION NOT NULL,
-              position TEXT NULL,
-              entry_price DOUBLE PRECISION NULL,
-              stake DOUBLE PRECISION NOT NULL,
-              unrealized_pnl DOUBLE PRECISION NOT NULL,
-              equity DOUBLE PRECISION NOT NULL
-            );
-            """)
-        conn.commit()
-
-def record_equity_snapshot(mark: float, balance: float, position: Optional[str],
-                          entry_price: Optional[float], stake: float,
-                          unrealized_pnl: float, equity: float):
-    if not ENABLE_SNAPSHOTS:
-        return
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO equity_snapshots
-                  (mark, balance, position, entry_price, stake, unrealized_pnl, equity)
-                VALUES
-                  (%s, %s, %s, %s, %s, %s, %s);
-                """,
-                (mark, balance, position, entry_price, stake, unrealized_pnl, equity),
-            )
-        conn.commit()
-
-def get_realized_pnl_24h_and_trades_24h() -> Tuple[float, int]:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                  COALESCE(SUM(CASE WHEN action='EXIT' THEN pnl ELSE 0 END), 0) AS pnl_24h,
-                  COUNT(*)::int AS trades_24h
-                FROM paper_trades
-                WHERE ts >= (NOW() - INTERVAL '24 hours');
-                """
-            )
-            row = cur.fetchone()
-            return float(row[0] or 0.0), int(row[1] or 0)
-
-def get_winrate_last_n_exits(n: int = 20) -> Optional[float]:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT pnl
-                FROM paper_trades
-                WHERE action='EXIT' AND pnl IS NOT NULL
-                ORDER BY ts DESC
-                LIMIT %s;
-                """,
-                (n,),
-            )
-            rows = cur.fetchall()
-    if not rows:
-        return None
-    pnls = [float(r[0]) for r in rows]
-    wins = sum(1 for p in pnls if p > 0)
-    return wins / len(pnls)
-
-def get_drawdown_24h() -> Optional[float]:
-    if not (ENABLE_SNAPSHOTS and ENABLE_DRAWDOWN):
-        return None
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT equity
-                FROM equity_snapshots
-                WHERE ts >= (NOW() - INTERVAL '24 hours')
-                ORDER BY ts ASC;
-                """
-            )
-            rows = cur.fetchall()
-    if len(rows) < 2:
-        return None
-    peak = float(rows[0][0])
-    max_dd = 0.0
-    for (eq,) in rows:
-        eq = float(eq)
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > max_dd:
-            max_dd = dd
-    return max_dd
-
-# STATS dashboard (no need for external query tools)
-def print_db_stats():
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*)::int FROM paper_trades WHERE action='EXIT';")
-            exits_total = int(cur.fetchone()[0] or 0)
-
-            cur.execute("""
-                SELECT
-                  COALESCE(SUM(pnl), 0) AS pnl_24h,
-                  COUNT(*)::int AS trades_24h
-                FROM paper_trades
-                WHERE ts >= (NOW() - INTERVAL '24 hours');
-            """)
-            row = cur.fetchone()
-            pnl_24h = float(row[0] or 0.0)
-            trades_24h = int(row[1] or 0)
-
-            cur.execute("""
-                SELECT COUNT(*)::int
-                FROM paper_trades
-                WHERE action='EXIT' AND ts >= (NOW() - INTERVAL '24 hours');
-            """)
-            exits_24h = int(cur.fetchone()[0] or 0)
-
-    winrate20 = get_winrate_last_n_exits(20)
-    print(
-        f"{utc_now_iso()} | STATS | exits_total={exits_total} "
-        f"exits_24h={exits_24h} pnl_24h(realized)={pnl_24h:.2f} "
-        f"trades_24h={trades_24h} "
-        f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')}",
-        flush=True
-    )
-
-    # last 10 UTC days
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                  (ts AT TIME ZONE 'UTC')::date AS day_utc,
-                  COUNT(*)::int AS exits,
-                  COALESCE(SUM(pnl),0) AS realized_pnl
-                FROM paper_trades
-                WHERE action='EXIT'
-                GROUP BY 1
-                ORDER BY 1 DESC
-                LIMIT 10;
-            """)
-            rows = cur.fetchall()
-
-    print(f"{utc_now_iso()} | STATS | last_10_days (UTC):", flush=True)
-    for day_utc, exits, realized_pnl in rows[::-1]:
-        print(f"{utc_now_iso()} | STATS | {day_utc} | exits={int(exits)} | realized_pnl={float(realized_pnl):.2f}", flush=True)
-
-
-# =========================
-# MAIN
-# =========================
 def main():
     init_db()
+    failure_tracker = FailureTracker()
 
-    if STATS_ONLY:
-        print_db_stats()
+    interval_key = current_btc_5m_slug()
+    if not reserve_interval(interval_key):
+        print(f"{utc_now_iso()} | INFO | duplicate interval skipped | interval_key={interval_key}", flush=True)
         return
 
-    state = load_state()
-    state = reset_daily_counters_if_needed(state)
-
-    # Manual daily reset (counters only)
-    if RESET_DAILY:
-        save_state(
-            balance=float(state["balance"]),
-            position=state["position"],
-            entry_price=float(state["entry_price"]) if state["entry_price"] is not None else None,
-            stake=float(state["stake"]),
-            last_trade_ts=state.get("last_trade_ts"),
-            last_trade_day=utc_today_date(),
-            trades_today=0,
-            realized_pnl_today=0.0,
-            last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
-        )
-        print(f"{utc_now_iso()} | INFO | RESET_DAILY applied. Daily counters cleared.", flush=True)
-        return
-
-    # Manual state reset (position only)
-    if RESET_STATE:
-        save_state(
-            balance=float(state["balance"]),
-            position=None,
-            entry_price=None,
-            stake=0.0,
-            last_trade_ts=state.get("last_trade_ts"),
-            last_trade_day=_as_date(state.get("last_trade_day")),
-            trades_today=int(state.get("trades_today", 0)),
-            realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
-            last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
-        )
-        print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared.", flush=True)
-        return
-
-    closes = fetch_btc_closes_5m(LOOKBACK)
+    state = reset_daily_counters_if_needed(load_state())
+    closes = fetch_btc_closes_5m(config.LOOKBACK)
     if closes is None:
-        print(f"{utc_now_iso()} | INFO | No data this run. balance={float(state['balance']):.2f} pos={state['position']}", flush=True)
+        msg = maybe_alert_on_failures(failure_tracker, "kraken_ohlc_fetch_failed")
+        if msg:
+            print(f"{utc_now_iso()} | ALERT | {msg}", flush=True)
+        print(f"{utc_now_iso()} | INFO | no market closes", flush=True)
         return
+    failure_tracker.success()
 
-    # State fields
+    p_up, p_down, source = (None, None, "synthetic")
+    pm = fetch_polymarket_marks(interval_key)
+    if pm is not None:
+        p_up, p_down, source = pm
+    else:
+        p_up = prob_from_closes(closes)
+        p_down = 1.0 - p_up
+
+    fair_up = prob_from_closes(closes)
+    edge = calc_edge(fair_up, p_up)
+
     balance = float(state["balance"])
     position = state["position"]
     entry_price = float(state["entry_price"]) if state["entry_price"] is not None else None
     stake = float(state["stake"])
-    last_trade_ts = state.get("last_trade_ts")
-    last_trade_day = _as_date(state.get("last_trade_day"))
     trades_today = int(state.get("trades_today", 0))
     realized_pnl_today = float(state.get("realized_pnl_today", 0.0))
+    last_trade_ts = state.get("last_trade_ts")
+    last_trade_day = state.get("last_trade_day")
 
-    # Marks: Polymarket preferred, synthetic fallback
-    source = "synthetic"
-    poly_slug = current_btc_5m_slug()
-    print(f"{utc_now_iso()} | INFO | poly_slug={poly_slug}", flush=True)
-
-    pm = fetch_polymarket_marks(poly_slug)
-    if pm is not None:
-        p_up, p_down, source = pm
-    else:
-        p_up = prob_from_closes(closes) if PROB_MODE else 0.5
-        p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
-        p_down = 1.0 - p_up
-        p_down = clamp(p_down, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
-
-    # Fair + edge
-    fair_up = prob_from_closes(closes)
-    fair_up = clamp(fair_up, PROB_P_MIN, PROB_P_MAX)
-    edge = fair_up - p_up
-
-    # LIVE safety: mark sanity + kill switch + profit lock
-    if KILL_SWITCH:
-        print(f"{utc_now_iso()} | SAFETY | KILL_SWITCH active - forcing HOLD", flush=True)
+    if config.KILL_SWITCH:
         signal = "HOLD"
-    elif LIVE_MODE and not marks_look_sane_for_live(p_up, p_down):
-        print(
-            f"{utc_now_iso()} | SAFETY | marks_sanity_failed "
-            f"p_up={p_up:.3f} p_down={p_down:.3f} sum={(p_up+p_down):.3f} - forcing HOLD",
-            flush=True
-        )
+    elif config.LIVE_MODE and not marks_look_sane_for_live(p_up, p_down):
         signal = "HOLD"
-    elif LIVE_MODE and LIVE_DAILY_PROFIT_LOCK > 0 and realized_pnl_today >= LIVE_DAILY_PROFIT_LOCK:
-        print(
-            f"{utc_now_iso()} | SAFETY | PROFIT_LOCK hit "
-            f"(pnl_today={realized_pnl_today:.2f} >= {LIVE_DAILY_PROFIT_LOCK:.2f}) - forcing HOLD",
-            flush=True
-        )
+        send_alert(f"marks sanity failed p_up={p_up:.3f} p_down={p_down:.3f}", level="warning")
+    elif config.LIVE_MODE and config.LIVE_DAILY_PROFIT_LOCK > 0 and realized_pnl_today >= config.LIVE_DAILY_PROFIT_LOCK:
         signal = "HOLD"
+        send_alert("daily profit lock reached", level="info")
     else:
-        # High-conviction signal
-        edge_enter = effective_edge_enter()
-        if edge >= edge_enter:
-            signal = "YES"
-        elif edge <= -edge_enter:
-            signal = "NO"
-        else:
-            signal = "HOLD"
+        signal = build_signal(edge=edge, kill_switch=False)
 
-    # Mark-to-market uPnL / equity (for logs + snapshots)
-    if position == "YES":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_up, stake)
-    elif position == "NO":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_down, stake)
+    blocked = should_block_enter(position, signal, edge, trades_today, realized_pnl_today, last_trade_ts)
+    if blocked:
+        send_alert(f"risk gate blocked enter: {blocked}", level="warning")
+        action = f"BLOCKED_{blocked}"
+    elif config.LIVE_MODE:
+        action, _, _ = _act_live(signal, p_up, p_down, config.effective_trade_size(), interval_key)
     else:
-        unrealized_pnl = 0.0
-    equity = balance + unrealized_pnl
-
-    record_equity_snapshot(
-        mark=p_up,
-        balance=balance,
-        position=position,
-        entry_price=entry_price,
-        stake=stake,
-        unrealized_pnl=unrealized_pnl,
-        equity=equity,
-    )
-
-    # Risk gates apply ONLY to ENTER (position is None)
-    blocked_reason = None
-    whale = (signal in ("YES", "NO")) and (abs(edge) >= WHALE_EDGE_OVERRIDE)
-
-    if position is None and signal in ("YES", "NO"):
-        max_daily_loss = effective_max_daily_loss()
-        max_trades_day = effective_max_trades_per_day()
-        cooldown_min = effective_cooldown_minutes()
-
-        if realized_pnl_today <= -max_daily_loss:
-            blocked_reason = f"MAX_DAILY_LOSS hit (pnl_today={realized_pnl_today:.2f} <= -{max_daily_loss:.2f})"
-        elif trades_today >= max_trades_day:
-            blocked_reason = f"MAX_TRADES_PER_DAY hit (trades_today={trades_today} >= {max_trades_day})"
-        else:
-            cd_active = cooldown_active(last_trade_ts, cooldown_min)
-            if cd_active and not (WHALE_COOLDOWN_OVERRIDE and whale):
-                blocked_reason = f"COOLDOWN active ({cooldown_min}m since last trade)"
-            elif cd_active and (WHALE_COOLDOWN_OVERRIDE and whale):
-                print(f"{utc_now_iso()} | SAFETY | WHALE override bypassed cooldown | edge={edge:+.3f}", flush=True)
-
-    if blocked_reason:
-        save_state(
+        (
+            balance,
+            position,
+            entry_price,
+            stake,
+            action,
+            trades_today,
+            realized_pnl_today,
+            last_trade_ts,
+            last_trade_day,
+        ) = paper_trade_step(
             balance=balance,
             position=position,
             entry_price=entry_price,
             stake=stake,
-            last_trade_ts=last_trade_ts,
-            last_trade_day=last_trade_day,
+            signal=signal,
+            p_up=p_up,
+            p_down=p_down,
+            edge=edge,
+            edge_exit=config.effective_edge_exit(),
             trades_today=trades_today,
             realized_pnl_today=realized_pnl_today,
-            last_mark=p_up,
+            last_trade_ts=last_trade_ts,
+            last_trade_day=last_trade_day,
         )
 
-        pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
-        winrate20 = get_winrate_last_n_exits(20)
-        dd_24h = get_drawdown_24h()
+    mark = p_up if position == "YES" else (p_down if position == "NO" else p_up)
+    unrealized = calc_unrealized_pnl(position, entry_price, mark, stake)
+    equity = balance + unrealized
 
-        label_up = "poly_up" if source in ("clob", "gamma") else "mark_up"
-        label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
-
-        print(
-            f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
-            f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
-            f"signal={signal} | action=BLOCKED | reason={blocked_reason} | "
-            f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-            f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | "
-            f"mode={'LIVE' if LIVE_MODE else 'PAPER'} | src={source}",
-            flush=True
-        )
-        print(
-            f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
-            f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
-            f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
-            f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}",
-            flush=True
-        )
-        return
-
-    # Trade step
-    (
-        balance,
-        position,
-        entry_price,
-        stake,
-        action,
-        last_trade_ts,
-        last_trade_day,
-        trades_today,
-        realized_pnl_today,
-    ) = paper_trade_prob(
-        balance=balance,
-        position=position,
-        entry_price=entry_price,
-        stake=stake,
-        signal=signal,
-        p_up=p_up,
-        p_down=p_down,
-        edge=edge,
-        edge_exit=effective_edge_exit(),
-        trade_size=effective_trade_size(),
-        last_trade_ts=last_trade_ts,
-        last_trade_day=last_trade_day,
-        trades_today=trades_today,
-        realized_pnl_today=realized_pnl_today,
-    )
-
-    save_state(
-        balance=balance,
-        position=position,
-        entry_price=entry_price,
-        stake=stake,
-        last_trade_ts=last_trade_ts,
-        last_trade_day=last_trade_day,
-        trades_today=trades_today,
-        realized_pnl_today=realized_pnl_today,
-        last_mark=p_up,
-    )
-
-    # Recompute uPnL after trade
-    if position == "YES":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_up, stake)
-    elif position == "NO":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_down, stake)
-    else:
-        unrealized_pnl = 0.0
-    equity = balance + unrealized_pnl
-
-    pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
-    winrate20 = get_winrate_last_n_exits(20)
-    dd_24h = get_drawdown_24h()
-
-    label_up = "poly_up" if source in ("clob", "gamma") else "mark_up"
-    label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
-
+    save_state(balance, position, entry_price, stake, last_trade_ts, last_trade_day, trades_today, realized_pnl_today, p_up)
     print(
-        f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
-        f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
-        f"signal={signal} | action={action} | "
-        f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-        f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | "
-        f"mode={'LIVE' if LIVE_MODE else 'PAPER'} | src={source}",
-        flush=True
-    )
-    print(
-        f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
-        f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
-        f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
-        f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}",
-        flush=True
+        f"{utc_now_iso()} | src={source} | signal={signal} | action={action} | "
+        f"edge={edge:+.3f} | balance={balance:.2f} | equity={equity:.2f} | pos={position}",
+        flush=True,
     )
 
 
 if __name__ == "__main__":
-    print("BOOT: bot.py starting", flush=True)
-    try:
-        main()
-        print("BOOT: bot.py finished cleanly", flush=True)
-    except Exception as e:
-        import traceback
-        print("FATAL: bot.py crashed:", repr(e), flush=True)
-        traceback.print_exc()
-        raise
+    main()

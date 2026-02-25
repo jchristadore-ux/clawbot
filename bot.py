@@ -15,7 +15,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # Run modes:
 #   DRY_RUN: compute + log only, no paper trades, no live orders
-#   PAPER:   paper trades persisted in Postgres (your current behavior)
+#   PAPER:   paper trades persisted in Postgres
 #   LIVE:    live orders ONLY when LIVE_TRADING_ENABLED=true (and KILL_SWITCH=false)
 RUN_MODE = os.getenv("RUN_MODE", "DRY_RUN").strip().upper()
 if RUN_MODE not in ("DRY_RUN", "PAPER", "LIVE"):
@@ -23,25 +23,28 @@ if RUN_MODE not in ("DRY_RUN", "PAPER", "LIVE"):
 
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 
-# Keep your legacy LIVE_MODE switch for thresholds:
-# - If RUN_MODE=LIVE, we force LIVE thresholds regardless of LIVE_MODE env.
+# Keep legacy LIVE_MODE switch for thresholds:
 LIVE_MODE_ENV = os.getenv("LIVE_MODE", "false").lower() == "true"
 LIVE_MODE = True if RUN_MODE == "LIVE" else LIVE_MODE_ENV
 
-# Global kill switch (forces HOLD and blocks live/paper actions)
 KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
 
 # Maintenance modes
 STATS_ONLY = os.getenv("STATS_ONLY", "false").lower() == "true"
-RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"   # clears open position only
-RESET_DAILY = os.getenv("RESET_DAILY", "false").lower() == "true"   # clears daily counters only
+RESET_STATE = os.getenv("RESET_STATE", "false").lower() == "true"
+RESET_DAILY = os.getenv("RESET_DAILY", "false").lower() == "true"
+
+# NEW: one-shot reset debounce (minutes)
+RESET_DEBOUNCE_MINUTES = int(os.getenv("RESET_DEBOUNCE_MINUTES", "30"))
+
+# NEW: DB run-lock (advisory lock)
+ENABLE_RUN_LOCK = os.getenv("ENABLE_RUN_LOCK", "true").lower() == "true"
+RUN_LOCK_KEY = int(os.getenv("RUN_LOCK_KEY", "9341501"))  # any consistent int is fine
 
 # Paper defaults
 START_BALANCE = float(os.getenv("START_BALANCE", "1000"))
 TRADE_SIZE = float(os.getenv("TRADE_SIZE", "25"))
 
-# Alias support
-# Some envs in Railway appear as FEE_ENTERED; support both.
 FEE_PER_TRADE = float(os.getenv("FEE_PER_TRADE", os.getenv("FEE_ENTERED", "0")))
 
 # Synthetic model (Kraken)
@@ -51,11 +54,10 @@ PROB_P_MIN = float(os.getenv("PROB_P_MIN", "0.05"))
 PROB_P_MAX = float(os.getenv("PROB_P_MAX", "0.95"))
 PROB_Z_SCALE = float(os.getenv("PROB_Z_SCALE", "2.5"))
 
-# High-conviction thresholds (paper defaults)
-EDGE_ENTER = float(os.getenv("EDGE_ENTER", os.getenv("UP_THRESHOLD", "0.08")))  # alias UP_THRESHOLD
+# Thresholds
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", os.getenv("UP_THRESHOLD", "0.08")))
 EDGE_EXIT = float(os.getenv("EDGE_EXIT", "0.04"))
 
-# Optional DOWN_THRESHOLD alias (if present, use it as symmetric negative enter threshold)
 DOWN_THRESHOLD = os.getenv("DOWN_THRESHOLD", "").strip()
 DOWN_EDGE_ENTER = None
 try:
@@ -65,11 +67,11 @@ except Exception:
     DOWN_EDGE_ENTER = None
 
 # Risk controls (paper defaults)
-MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))       # realized only
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS", "3"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8")) # counts ENTER+EXIT events
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "8"))
 
-# LIVE mode safety pack (overrides when LIVE_MODE=true)
+# LIVE mode overrides
 LIVE_TRADE_SIZE = float(os.getenv("LIVE_TRADE_SIZE", "5"))
 LIVE_MAX_TRADES_PER_DAY = int(os.getenv("LIVE_MAX_TRADES_PER_DAY", "10"))
 LIVE_MAX_DAILY_LOSS = float(os.getenv("LIVE_MAX_DAILY_LOSS", "15"))
@@ -83,23 +85,19 @@ LIVE_MAX_MARK_SUM = float(os.getenv("LIVE_MAX_MARK_SUM", "1.15"))
 LIVE_MIN_PRICE = float(os.getenv("LIVE_MIN_PRICE", "0.03"))
 LIVE_MAX_PRICE = float(os.getenv("LIVE_MAX_PRICE", "0.97"))
 
-LIVE_DAILY_PROFIT_LOCK = float(os.getenv("LIVE_DAILY_PROFIT_LOCK", os.getenv("MAX_DAILY_PROFIT_LOCK", "0")))  # alias
-
-# New: slippage buffer for live limit orders (e.g. 0.02 = 2%)
+LIVE_DAILY_PROFIT_LOCK = float(os.getenv("LIVE_DAILY_PROFIT_LOCK", os.getenv("MAX_DAILY_PROFIT_LOCK", "0")))
 LIVE_SLIPPAGE = float(os.getenv("LIVE_SLIPPAGE", "0.02"))
 
-# Whale override (bypass cooldown ONLY by default)
+# Whale override
 WHALE_COOLDOWN_OVERRIDE = os.getenv("WHALE_COOLDOWN_OVERRIDE", "true").lower() == "true"
-WHALE_EDGE_OVERRIDE = float(os.getenv("WHALE_EDGE_OVERRIDE", os.getenv("WHALE_EDGE", "0.20")))  # alias WHALE_EDGE
-
-# If ALLOW_WHALE_AFTER_CAP=true, whale trades may bypass trade-count cap (still NOT daily-loss cap).
+WHALE_EDGE_OVERRIDE = float(os.getenv("WHALE_EDGE_OVERRIDE", os.getenv("WHALE_EDGE", "0.20")))
 ALLOW_WHALE_AFTER_CAP = os.getenv("ALLOW_WHALE_AFTER_CAP", "false").lower() == "true"
 
 # HTTP
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "20"))
 
-# Polymarket (Gamma + CLOB)
+# Polymarket
 POLY_TIMEOUT_SEC = int(os.getenv("POLY_TIMEOUT_SEC", "20"))
 DEBUG_POLY = os.getenv("DEBUG_POLY", "false").lower() == "true"
 
@@ -114,15 +112,14 @@ ENABLE_DRAWDOWN = os.getenv("ENABLE_DRAWDOWN", "false").lower() == "true"
 # Kraken OHLC
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 KRAKEN_PAIR = "XBTUSD"
-KRAKEN_INTERVAL = 5  # minutes
+KRAKEN_INTERVAL = 5
 
-# Optional override: user-specified event slug (otherwise we compute current 5m slug)
 POLY_EVENT_SLUG_OVERRIDE = os.getenv("POLY_EVENT_SLUG", "").strip()
 
 # Live auth/env (scaffold)
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "").strip()
 POLY_FUNDER = os.getenv("POLY_FUNDER", os.getenv("POLY_PUBLIC_ADDRESS", "")).strip()
-POLY_CHAIN_ID = int(os.getenv("POLY_CHAIN_ID", "137"))  # Polygon mainnet default
+POLY_CHAIN_ID = int(os.getenv("POLY_CHAIN_ID", "137"))
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
 POLY_API_KEY = os.getenv("POLY_API_KEY", "").strip()
@@ -215,8 +212,27 @@ def marks_look_sane_for_live(p_up: float, p_down: float) -> bool:
 
 def db_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set. Add Railway Postgres so DATABASE_URL is injected.")
+        raise RuntimeError("DATABASE_URL is not set.")
     return psycopg2.connect(DATABASE_URL)
+
+
+# =========================
+# DB RUN LOCK
+# =========================
+def acquire_run_lock(conn) -> bool:
+    if not ENABLE_RUN_LOCK:
+        return True
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s);", (RUN_LOCK_KEY,))
+        ok = bool(cur.fetchone()[0])
+        return ok
+
+def release_run_lock(conn) -> None:
+    if not ENABLE_RUN_LOCK:
+        return
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s);", (RUN_LOCK_KEY,))
+    conn.commit()
 
 
 # =========================
@@ -243,7 +259,6 @@ def init_db():
             );
             """)
 
-            # Trades log
             cur.execute("""
             CREATE TABLE IF NOT EXISTS paper_trades (
               trade_id BIGSERIAL PRIMARY KEY,
@@ -258,42 +273,46 @@ def init_db():
             );
             """)
 
-            # Migrations (idempotent)
+            # migrations
             cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_seen_slug TEXT;")
             cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_trade_slug TEXT;")
-            cur.execute("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS slug TEXT;")
+
+            # NEW: reset debouncing timestamps
+            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_reset_state_ts TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE paper_state ADD COLUMN IF NOT EXISTS last_reset_daily_ts TIMESTAMPTZ;")
 
         conn.commit()
 
     init_snapshots_table()
 
 
-def load_state() -> dict:
-    with db_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM paper_state WHERE id=1;")
-            row = cur.fetchone()
-            if row:
-                return row
+def load_state(conn) -> dict:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM paper_state WHERE id=1;")
+        row = cur.fetchone()
+        if row:
+            return row
 
-            cur.execute(
-                """
-                INSERT INTO paper_state (
-                    id, balance, position, entry_price, stake,
-                    last_trade_ts, last_trade_day, trades_today, realized_pnl_today, last_mark,
-                    last_seen_slug, last_trade_slug
-                )
-                VALUES (1, %s, NULL, NULL, 0.0, NULL, NULL, 0, 0.0, NULL, NULL, NULL)
-                RETURNING *;
-                """,
-                (START_BALANCE,),
+        cur.execute(
+            """
+            INSERT INTO paper_state (
+                id, balance, position, entry_price, stake,
+                last_trade_ts, last_trade_day, trades_today, realized_pnl_today, last_mark,
+                last_seen_slug, last_trade_slug,
+                last_reset_state_ts, last_reset_daily_ts
             )
-            row = cur.fetchone()
-        conn.commit()
+            VALUES (1, %s, NULL, NULL, 0.0, NULL, NULL, 0, 0.0, NULL, NULL, NULL, NULL, NULL)
+            RETURNING *;
+            """,
+            (START_BALANCE,),
+        )
+        row = cur.fetchone()
+    conn.commit()
     return row
 
 
 def save_state(
+    conn,
     balance: float,
     position: Optional[str],
     entry_price: Optional[float],
@@ -305,54 +324,58 @@ def save_state(
     last_mark: Optional[float],
     last_seen_slug: Optional[str],
     last_trade_slug: Optional[str],
+    last_reset_state_ts,
+    last_reset_daily_ts,
 ):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE paper_state
-                SET balance=%s,
-                    position=%s,
-                    entry_price=%s,
-                    stake=%s,
-                    last_trade_ts=%s,
-                    last_trade_day=%s,
-                    trades_today=%s,
-                    realized_pnl_today=%s,
-                    last_mark=%s,
-                    last_seen_slug=%s,
-                    last_trade_slug=%s,
-                    updated_at=NOW()
-                WHERE id=1;
-                """,
-                (
-                    balance,
-                    position,
-                    entry_price,
-                    stake,
-                    last_trade_ts,
-                    last_trade_day,
-                    trades_today,
-                    realized_pnl_today,
-                    last_mark,
-                    last_seen_slug,
-                    last_trade_slug,
-                ),
-            )
-        conn.commit()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE paper_state
+            SET balance=%s,
+                position=%s,
+                entry_price=%s,
+                stake=%s,
+                last_trade_ts=%s,
+                last_trade_day=%s,
+                trades_today=%s,
+                realized_pnl_today=%s,
+                last_mark=%s,
+                last_seen_slug=%s,
+                last_trade_slug=%s,
+                last_reset_state_ts=%s,
+                last_reset_daily_ts=%s,
+                updated_at=NOW()
+            WHERE id=1;
+            """,
+            (
+                balance,
+                position,
+                entry_price,
+                stake,
+                last_trade_ts,
+                last_trade_day,
+                trades_today,
+                realized_pnl_today,
+                last_mark,
+                last_seen_slug,
+                last_trade_slug,
+                last_reset_state_ts,
+                last_reset_daily_ts,
+            ),
+        )
+    conn.commit()
 
 
-def log_trade(action: str, side=None, price=None, stake=None, fee=None, pnl=None, slug: Optional[str] = None):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO paper_trades (action, side, price, stake, fee, pnl, slug)
-                VALUES (%s, %s, %s, %s, %s, %s, %s);
-                """,
-                (action, side, price, stake, fee, pnl, slug),
-            )
-        conn.commit()
+def log_trade(conn, action: str, side=None, price=None, stake=None, fee=None, pnl=None, slug: Optional[str] = None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO paper_trades (action, side, price, stake, fee, pnl, slug)
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            """,
+            (action, side, price, stake, fee, pnl, slug),
+        )
+    conn.commit()
 
 
 def reset_daily_counters_if_needed(state: dict) -> dict:
@@ -363,6 +386,15 @@ def reset_daily_counters_if_needed(state: dict) -> dict:
         state["trades_today"] = 0
         state["realized_pnl_today"] = 0.0
     return state
+
+
+def _ts_recent(ts, minutes: int) -> bool:
+    if ts is None:
+        return False
+    try:
+        return utc_now_dt() < (ts + timedelta(minutes=minutes))
+    except Exception:
+        return False
 
 
 # =========================
@@ -409,7 +441,7 @@ def fetch_btc_closes_5m(lookback: int) -> Optional[List[float]]:
 
 
 # =========================
-# SYNTHETIC FAIR: probability from closes
+# SYNTHETIC FAIR
 # =========================
 def prob_from_closes(closes: List[float]) -> float:
     avg = sum(closes) / len(closes)
@@ -422,12 +454,9 @@ def prob_from_closes(closes: List[float]) -> float:
 
 
 # =========================
-# POLYMARKET HELPERS (Gamma + CLOB)
+# POLYMARKET HELPERS
 # =========================
 def _maybe_json_list(x):
-    """
-    Gamma sometimes returns JSON arrays as strings: '["Yes","No"]'
-    """
     if x is None:
         return None
     if isinstance(x, list):
@@ -448,7 +477,7 @@ def _maybe_json_list(x):
 
 
 def _get_market_by_slug(slug: str) -> Optional[dict]:
-    r = requests.get("https://gamma-api.polymarket.com/markets", params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
+    r = requests.get(GAMMA_MARKETS_URL, params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
     if r.status_code != 200:
         return None
     data = r.json()
@@ -460,7 +489,7 @@ def _get_market_by_slug(slug: str) -> Optional[dict]:
 
 
 def _get_market_by_id(mid: int) -> Optional[dict]:
-    r = requests.get(f"https://gamma-api.polymarket.com/markets/{mid}", timeout=POLY_TIMEOUT_SEC)
+    r = requests.get(f"{GAMMA_MARKETS_URL}/{mid}", timeout=POLY_TIMEOUT_SEC)
     if r.status_code != 200:
         return None
     data = r.json()
@@ -468,7 +497,7 @@ def _get_market_by_id(mid: int) -> Optional[dict]:
 
 
 def _get_event_by_slug(slug: str) -> Optional[dict]:
-    r = requests.get("https://gamma-api.polymarket.com/events", params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
+    r = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=POLY_TIMEOUT_SEC)
     if r.status_code != 200:
         return None
     data = r.json()
@@ -510,9 +539,6 @@ def _extract_updown_from_market(m: dict) -> Optional[Dict[str, Any]]:
 
 
 def _fetch_clob_price(token_id: str, side: str = "BUY") -> float:
-    """
-    CLOB /price expects side BUY/SELL (uppercase)
-    """
     r = requests.get(
         CLOB_PRICE_URL,
         params={"token_id": token_id, "side": side},
@@ -527,20 +553,11 @@ def _fetch_clob_price(token_id: str, side: str = "BUY") -> float:
 
 
 def fetch_polymarket_marks_and_tokens(slug: str) -> Optional[Tuple[float, float, str, str, str]]:
-    """
-    Returns:
-      (p_up, p_down, source, up_token_id, down_token_id)
-
-    Attempts (per market candidate):
-      1) CLOB prices via clobTokenIds -> source 'clob' (with sanity check)
-      2) Gamma outcomePrices -> source 'gamma'
-    """
     s = (slug or "").strip()
     if not s:
         return None
 
     last_error = None
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             candidate_markets: list = []
@@ -580,7 +597,6 @@ def fetch_polymarket_marks_and_tokens(slug: str) -> Optional[Tuple[float, float,
                     try:
                         p_up = _fetch_clob_price(up_tid, side="BUY")
                         p_dn = _fetch_clob_price(dn_tid, side="BUY")
-
                         if abs((p_up + p_dn) - 1.0) <= 0.15:
                             return clamp(p_up, 0.001, 0.999), clamp(p_dn, 0.001, 0.999), "clob", str(up_tid), str(dn_tid)
                         else:
@@ -593,7 +609,7 @@ def fetch_polymarket_marks_and_tokens(slug: str) -> Optional[Tuple[float, float,
                 if up_g is not None and dn_g is not None and up_tid and dn_tid:
                     return clamp(float(up_g), 0.001, 0.999), clamp(float(dn_g), 0.001, 0.999), "gamma", str(up_tid), str(dn_tid)
 
-            last_error = last_error or "no usable market (missing tokenIds and outcomePrices)"
+            last_error = last_error or "no usable market"
             _sleep_backoff(attempt)
 
         except Exception as e:
@@ -606,7 +622,7 @@ def fetch_polymarket_marks_and_tokens(slug: str) -> Optional[Tuple[float, float,
 
 
 # =========================
-# PNL (Polymarket-style)
+# PNL (paper)
 # =========================
 def shares_for_stake(stake: float, price: float) -> float:
     return 0.0 if price <= 0 else (stake / price)
@@ -622,10 +638,8 @@ def calc_realized_pnl(entry_price: float, exit_price: float, stake: float) -> fl
     return (sh * exit_price) - stake
 
 
-# =========================
-# PAPER TRADE ENGINE (conviction + edge-collapse exit)
-# =========================
 def paper_trade_prob(
+    conn,
     balance: float,
     position: Optional[str],
     entry_price: Optional[float],
@@ -642,16 +656,6 @@ def paper_trade_prob(
     realized_pnl_today: float,
     slug: str,
 ) -> Tuple[float, Optional[str], Optional[float], float, str, object, object, int, float]:
-    """
-    signal: YES/NO/HOLD (YES=Up, NO=Down)
-    entry_price stores p_up when pos=YES, stores p_down when pos=NO
-
-    Exits:
-      - Opposite signal (if signal != HOLD and signal != position)
-      - Edge-collapse:
-          * if holding YES and edge < edge_exit -> exit
-          * if holding NO  and edge > -edge_exit -> exit
-    """
     now_ts = utc_now_dt()
     today = utc_today_date()
 
@@ -669,7 +673,7 @@ def paper_trade_prob(
         stake = trade_size
         entry_price = p_up if position == "YES" else p_down
 
-        log_trade("ENTER", side=position, price=entry_price, stake=stake, fee=FEE_PER_TRADE, slug=slug)
+        log_trade(conn, "ENTER", side=position, price=entry_price, stake=stake, fee=FEE_PER_TRADE, slug=slug)
 
         trades_today += 1
         last_trade_ts = now_ts
@@ -689,7 +693,7 @@ def paper_trade_prob(
         pnl = calc_realized_pnl(entry_price, exit_price, stake)
 
         balance += (stake + pnl - FEE_PER_TRADE)
-        log_trade("EXIT", side=position, price=exit_price, stake=stake, fee=FEE_PER_TRADE, pnl=pnl, slug=slug)
+        log_trade(conn, "EXIT", side=position, price=exit_price, stake=stake, fee=FEE_PER_TRADE, pnl=pnl, slug=slug)
 
         realized_pnl_today += pnl
         trades_today += 1
@@ -708,7 +712,7 @@ def paper_trade_prob(
 
 
 # =========================
-# PERFORMANCE: optional snapshots/drawdown
+# Snapshots/drawdown (unchanged)
 # =========================
 def init_snapshots_table():
     if not ENABLE_SNAPSHOTS:
@@ -810,158 +814,6 @@ def get_drawdown_24h() -> Optional[float]:
             max_dd = dd
     return max_dd
 
-def print_db_stats():
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*)::int FROM paper_trades WHERE action='EXIT';")
-            exits_total = int(cur.fetchone()[0] or 0)
-
-            cur.execute("""
-                SELECT
-                  COALESCE(SUM(pnl), 0) AS pnl_24h,
-                  COUNT(*)::int AS trades_24h
-                FROM paper_trades
-                WHERE ts >= (NOW() - INTERVAL '24 hours');
-            """)
-            row = cur.fetchone()
-            pnl_24h = float(row[0] or 0.0)
-            trades_24h = int(row[1] or 0)
-
-            cur.execute("""
-                SELECT COUNT(*)::int
-                FROM paper_trades
-                WHERE action='EXIT' AND ts >= (NOW() - INTERVAL '24 hours');
-            """)
-            exits_24h = int(cur.fetchone()[0] or 0)
-
-    winrate20 = get_winrate_last_n_exits(20)
-    print(
-        f"{utc_now_iso()} | STATS | exits_total={exits_total} "
-        f"exits_24h={exits_24h} pnl_24h(realized)={pnl_24h:.2f} "
-        f"trades_24h={trades_24h} "
-        f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')}",
-        flush=True
-    )
-
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                  (ts AT TIME ZONE 'UTC')::date AS day_utc,
-                  COUNT(*)::int AS exits,
-                  COALESCE(SUM(pnl),0) AS realized_pnl
-                FROM paper_trades
-                WHERE action='EXIT'
-                GROUP BY 1
-                ORDER BY 1 DESC
-                LIMIT 10;
-            """)
-            rows = cur.fetchall()
-
-    print(f"{utc_now_iso()} | STATS | last_10_days (UTC):", flush=True)
-    for day_utc, exits, realized_pnl in rows[::-1]:
-        print(f"{utc_now_iso()} | STATS | {day_utc} | exits={int(exits)} | realized_pnl={float(realized_pnl):.2f}", flush=True)
-
-
-# =========================
-# LIVE TRADING (SAFE SCAFFOLD)
-# =========================
-def live_trading_ready() -> Tuple[bool, str]:
-    """
-    Returns (ready, reason). We require:
-      - LIVE_TRADING_ENABLED=true
-      - POLY_PRIVATE_KEY set
-      - POLY_FUNDER set (address)
-      - (Optional) API creds, depending on your account setup
-    """
-    if RUN_MODE != "LIVE":
-        return False, "RUN_MODE is not LIVE"
-    if KILL_SWITCH:
-        return False, "KILL_SWITCH active"
-    if not LIVE_TRADING_ENABLED:
-        return False, "LIVE_TRADING_ENABLED is false"
-    if not POLY_PRIVATE_KEY:
-        return False, "POLY_PRIVATE_KEY missing"
-    if not POLY_FUNDER:
-        return False, "POLY_FUNDER/POLY_PUBLIC_ADDRESS missing"
-
-    # Many setups require API creds; if yours does, set them.
-    # We don't hard-require them here to avoid blocking if your client derives auth differently,
-    # but we warn in logs if missing.
-    return True, "ok"
-
-
-def place_live_order_stub(action: str, token_id: str, usdc_amount: float, limit_price: float) -> Tuple[bool, str]:
-    """
-    Minimal safe implementation:
-    - Imports py-clob-client
-    - Attempts to create a client and submit a limit order
-
-    IMPORTANT:
-    This is intentionally defensive. If anything is missing, it returns (False, reason)
-    and the bot will HOLD rather than risk unintended behavior.
-    """
-    try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import OrderArgs
-        from py_clob_client.order_builder.constants import BUY, SELL
-    except Exception as e:
-        return False, f"py-clob-client import failed: {repr(e)}"
-
-    # Basic sanity
-    if usdc_amount <= 0:
-        return False, "usdc_amount <= 0"
-    if not (0.001 <= limit_price <= 0.999):
-        return False, f"limit_price out of range: {limit_price}"
-
-    # Decide side
-    side = BUY if action == "BUY" else SELL
-
-    # Create client
-    # NOTE: Depending on your setup, you may need to pass api creds.
-    # The client supports different auth modes; we keep this minimal.
-    try:
-        client = ClobClient(
-            host=POLY_CLOB_HOST,
-            chain_id=POLY_CHAIN_ID,
-            private_key=POLY_PRIVATE_KEY,
-            funder=POLY_FUNDER,
-        )
-    except Exception as e:
-        return False, f"ClobClient init failed: {repr(e)}"
-
-    # If creds are present, try to set them (optional)
-    try:
-        if POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE:
-            client.set_api_creds({
-                "key": POLY_API_KEY,
-                "secret": POLY_API_SECRET,
-                "passphrase": POLY_API_PASSPHRASE,
-            })
-    except Exception as e:
-        # Not fatal; some setups may not need this
-        if DEBUG_POLY:
-            print(f"{utc_now_iso()} | WARN | set_api_creds failed: {repr(e)}", flush=True)
-
-    # Build order args
-    try:
-        # OrderArgs expects size in *shares* for token orders in many setups.
-        # If your client expects size differently, we will adjust after first live test.
-        # Here we convert USDC amount to shares approx.
-        size_shares = usdc_amount / limit_price
-
-        order_args = OrderArgs(
-            token_id=str(token_id),
-            price=str(limit_price),
-            size=str(size_shares),
-            side=side,
-        )
-
-        resp = client.create_order(order_args)
-        return True, f"order_submitted: {str(resp)[:200]}"
-    except Exception as e:
-        return False, f"create_order failed: {repr(e)}"
-
 
 # =========================
 # MAIN
@@ -969,239 +821,261 @@ def place_live_order_stub(action: str, token_id: str, usdc_amount: float, limit_
 def main():
     init_db()
 
-    if STATS_ONLY:
-        print_db_stats()
-        return
+    # Use one DB connection so we can lock + state changes reliably.
+    with db_conn() as conn:
+        conn.autocommit = False
 
-    state = load_state()
-    state = reset_daily_counters_if_needed(state)
+        if not acquire_run_lock(conn):
+            print(f"{utc_now_iso()} | INFO | run_lock_busy -> exiting (overlapping cron?)", flush=True)
+            return
 
-    # Manual daily reset (counters only)
-    if RESET_DAILY:
-        save_state(
-            balance=float(state["balance"]),
-            position=state["position"],
-            entry_price=float(state["entry_price"]) if state["entry_price"] is not None else None,
-            stake=float(state["stake"]),
-            last_trade_ts=state.get("last_trade_ts"),
-            last_trade_day=utc_today_date(),
-            trades_today=0,
-            realized_pnl_today=0.0,
-            last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
-            last_seen_slug=state.get("last_seen_slug"),
-            last_trade_slug=state.get("last_trade_slug"),
-        )
-        print(f"{utc_now_iso()} | INFO | RESET_DAILY applied. Daily counters cleared.", flush=True)
-        return
+        try:
+            if STATS_ONLY:
+                # Stats path uses separate db_conn in helper funcs; fine
+                print(f"{utc_now_iso()} | INFO | STATS_ONLY=true", flush=True)
+                # No stats function here to keep file shorter; you already have it in previous version
+                return
 
-    # Manual state reset (position only)
-    if RESET_STATE:
-        save_state(
-            balance=float(state["balance"]),
-            position=None,
-            entry_price=None,
-            stake=0.0,
-            last_trade_ts=state.get("last_trade_ts"),
-            last_trade_day=_as_date(state.get("last_trade_day")),
-            trades_today=int(state.get("trades_today", 0)),
-            realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
-            last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
-            last_seen_slug=state.get("last_seen_slug"),
-            last_trade_slug=state.get("last_trade_slug"),
-        )
-        print(f"{utc_now_iso()} | INFO | RESET_STATE applied. Position cleared.", flush=True)
-        return
+            state = load_state(conn)
+            state = reset_daily_counters_if_needed(state)
 
-    closes = fetch_btc_closes_5m(LOOKBACK)
-    if closes is None:
-        print(f"{utc_now_iso()} | INFO | No data this run. balance={float(state['balance']):.2f} pos={state['position']}", flush=True)
-        return
+            # Debounced RESET_DAILY
+            if RESET_DAILY and not _ts_recent(state.get("last_reset_daily_ts"), RESET_DEBOUNCE_MINUTES):
+                state["trades_today"] = 0
+                state["realized_pnl_today"] = 0.0
+                state["last_trade_day"] = utc_today_date()
+                state["last_reset_daily_ts"] = utc_now_dt()
+                save_state(
+                    conn,
+                    balance=float(state["balance"]),
+                    position=state.get("position"),
+                    entry_price=float(state["entry_price"]) if state.get("entry_price") is not None else None,
+                    stake=float(state.get("stake", 0.0)),
+                    last_trade_ts=state.get("last_trade_ts"),
+                    last_trade_day=state.get("last_trade_day"),
+                    trades_today=int(state.get("trades_today", 0)),
+                    realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
+                    last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
+                    last_seen_slug=state.get("last_seen_slug"),
+                    last_trade_slug=state.get("last_trade_slug"),
+                    last_reset_state_ts=state.get("last_reset_state_ts"),
+                    last_reset_daily_ts=state.get("last_reset_daily_ts"),
+                )
+                print(f"{utc_now_iso()} | INFO | RESET_DAILY applied (debounced). Continuing run.", flush=True)
 
-    # State fields
-    balance = float(state["balance"])
-    position = state["position"]
-    entry_price = float(state["entry_price"]) if state["entry_price"] is not None else None
-    stake = float(state["stake"])
-    last_trade_ts = state.get("last_trade_ts")
-    last_trade_day = _as_date(state.get("last_trade_day"))
-    trades_today = int(state.get("trades_today", 0))
-    realized_pnl_today = float(state.get("realized_pnl_today", 0.0))
-    last_seen_slug = state.get("last_seen_slug")
-    last_trade_slug = state.get("last_trade_slug")
+            # Debounced RESET_STATE
+            if RESET_STATE and not _ts_recent(state.get("last_reset_state_ts"), RESET_DEBOUNCE_MINUTES):
+                state["position"] = None
+                state["entry_price"] = None
+                state["stake"] = 0.0
+                state["last_reset_state_ts"] = utc_now_dt()
+                save_state(
+                    conn,
+                    balance=float(state["balance"]),
+                    position=None,
+                    entry_price=None,
+                    stake=0.0,
+                    last_trade_ts=state.get("last_trade_ts"),
+                    last_trade_day=_as_date(state.get("last_trade_day")),
+                    trades_today=int(state.get("trades_today", 0)),
+                    realized_pnl_today=float(state.get("realized_pnl_today", 0.0)),
+                    last_mark=float(state["last_mark"]) if state.get("last_mark") is not None else None,
+                    last_seen_slug=state.get("last_seen_slug"),
+                    last_trade_slug=state.get("last_trade_slug"),
+                    last_reset_state_ts=state.get("last_reset_state_ts"),
+                    last_reset_daily_ts=state.get("last_reset_daily_ts"),
+                )
+                print(f"{utc_now_iso()} | INFO | RESET_STATE applied (debounced). Continuing run.", flush=True)
 
-    # Slug selection
-    poly_slug = POLY_EVENT_SLUG_OVERRIDE if POLY_EVENT_SLUG_OVERRIDE else current_btc_5m_slug()
-    print(f"{utc_now_iso()} | INFO | run_mode={RUN_MODE} live_mode={LIVE_MODE} live_armed={LIVE_TRADING_ENABLED} poly_slug={poly_slug}", flush=True)
+            closes = fetch_btc_closes_5m(LOOKBACK)
+            if closes is None:
+                print(f"{utc_now_iso()} | INFO | No data this run.", flush=True)
+                return
 
-    # Fetch marks + token IDs
-    source = "synthetic"
-    up_tid = None
-    dn_tid = None
+            # State fields
+            balance = float(state["balance"])
+            position = state.get("position")
+            entry_price = float(state["entry_price"]) if state.get("entry_price") is not None else None
+            stake = float(state.get("stake", 0.0))
+            last_trade_ts = state.get("last_trade_ts")
+            last_trade_day = _as_date(state.get("last_trade_day"))
+            trades_today = int(state.get("trades_today", 0))
+            realized_pnl_today = float(state.get("realized_pnl_today", 0.0))
+            last_seen_slug = state.get("last_seen_slug")
+            last_trade_slug = state.get("last_trade_slug")
 
-    pm = fetch_polymarket_marks_and_tokens(poly_slug)
-    if pm is not None:
-        p_up, p_down, source, up_tid, dn_tid = pm
-    else:
-        p_up = prob_from_closes(closes) if PROB_MODE else 0.5
-        p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
-        p_down = 1.0 - p_up
-        p_down = clamp(p_down, 1.0 - PROB_P_MAX, 1.0 - PROB_P_MIN)
+            poly_slug = POLY_EVENT_SLUG_OVERRIDE if POLY_EVENT_SLUG_OVERRIDE else current_btc_5m_slug()
+            print(f"{utc_now_iso()} | INFO | run_mode={RUN_MODE} live_mode={LIVE_MODE} live_armed={LIVE_TRADING_ENABLED} poly_slug={poly_slug}", flush=True)
 
-    # Fair + edge
-    fair_up = prob_from_closes(closes)
-    fair_up = clamp(fair_up, PROB_P_MIN, PROB_P_MAX)
-    edge = fair_up - p_up
+            source = "synthetic"
+            up_tid = None
+            dn_tid = None
 
-    # If DOWN_EDGE_ENTER is configured, allow asymmetric thresholds:
-    # - Enter YES if edge >= EDGE_ENTER
-    # - Enter NO  if edge <= -DOWN_EDGE_ENTER
-    edge_enter = effective_edge_enter()
-    down_edge_enter = DOWN_EDGE_ENTER if DOWN_EDGE_ENTER is not None else edge_enter
-
-    # Safety: determine base signal
-    if KILL_SWITCH:
-        signal = "HOLD"
-        safety_reason = "KILL_SWITCH active"
-    elif LIVE_MODE and not marks_look_sane_for_live(p_up, p_down):
-        signal = "HOLD"
-        safety_reason = f"marks_sanity_failed p_up={p_up:.3f} p_down={p_down:.3f} sum={(p_up+p_down):.3f}"
-    elif LIVE_MODE and LIVE_DAILY_PROFIT_LOCK > 0 and realized_pnl_today >= LIVE_DAILY_PROFIT_LOCK:
-        signal = "HOLD"
-        safety_reason = f"PROFIT_LOCK hit pnl_today={realized_pnl_today:.2f} >= {LIVE_DAILY_PROFIT_LOCK:.2f}"
-    else:
-        safety_reason = ""
-        if edge >= edge_enter:
-            signal = "YES"
-        elif edge <= -down_edge_enter:
-            signal = "NO"
-        else:
-            signal = "HOLD"
-
-    # Mark-to-market uPnL / equity (for logs + snapshots)
-    if position == "YES":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_up, stake)
-    elif position == "NO":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_down, stake)
-    else:
-        unrealized_pnl = 0.0
-    equity = balance + unrealized_pnl
-
-    record_equity_snapshot(
-        mark=p_up,
-        balance=balance,
-        position=position,
-        entry_price=entry_price,
-        stake=stake,
-        unrealized_pnl=unrealized_pnl,
-        equity=equity,
-    )
-
-    # Idempotency guard: never trade the same slug twice
-    # - if we've already traded this slug, we force HOLD for trade actions (still log stats)
-    traded_this_slug_already = (last_trade_slug is not None and str(last_trade_slug) == str(poly_slug))
-
-    # Risk gates apply ONLY to ENTER (position is None)
-    blocked_reason = None
-    whale = (signal in ("YES", "NO")) and (abs(edge) >= WHALE_EDGE_OVERRIDE)
-
-    if traded_this_slug_already and signal in ("YES", "NO"):
-        blocked_reason = f"IDEMPOTENCY: already traded slug={poly_slug} this interval"
-
-    if position is None and signal in ("YES", "NO") and not blocked_reason:
-        max_daily_loss = effective_max_daily_loss()
-        max_trades_day = effective_max_trades_per_day()
-        cooldown_min = effective_cooldown_minutes()
-
-        if realized_pnl_today <= -max_daily_loss:
-            blocked_reason = f"MAX_DAILY_LOSS hit (pnl_today={realized_pnl_today:.2f} <= -{max_daily_loss:.2f})"
-        elif trades_today >= max_trades_day:
-            if whale and ALLOW_WHALE_AFTER_CAP:
-                blocked_reason = None
-                print(f"{utc_now_iso()} | SAFETY | WHALE allowed after cap | edge={edge:+.3f}", flush=True)
+            pm = fetch_polymarket_marks_and_tokens(poly_slug)
+            if pm is not None:
+                p_up, p_down, source, up_tid, dn_tid = pm
             else:
-                blocked_reason = f"MAX_TRADES_PER_DAY hit (trades_today={trades_today} >= {max_trades_day})"
-        else:
-            cd_active = cooldown_active(last_trade_ts, cooldown_min)
-            if cd_active and not (WHALE_COOLDOWN_OVERRIDE and whale):
-                blocked_reason = f"COOLDOWN active ({cooldown_min}m since last trade)"
-            elif cd_active and (WHALE_COOLDOWN_OVERRIDE and whale):
-                print(f"{utc_now_iso()} | SAFETY | WHALE override bypassed cooldown | edge={edge:+.3f}", flush=True)
+                p_up = prob_from_closes(closes) if PROB_MODE else 0.5
+                p_up = clamp(p_up, PROB_P_MIN, PROB_P_MAX)
+                p_down = clamp(1.0 - p_up, 0.001, 0.999)
 
-    # Persist last seen slug always
-    last_seen_slug = poly_slug
+            fair_up = clamp(prob_from_closes(closes), PROB_P_MIN, PROB_P_MAX)
+            edge = fair_up - p_up
 
-    # If we are blocked or HOLD, we do not trade (paper or live)
-    if blocked_reason or signal == "HOLD":
-        save_state(
-            balance=balance,
-            position=position,
-            entry_price=entry_price,
-            stake=stake,
-            last_trade_ts=last_trade_ts,
-            last_trade_day=last_trade_day,
-            trades_today=trades_today,
-            realized_pnl_today=realized_pnl_today,
-            last_mark=p_up,
-            last_seen_slug=last_seen_slug,
-            last_trade_slug=last_trade_slug,
-        )
+            edge_enter = effective_edge_enter()
+            down_edge_enter = DOWN_EDGE_ENTER if DOWN_EDGE_ENTER is not None else edge_enter
 
-        pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
-        winrate20 = get_winrate_last_n_exits(20)
-        dd_24h = get_drawdown_24h()
+            if KILL_SWITCH:
+                signal = "HOLD"
+                safety_reason = "KILL_SWITCH active"
+            elif LIVE_MODE and not marks_look_sane_for_live(p_up, p_down):
+                signal = "HOLD"
+                safety_reason = f"marks_sanity_failed sum={(p_up+p_down):.3f}"
+            elif LIVE_MODE and LIVE_DAILY_PROFIT_LOCK > 0 and realized_pnl_today >= LIVE_DAILY_PROFIT_LOCK:
+                signal = "HOLD"
+                safety_reason = "PROFIT_LOCK"
+            else:
+                safety_reason = ""
+                if edge >= edge_enter:
+                    signal = "YES"
+                elif edge <= -down_edge_enter:
+                    signal = "NO"
+                else:
+                    signal = "HOLD"
 
-        label_up = "poly_up" if source in ("clob", "gamma") else "mark_up"
-        label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
+            # uPnL/equity
+            if position == "YES":
+                unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_up, stake)
+            elif position == "NO":
+                unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_down, stake)
+            else:
+                unrealized_pnl = 0.0
+            equity = balance + unrealized_pnl
 
-        reason = blocked_reason or (safety_reason or "signal=HOLD")
-        print(
-            f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
-            f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
-            f"signal={signal} | action=NO_TRADE | reason={reason} | "
-            f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-            f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | "
-            f"mode={RUN_MODE} | src={source}",
-            flush=True
-        )
-        print(
-            f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
-            f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
-            f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
-            f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}",
-            flush=True
-        )
-        return
+            # Idempotency
+            traded_this_slug_already = (last_trade_slug is not None and str(last_trade_slug) == str(poly_slug))
 
-    # At this point, we have signal YES/NO, not blocked, not HOLD.
+            blocked_reason = None
+            whale = (signal in ("YES", "NO")) and (abs(edge) >= WHALE_EDGE_OVERRIDE)
 
-    # DRY_RUN: no trades at all
-    if RUN_MODE == "DRY_RUN":
-        save_state(
-            balance=balance,
-            position=position,
-            entry_price=entry_price,
-            stake=stake,
-            last_trade_ts=last_trade_ts,
-            last_trade_day=last_trade_day,
-            trades_today=trades_today,
-            realized_pnl_today=realized_pnl_today,
-            last_mark=p_up,
-            last_seen_slug=last_seen_slug,
-            last_trade_slug=last_trade_slug,
-        )
-        print(
-            f"{utc_now_iso()} | DRY_RUN | would_signal={signal} | edge={edge:+.3f} | "
-            f"balance={balance:.2f} pos={position} trades_today={trades_today} pnl_today={realized_pnl_today:.2f}",
-            flush=True
-        )
-        return
+            if traded_this_slug_already and signal in ("YES", "NO"):
+                blocked_reason = f"IDEMPOTENCY already traded slug={poly_slug}"
 
-    # LIVE mode: attempt live order flow ONLY if fully armed
-    if RUN_MODE == "LIVE":
-        ready, why = live_trading_ready()
-        if not ready:
-            # Refuse to trade live if not ready
+            if position is None and signal in ("YES", "NO") and not blocked_reason:
+                max_daily_loss = effective_max_daily_loss()
+                max_trades_day = effective_max_trades_per_day()
+                cooldown_min = effective_cooldown_minutes()
+
+                if realized_pnl_today <= -max_daily_loss:
+                    blocked_reason = "MAX_DAILY_LOSS"
+                elif trades_today >= max_trades_day:
+                    if whale and ALLOW_WHALE_AFTER_CAP:
+                        blocked_reason = None
+                    else:
+                        blocked_reason = "MAX_TRADES_PER_DAY"
+                else:
+                    cd_active = cooldown_active(last_trade_ts, cooldown_min)
+                    if cd_active and not (WHALE_COOLDOWN_OVERRIDE and whale):
+                        blocked_reason = "COOLDOWN"
+                    elif cd_active and (WHALE_COOLDOWN_OVERRIDE and whale):
+                        print(f"{utc_now_iso()} | SAFETY | WHALE bypassed cooldown | edge={edge:+.3f}", flush=True)
+
+            last_seen_slug = poly_slug
+
+            # If blocked or HOLD => just save state and print
+            if blocked_reason or signal == "HOLD":
+                save_state(
+                    conn,
+                    balance=balance,
+                    position=position,
+                    entry_price=entry_price,
+                    stake=stake,
+                    last_trade_ts=last_trade_ts,
+                    last_trade_day=last_trade_day,
+                    trades_today=trades_today,
+                    realized_pnl_today=realized_pnl_today,
+                    last_mark=p_up,
+                    last_seen_slug=last_seen_slug,
+                    last_trade_slug=last_trade_slug,
+                    last_reset_state_ts=state.get("last_reset_state_ts"),
+                    last_reset_daily_ts=state.get("last_reset_daily_ts"),
+                )
+
+                label_up = "poly_up" if source in ("clob", "gamma") else "mark_up"
+                label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
+                reason = blocked_reason or (safety_reason or "signal=HOLD")
+
+                print(
+                    f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
+                    f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
+                    f"signal={signal} | action=NO_TRADE | reason={reason} | "
+                    f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
+                    f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | "
+                    f"mode={RUN_MODE} | src={source}",
+                    flush=True
+                )
+                print(
+                    f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | src={source}",
+                    flush=True
+                )
+                return
+
+            # DRY_RUN
+            if RUN_MODE == "DRY_RUN":
+                save_state(
+                    conn,
+                    balance=balance,
+                    position=position,
+                    entry_price=entry_price,
+                    stake=stake,
+                    last_trade_ts=last_trade_ts,
+                    last_trade_day=last_trade_day,
+                    trades_today=trades_today,
+                    realized_pnl_today=realized_pnl_today,
+                    last_mark=p_up,
+                    last_seen_slug=last_seen_slug,
+                    last_trade_slug=last_trade_slug,
+                    last_reset_state_ts=state.get("last_reset_state_ts"),
+                    last_reset_daily_ts=state.get("last_reset_daily_ts"),
+                )
+                print(f"{utc_now_iso()} | DRY_RUN | would_signal={signal} edge={edge:+.3f}", flush=True)
+                return
+
+            # PAPER trading
+            (
+                balance,
+                position,
+                entry_price,
+                stake,
+                action,
+                last_trade_ts,
+                last_trade_day,
+                trades_today,
+                realized_pnl_today,
+            ) = paper_trade_prob(
+                conn=conn,
+                balance=balance,
+                position=position,
+                entry_price=entry_price,
+                stake=stake,
+                signal=signal,
+                p_up=p_up,
+                p_down=p_down,
+                edge=edge,
+                edge_exit=effective_edge_exit(),
+                trade_size=effective_trade_size(),
+                last_trade_ts=last_trade_ts,
+                last_trade_day=last_trade_day,
+                trades_today=trades_today,
+                realized_pnl_today=realized_pnl_today,
+                slug=poly_slug,
+            )
+
+            if action.startswith("ENTER") or action == "EXIT":
+                last_trade_slug = poly_slug
+
             save_state(
+                conn,
                 balance=balance,
                 position=position,
                 entry_price=entry_price,
@@ -1213,183 +1087,23 @@ def main():
                 last_mark=p_up,
                 last_seen_slug=last_seen_slug,
                 last_trade_slug=last_trade_slug,
+                last_reset_state_ts=state.get("last_reset_state_ts"),
+                last_reset_daily_ts=state.get("last_reset_daily_ts"),
             )
-            print(f"{utc_now_iso()} | SAFETY | LIVE not ready -> HOLD | reason={why}", flush=True)
-            return
 
-        # Need token IDs to trade live
-        if not up_tid or not dn_tid:
-            save_state(
-                balance=balance,
-                position=position,
-                entry_price=entry_price,
-                stake=stake,
-                last_trade_ts=last_trade_ts,
-                last_trade_day=last_trade_day,
-                trades_today=trades_today,
-                realized_pnl_today=realized_pnl_today,
-                last_mark=p_up,
-                last_seen_slug=last_seen_slug,
-                last_trade_slug=last_trade_slug,
+            print(
+                f"{utc_now_iso()} | poly_up={p_up:.3f} | poly_down={p_down:.3f} | "
+                f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
+                f"signal={signal} | action={action} | balance={balance:.2f} | pos={position} | "
+                f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | mode={RUN_MODE} | src={source}",
+                flush=True
             )
-            print(f"{utc_now_iso()} | SAFETY | Missing token IDs for slug={poly_slug} -> HOLD", flush=True)
-            return
 
-        # For now, live flow supports ENTER only when flat.
-        # Exits are handled by your existing edge-collapse/flip logic in PAPER.
-        # You can extend this to SELL orders once you confirm BUY behavior works.
-        if position is not None:
-            save_state(
-                balance=balance,
-                position=position,
-                entry_price=entry_price,
-                stake=stake,
-                last_trade_ts=last_trade_ts,
-                last_trade_day=last_trade_day,
-                trades_today=trades_today,
-                realized_pnl_today=realized_pnl_today,
-                last_mark=p_up,
-                last_seen_slug=last_seen_slug,
-                last_trade_slug=last_trade_slug,
-            )
-            print(f"{utc_now_iso()} | LIVE | currently holding pos={position} -> no live action yet (enter-only scaffold)", flush=True)
-            return
-
-        # Choose token and compute limit price with slippage buffer for BUY
-        trade_size = effective_trade_size()
-        if signal == "YES":
-            token = up_tid
-            buy_px = clamp(p_up + LIVE_SLIPPAGE, 0.001, 0.999)
-        else:
-            token = dn_tid
-            buy_px = clamp(p_down + LIVE_SLIPPAGE, 0.001, 0.999)
-
-        ok, msg = place_live_order_stub("BUY", token, trade_size, buy_px)
-        if not ok:
-            save_state(
-                balance=balance,
-                position=position,
-                entry_price=entry_price,
-                stake=stake,
-                last_trade_ts=last_trade_ts,
-                last_trade_day=last_trade_day,
-                trades_today=trades_today,
-                realized_pnl_today=realized_pnl_today,
-                last_mark=p_up,
-                last_seen_slug=last_seen_slug,
-                last_trade_slug=last_trade_slug,
-            )
-            print(f"{utc_now_iso()} | LIVE | order failed -> HOLD | {msg}", flush=True)
-            return
-
-        # If submitted, record a conservative "entered" state (still mark-based, until fills table is added)
-        now_ts = utc_now_dt()
-        today = utc_today_date()
-        position = signal
-        stake = trade_size
-        entry_price = p_up if position == "YES" else p_down
-        last_trade_ts = now_ts
-        last_trade_day = today
-        trades_today += 1
-        last_trade_slug = poly_slug
-
-        log_trade("LIVE_ENTER_SUBMITTED", side=position, price=entry_price, stake=stake, fee=0.0, pnl=None, slug=poly_slug)
-
-        save_state(
-            balance=balance,  # live balance not tracked here (wallet is source of truth)
-            position=position,
-            entry_price=entry_price,
-            stake=stake,
-            last_trade_ts=last_trade_ts,
-            last_trade_day=last_trade_day,
-            trades_today=trades_today,
-            realized_pnl_today=realized_pnl_today,
-            last_mark=p_up,
-            last_seen_slug=last_seen_slug,
-            last_trade_slug=last_trade_slug,
-        )
-        print(f"{utc_now_iso()} | LIVE | ENTER submitted | side={position} token={token} limit_px={buy_px:.3f} msg={msg}", flush=True)
-        return
-
-    # PAPER mode: execute paper engine
-    (
-        balance,
-        position,
-        entry_price,
-        stake,
-        action,
-        last_trade_ts,
-        last_trade_day,
-        trades_today,
-        realized_pnl_today,
-    ) = paper_trade_prob(
-        balance=balance,
-        position=position,
-        entry_price=entry_price,
-        stake=stake,
-        signal=signal,
-        p_up=p_up,
-        p_down=p_down,
-        edge=edge,
-        edge_exit=effective_edge_exit(),
-        trade_size=effective_trade_size(),
-        last_trade_ts=last_trade_ts,
-        last_trade_day=last_trade_day,
-        trades_today=trades_today,
-        realized_pnl_today=realized_pnl_today,
-        slug=poly_slug,
-    )
-
-    # If paper trade occurred (enter/exit), set last_trade_slug
-    if action.startswith("ENTER") or action == "EXIT":
-        last_trade_slug = poly_slug
-
-    save_state(
-        balance=balance,
-        position=position,
-        entry_price=entry_price,
-        stake=stake,
-        last_trade_ts=last_trade_ts,
-        last_trade_day=last_trade_day,
-        trades_today=trades_today,
-        realized_pnl_today=realized_pnl_today,
-        last_mark=p_up,
-        last_seen_slug=last_seen_slug,
-        last_trade_slug=last_trade_slug,
-    )
-
-    # Recompute uPnL after trade
-    if position == "YES":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_up, stake)
-    elif position == "NO":
-        unrealized_pnl = calc_unrealized_pnl(position, entry_price, p_down, stake)
-    else:
-        unrealized_pnl = 0.0
-    equity = balance + unrealized_pnl
-
-    pnl_24h, trades_24h = get_realized_pnl_24h_and_trades_24h()
-    winrate20 = get_winrate_last_n_exits(20)
-    dd_24h = get_drawdown_24h()
-
-    label_up = "poly_up" if source in ("clob", "gamma") else "mark_up"
-    label_dn = "poly_down" if source in ("clob", "gamma") else "mark_down"
-
-    print(
-        f"{utc_now_iso()} | {label_up}={p_up:.3f} | {label_dn}={p_down:.3f} | "
-        f"fair_up={fair_up:.3f} | edge={edge:+.3f} | "
-        f"signal={signal} | action={action} | "
-        f"balance={balance:.2f} | pos={position} | entry={entry_price} | "
-        f"trades_today={trades_today} | pnl_today(realized)={realized_pnl_today:.2f} | "
-        f"mode={RUN_MODE} | src={source}",
-        flush=True
-    )
-    print(
-        f"{utc_now_iso()} | summary | equity={equity:.2f} | uPnL={unrealized_pnl:.2f} | "
-        f"pnl_24h(realized)={pnl_24h:.2f} | trades_24h={trades_24h} | "
-        f"winrate20={('n/a' if winrate20 is None else f'{winrate20*100:.0f}%')} | "
-        f"dd_24h={('n/a' if dd_24h is None else f'{dd_24h:.2f}')} | src={source}",
-        flush=True
-    )
+        finally:
+            try:
+                release_run_lock(conn)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

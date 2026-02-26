@@ -257,17 +257,120 @@ GAMMA_URL = env_str("GAMMA_URL", "https://gamma-api.polymarket.com")
 
 
 def _maybe_json_list(x):
+    """
+    Gamma sometimes returns JSON arrays as strings.
+    Handles:
+      - '["Up","Down"]' -> ["Up","Down"]
+      - '["0.49","0.51"]' -> ["0.49","0.51"]
+      - ["Up","Down"] -> ["Up","Down"]
+      - "Up,Down" -> ["Up","Down"]
+    """
+    if x is None:
+        return None
     if isinstance(x, list):
         return x
     if isinstance(x, str):
         s = x.strip()
-        try:
-            v = json.loads(s)
-            if isinstance(v, list):
-                return v
-        except Exception:
+        if not s:
             return None
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
+        if "," in s:
+            return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
+        return [s]
     return None
+
+
+def _extract_updown_from_market(m: dict) -> Optional[Dict[str, Any]]:
+    """
+    Returns mapping for UP/DOWN (or YES/NO) plus optional Gamma prices.
+    Very defensive: supports multiple Gamma field variants and outcome labels.
+    """
+    # Outcomes / names
+    outcomes = (
+        _maybe_json_list(m.get("outcomes"))
+        or _maybe_json_list(m.get("outcomeNames"))
+        or _maybe_json_list(m.get("outcome_names"))
+        or _maybe_json_list(m.get("answers"))
+    )
+
+    # Token IDs (CLOB)
+    token_ids = (
+        _maybe_json_list(m.get("clobTokenIds"))
+        or _maybe_json_list(m.get("clobTokenIDs"))
+        or _maybe_json_list(m.get("clob_token_ids"))
+        or _maybe_json_list(m.get("tokenIds"))
+        or _maybe_json_list(m.get("token_ids"))
+    )
+
+    # Gamma prices
+    outcome_prices = (
+        _maybe_json_list(m.get("outcomePrices"))
+        or _maybe_json_list(m.get("outcome_prices"))
+        or _maybe_json_list(m.get("prices"))
+    )
+
+    if not isinstance(outcomes, list) or len(outcomes) < 2:
+        if DEBUG_POLY:
+            print(f"{utc_now_iso()} | DEBUG | extract_fail outcomes={str(m.get('outcomes'))[:200]} outcomeNames={str(m.get('outcomeNames'))[:200]}", flush=True)
+        return None
+
+    # Normalize outcome labels
+    norm = [str(o).strip().lower() for o in outcomes]
+
+    # Build index lookup for common label variants
+    # We accept: up/down, yes/no, higher/lower, above/below
+    def find_idx(candidates: List[str]) -> Optional[int]:
+        for c in candidates:
+            c = c.lower()
+            for i, n in enumerate(norm):
+                if n == c:
+                    return i
+            # substring match fallback (handles "btc up" / "price up" etc.)
+            for i, n in enumerate(norm):
+                if c in n:
+                    return i
+        return None
+
+    up_i = find_idx(["up", "yes", "higher", "above", "increase"])
+    dn_i = find_idx(["down", "no", "lower", "below", "decrease"])
+
+    # If we still can’t identify, but it’s a 2-outcome market, assume order is [up, down]
+    if up_i is None or dn_i is None:
+        if len(outcomes) == 2:
+            up_i, dn_i = 0, 1
+        else:
+            if DEBUG_POLY:
+                print(f"{utc_now_iso()} | DEBUG | extract_fail norm_outcomes={norm}", flush=True)
+            return None
+
+    # Token mapping
+    up_tid = None
+    dn_tid = None
+    if isinstance(token_ids, list) and len(token_ids) > max(up_i, dn_i):
+        up_tid = str(token_ids[up_i])
+        dn_tid = str(token_ids[dn_i])
+
+    # Gamma price mapping
+    up_g = None
+    dn_g = None
+    if isinstance(outcome_prices, list) and len(outcome_prices) > max(up_i, dn_i):
+        up_g = _safe_float(outcome_prices[up_i])
+        dn_g = _safe_float(outcome_prices[dn_i])
+
+    if DEBUG_POLY:
+        print(
+            f"{utc_now_iso()} | DEBUG | market_id={m.get('id')} title={str(m.get('title') or m.get('question') or '')[:80]} "
+            f"outcomes={outcomes} token_ids_len={(len(token_ids) if isinstance(token_ids, list) else 'n/a')} "
+            f"prices_len={(len(outcome_prices) if isinstance(outcome_prices, list) else 'n/a')} "
+            f"up_i={up_i} dn_i={dn_i} up_tid={up_tid} dn_tid={dn_tid} up_g={up_g} dn_g={dn_g}",
+            flush=True
+        )
+
+    return {"up_tid": up_tid, "dn_tid": dn_tid, "up_gamma": up_g, "dn_gamma": dn_g}
 
 
 def fetch_gamma_market_by_slug(slug: str) -> dict:

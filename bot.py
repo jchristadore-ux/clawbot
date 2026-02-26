@@ -221,15 +221,30 @@ def current_5m_bucket_ts(now_ts: int) -> int:
 
 
 def make_poly_slug() -> str:
-    # Preferred: POLY_MARKET_SLUG already set by you
-    fixed = env_str("POLY_MARKET_SLUG", "").strip()
-    if fixed:
-        return fixed
+    """
+    Priority:
+      1) POLY_MARKET_SLUG (explicit full slug)
+      2) POLY_EVENT_SLUG (base slug) + current 5m bucket
+      3) Back-compat fallbacks: MARKET_SLUG / EVENT_SLUG / POLY_SLUG
+    Returns "" if missing (caller should exit cleanly).
+    """
+    # 1) explicit
+    for k in ("POLY_MARKET_SLUG", "MARKET_SLUG", "POLY_SLUG"):
+        v = env_str(k, "").strip()
+        if v:
+            return v
 
-    # Else derive from POLY_EVENT_SLUG + 5m timestamp bucket
-    event_slug = env_str("POLY_EVENT_SLUG", "").strip()
+    # 2) derive
+    event_slug = ""
+    for k in ("POLY_EVENT_SLUG", "EVENT_SLUG"):
+        v = env_str(k, "").strip()
+        if v:
+            event_slug = v
+            break
+
     if not event_slug:
-        raise RuntimeError("Missing POLY_MARKET_SLUG or POLY_EVENT_SLUG")
+        return ""
+
     now_ts = int(time.time())
     bucket = current_5m_bucket_ts(now_ts)
     return f"{event_slug}-{bucket}"
@@ -606,6 +621,11 @@ def main():
 
     # Build market slug & lookup token ids
     poly_slug = make_poly_slug()
+    if not poly_slug:
+        log_line("ERROR", "Missing market slug vars. Set POLY_MARKET_SLUG or POLY_EVENT_SLUG on this service (clawbot).")
+        log_line("INFO", "BOOT: bot.py finished cleanly")
+        return
+
     log_line("INFO", f"run_mode={run_mode} live_mode={live_mode} live_armed={live_armed} poly_slug={poly_slug}")
 
     mkt = fetch_gamma_market_by_slug(poly_slug)

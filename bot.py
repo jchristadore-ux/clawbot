@@ -1,364 +1,109 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 import os
 import sys
 import json
 import time
 import math
 import uuid
-import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 import psycopg2
-from psycopg2.extras import RealDictCursor
+
 
 # ----------------------------
 # Logging
 # ----------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-STATS_ONLY = os.getenv("STATS_ONLY", "false").lower() == "true"
-
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(message)s",
-    stream=sys.stdout,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("clawbot")
-
-
-def ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def jbool(x: str, default: bool = False) -> bool:
-    if x is None:
-        return default
-    return str(x).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def env(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name)
-    return v if v not in (None, "") else default
-
-
-def env_float(name: str, default: float) -> float:
-    v = env(name)
-    if v is None:
-        return default
-    return float(v)
-
-
-def env_int(name: str, default: int) -> int:
-    v = env(name)
-    if v is None:
-        return default
-    return int(v)
+log = logging.getLogger("johnny5")
 
 
 # ----------------------------
-# Config
+# Env / Config
 # ----------------------------
-DATABASE_URL = env("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL")
+POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
+GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").rstrip("/")
 
-RUN_MODE = (env("RUN_MODE", "PAPER") or "PAPER").upper()  # PAPER | LIVE | DRY_RUN
-POLY_MARKET_SLUG = env("POLY_MARKET_SLUG")  # preferred
-POLY_EVENT_SLUG = env("POLY_EVENT_SLUG")    # fallback
+# For these time-sliced markets we use a base slug + timestamp
+POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
+POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()  # optional alternate strategy
 
-COOLDOWN_MINUTES = env_int("COOLDOWN_MINUTES", 5)
-LIVE_COOLDOWN_MINUTES = env_int("LIVE_COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+RUN_MODE = os.getenv("RUN_MODE", "PAPER").upper()  # DRY_RUN, PAPER, LIVE
 
-MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", 5)
-LIVE_MAX_TRADES_PER_DAY = env_int("LIVE_MAX_TRADES_PER_DAY", MAX_TRADES_PER_DAY)
+LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+KILL_SWITCH = os.getenv("KILL_SWITCH", "true").lower() == "true"
 
-UP_THRESHOLD = env_float("UP_THRESHOLD", 0.08)   # edge threshold to enter YES
-DOWN_THRESHOLD = env_float("DOWN_THRESHOLD", 0.08)  # edge threshold to enter NO
-EDGE_EXIT = env_float("EDGE_EXIT", 0.00)         # exit if edge crosses against position by >= this (basic)
+# “armed” means you intentionally want orders to be able to flow (still gated by kill switch)
+LIVE_ARMED = os.getenv("LIVE_ARMED", "false").lower() == "true"
+# Back-compat: if your older env var is LIVE_TRADING_ARMED use it too
+if os.getenv("LIVE_TRADING_ARMED") is not None:
+    LIVE_ARMED = os.getenv("LIVE_TRADING_ARMED", "false").lower() == "true"
 
-ENABLE_DRAWDOWN = jbool(env("ENABLE_DRAWDOWN", "false"))
-MAX_DAILY_LOSS = env_float("MAX_DAILY_LOSS", 999999.0)
-LIVE_MAX_DAILY_LOSS = env_float("LIVE_MAX_DAILY_LOSS", MAX_DAILY_LOSS)
+# your Bun service endpoint
+BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").rstrip("/")
+BUN_ORDER_URL = os.getenv("BUN_ORDER_URL", "").strip()  # recommended: full /order URL
+BUN_TIMEOUT_S = float(os.getenv("BUN_TIMEOUT_S", "10"))
 
-# Live rails
-LIVE_TRADING_ENABLED = jbool(env("LIVE_TRADING_ENABLED", "false"))
-KILL_SWITCH = jbool(env("KILL_SWITCH", "true"))
-LIVE_TRADE_SIZE = env_float("LIVE_TRADE_SIZE", 1.0)  # "shares" for relay; keep tiny at first
+# sizing
+LIVE_TRADE_SIZE = float(os.getenv("LIVE_TRADE_SIZE", "1"))
+PAPER_TRADE_SIZE = float(os.getenv("PAPER_TRADE_SIZE", "1"))
 
-# Optional: “armed” gating
-# If you already have LIVE_ARMED or LIVE_MODE flags, we’ll accept them.
-LIVE_ARMED = jbool(env("LIVE_ARMED", "false")) or jbool(env("LIVE_MODE", "false"))
+# strategy thresholds
+EDGE_ENTER = float(os.getenv("EDGE_ENTER", "0.10"))   # enter when edge >= 10 cents
+EDGE_EXIT = float(os.getenv("EDGE_EXIT", "0.00"))     # exit when opposite signal or edge flips
+COOLDOWN_BARS = int(os.getenv("COOLDOWN_BARS", "1"))  # minimum bars between trades
 
-# Relay (function-bun)
-ORDER_RELAY_URL = env("ORDER_RELAY_URL")  # e.g. http://function-bun.railway.internal
-ORDER_TIMEOUT_SEC = env_int("ORDER_TIMEOUT_SEC", 20)
-ORDER_STATUS_TIMEOUT_SEC = env_int("ORDER_STATUS_TIMEOUT_SEC", 10)
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "60"))
 
-# State resets
-RESET_STATE = jbool(env("RESET_STATE", "false"))
-RESET_DAILY = jbool(env("RESET_DAILY", "false"))
-RESET_DAILY_DEBOUNCE_MIN = env_int("RESET_DAILY_DEBOUNCE_MIN", 20)
+# DB
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# Misc
+STATS_ONLY = os.getenv("STATS_ONLY", "false").lower() == "true"
+
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def make_poly_slug() -> str:
-    if POLY_MARKET_SLUG:
-        return POLY_MARKET_SLUG
-    if POLY_EVENT_SLUG:
-        return POLY_EVENT_SLUG
-    raise RuntimeError("Missing POLY_MARKET_SLUG or POLY_EVENT_SLUG")
-
-
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def floor_to_5m(ts: int) -> int:
+    return (ts // 300) * 300
 
-def floor_to_5m(dt: datetime) -> datetime:
-    # align to 5 minute buckets
-    minute = (dt.minute // 5) * 5
-    return dt.replace(minute=minute, second=0, microsecond=0)
-
-
-def slug_for_5m_market(base_slug: str, dt: datetime) -> str:
-    # You already use btc-updown-5m-<epoch> style; keep consistent:
-    # If POLY_MARKET_SLUG already includes the epoch suffix, just use it.
-    # Otherwise append epoch of the 5m bucket start.
-    if base_slug.count("-") >= 3 and base_slug.split("-")[-1].isdigit():
-        return base_slug
-    epoch = int(floor_to_5m(dt).timestamp())
-    return f"{base_slug}-{epoch}"
-
-
-def stable_client_order_id(poly_slug: str, action: str, side: str) -> str:
-    raw = f"{poly_slug}|{action}|{side}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
-
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
-
-
-def round_to_tick(price: float, tick: float) -> float:
-    if tick <= 0:
-        return price
-    return round(price / tick) * tick
-
-
-# ----------------------------
-# DB
-# ----------------------------
-def db() -> psycopg2.extensions.connection:
-    return psycopg2.connect(DATABASE_URL)
-
-
-def ensure_schema() -> None:
+def make_poly_slug() -> str:
     """
-    Create required tables and add missing columns without breaking existing data.
-    This prevents “mark/price missing” crashes.
+    If POLY_EVENT_SLUG is provided, use it as exact slug.
+    Else use POLY_MARKET_SLUG base + 5-minute timestamp bucket.
     """
-    with db() as conn, conn.cursor() as cur:
-        # bot_state: single-row KV-ish
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_state (
-            id SERIAL PRIMARY KEY,
-            key TEXT UNIQUE NOT NULL,
-            value TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """)
+    if POLY_EVENT_SLUG:
+        return POLY_EVENT_SLUG
 
-        # trades: record discrete entries/exits (paper and live-intent)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            poly_slug TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            action TEXT NOT NULL,
-            side TEXT,
-            price DOUBLE PRECISION,
-            size DOUBLE PRECISION,
-            position TEXT,
-            entry_price DOUBLE PRECISION,
-            pnl_realized DOUBLE PRECISION DEFAULT 0
-        );
-        """)
+    if not POLY_MARKET_SLUG:
+        raise RuntimeError("Missing POLY_MARKET_SLUG or POLY_EVENT_SLUG")
 
-        # equity snapshots
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS equity_snapshots (
-            id SERIAL PRIMARY KEY,
-            ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            price DOUBLE PRECISION,
-            balance DOUBLE PRECISION,
-            position TEXT,
-            entry_price DOUBLE PRECISION,
-            stake DOUBLE PRECISION,
-            unrealized_pnl DOUBLE PRECISION,
-            equity DOUBLE PRECISION
-        );
-        """)
+    ts = int(time.time())
+    bucket = floor_to_5m(ts)
+    return f"{POLY_MARKET_SLUG}-{bucket}"
 
-        # live_orders: idempotent per slug/action
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS live_orders (
-            id SERIAL PRIMARY KEY,
-            ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            poly_slug TEXT NOT NULL,
-            action TEXT NOT NULL,
-            position_side TEXT NOT NULL,
-            token_id TEXT,
-            client_order_id TEXT UNIQUE,
-            order_id TEXT,
-            status TEXT NOT NULL DEFAULT 'created',
-            price DOUBLE PRECISION,
-            size DOUBLE PRECISION,
-            raw_response TEXT
-        );
-        """)
+def http_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = 10) -> Any:
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-        # daily_state: for resets / debouncing
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS daily_state (
-            id SERIAL PRIMARY KEY,
-            day_key TEXT UNIQUE NOT NULL,
-            trades_today INTEGER NOT NULL DEFAULT 0,
-            pnl_today_realized DOUBLE PRECISION NOT NULL DEFAULT 0,
-            last_trade_ts TIMESTAMPTZ,
-            last_reset_ts TIMESTAMPTZ
-        );
-        """)
-
-        # Add missing columns defensively
-        def add_col(table: str, col: str, ddl: str) -> None:
-            cur.execute("""
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name=%s AND column_name=%s
-            """, (table, col))
-            if cur.fetchone() is None:
-                cur.execute(f'ALTER TABLE "{table}" ADD COLUMN {ddl};')
-
-        # handle prior schema that used "mark" instead of "price"
-        add_col("equity_snapshots", "price", "price DOUBLE PRECISION")
-        add_col("equity_snapshots", "balance", "balance DOUBLE PRECISION")
-        add_col("equity_snapshots", "position", "position TEXT")
-        add_col("equity_snapshots", "entry_price", "entry_price DOUBLE PRECISION")
-        add_col("equity_snapshots", "stake", "stake DOUBLE PRECISION")
-        add_col("equity_snapshots", "unrealized_pnl", "unrealized_pnl DOUBLE PRECISION")
-        add_col("equity_snapshots", "equity", "equity DOUBLE PRECISION")
-
-        add_col("live_orders", "client_order_id", "client_order_id TEXT UNIQUE")
-        add_col("live_orders", "raw_response", "raw_response TEXT")
-
-        conn.commit()
-
-
-def get_day_key() -> str:
-    # UTC day boundary
-    return now_utc().strftime("%Y-%m-%d")
-
-
-def load_daily_state(cur) -> Dict[str, Any]:
-    day_key = get_day_key()
-    cur.execute("SELECT * FROM daily_state WHERE day_key=%s", (day_key,))
-    row = cur.fetchone()
-    if row:
-        return dict(row)
-    cur.execute("""
-        INSERT INTO daily_state(day_key, trades_today, pnl_today_realized, last_trade_ts, last_reset_ts)
-        VALUES (%s, 0, 0, NULL, NULL)
-        RETURNING *
-    """, (day_key,))
-    return dict(cur.fetchone())
-
-
-def update_daily_state(cur, trades_today: int, pnl_today_realized: float, last_trade_ts: Optional[datetime]) -> None:
-    day_key = get_day_key()
-    cur.execute("""
-        UPDATE daily_state
-        SET trades_today=%s, pnl_today_realized=%s, last_trade_ts=%s
-        WHERE day_key=%s
-    """, (trades_today, pnl_today_realized, last_trade_ts, day_key))
-
-
-def set_last_reset(cur, dt: datetime) -> None:
-    day_key = get_day_key()
-    cur.execute("""
-        UPDATE daily_state
-        SET last_reset_ts=%s
-        WHERE day_key=%s
-    """, (dt, day_key))
-
-
-def get_state(cur) -> Dict[str, Any]:
-    # position state stored as JSON in bot_state key "position"
-    cur.execute("SELECT value FROM bot_state WHERE key='position'")
-    r = cur.fetchone()
-    if not r:
-        return {"pos": None, "entry": None, "stake": 0.0, "balance": 0.0}
-    return json.loads(r["value"])
-
-
-def save_state(cur, state: Dict[str, Any]) -> None:
-    payload = json.dumps(state)
-    cur.execute("""
-        INSERT INTO bot_state(key, value) VALUES ('position', %s)
-        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-    """, (payload,))
-
-
-def record_trade(cur, poly_slug: str, mode: str, action: str, side: Optional[str],
-                 price: Optional[float], size: Optional[float], position: Optional[str],
-                 entry_price: Optional[float], pnl_realized: float = 0.0) -> None:
-    cur.execute("""
-        INSERT INTO trades(poly_slug, mode, action, side, price, size, position, entry_price, pnl_realized)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (poly_slug, mode, action, side, price, size, position, entry_price, pnl_realized))
-
-
-def record_equity_snapshot(cur, price: Optional[float], balance: float, position: Optional[str],
-                           entry_price: Optional[float], stake: float,
-                           unrealized_pnl: float, equity: float) -> None:
-    cur.execute("""
-        INSERT INTO equity_snapshots(price, balance, position, entry_price, stake, unrealized_pnl, equity)
-        VALUES (%s,%s,%s,%s,%s,%s,%s)
-    """, (price, balance, position, entry_price, stake, unrealized_pnl, equity))
-
-
-def live_order_exists(cur, client_order_id: str) -> bool:
-    cur.execute("SELECT 1 FROM live_orders WHERE client_order_id=%s", (client_order_id,))
-    return cur.fetchone() is not None
-
-
-def create_live_order(cur, poly_slug: str, action: str, position_side: str,
-                      token_id: Optional[str], client_order_id: str,
-                      price: Optional[float], size: Optional[float]) -> None:
-    cur.execute("""
-        INSERT INTO live_orders(poly_slug, action, position_side, token_id, client_order_id, price, size, status)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,'created')
-        ON CONFLICT(client_order_id) DO NOTHING
-    """, (poly_slug, action, position_side, token_id, client_order_id, price, size))
-
-
-def update_live_order(cur, client_order_id: str, status: str, order_id: Optional[str], raw_response: Optional[str]) -> None:
-    cur.execute("""
-        UPDATE live_orders
-        SET status=%s, order_id=COALESCE(%s, order_id), raw_response=COALESCE(%s, raw_response)
-        WHERE client_order_id=%s
-    """, (status, order_id, raw_response, client_order_id))
-
-
-# ----------------------------
-# Gamma / Pricing
-# ----------------------------
-GAMMA = "https://gamma-api.polymarket.com"
-
+def http_post_json(url: str, payload: Dict[str, Any], timeout: float = 10) -> Any:
+    r = requests.post(url, json=payload, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 def _maybe_json_list(x: Any) -> Any:
-    # Gamma sometimes returns list-like fields as JSON-encoded strings
+    # Gamma sometimes returns arrays as JSON-encoded strings.
     if isinstance(x, str):
         s = x.strip()
         if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
@@ -369,483 +114,548 @@ def _maybe_json_list(x: Any) -> Any:
     return x
 
 
-def fetch_gamma_market_for_slug(slug: str) -> Optional[Dict[str, Any]]:
-    # markets?slug= is common; if not found, try events?slug=
+# ----------------------------
+# Gamma: market lookup + token ids
+# ----------------------------
+def gamma_get_market_by_slug_exact(full_slug: str) -> Optional[Dict[str, Any]]:
+    """
+    Try exact slug lookup: /markets?slug=<full_slug>
+    (Gamma supports "get market by slug" behavior.) :contentReference[oaicite:1]{index=1}
+    """
+    url = f"{GAMMA_HOST}/markets"
     try:
-        r = requests.get(f"{GAMMA}/markets", params={"slug": slug}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                return data[0]
-            if isinstance(data, dict) and data.get("markets"):
-                mkts = data["markets"]
-                if mkts:
-                    return mkts[0]
+        data = http_get_json(url, params={"slug": full_slug, "limit": 1}, timeout=10)
+        # Gamma commonly returns a list for /markets
+        if isinstance(data, list) and data:
+            return data[0]
+        # sometimes it might return an object
+        if isinstance(data, dict) and data.get("slug") == full_slug:
+            return data
+        return None
     except Exception:
-        pass
+        return None
 
-    try:
-        r = requests.get(f"{GAMMA}/events", params={"slug": slug}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                ev = data[0]
-                # event often contains markets array
-                markets = ev.get("markets") or []
-                if markets:
-                    return markets[0]
-    except Exception:
-        pass
+def gamma_search_markets_by_base(base_slug: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Fallback scan: pull recent markets and filter those whose slug starts with base_slug-
+    """
+    url = f"{GAMMA_HOST}/markets"
+    out: List[Dict[str, Any]] = []
+    offset = 0
+    page = 100
+    while len(out) < limit:
+        try:
+            data = http_get_json(url, params={"limit": page, "offset": offset, "active": True}, timeout=10)
+            if not isinstance(data, list) or not data:
+                break
+            out.extend(data)
+            offset += page
+            if len(data) < page:
+                break
+        except Exception:
+            break
+    return out[:limit]
+
+def extract_yes_no_token_ids(gamma_market: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """
+    Try multiple known fields:
+    - clobTokenIds: often an array (or json-string)
+    - tokens / outcomes structures differ across versions
+    We attempt to map by outcome label.
+    """
+    # 1) clobTokenIds + outcomes
+    outcomes = _maybe_json_list(gamma_market.get("outcomes"))
+    clob_ids = _maybe_json_list(gamma_market.get("clobTokenIds") or gamma_market.get("clob_token_ids"))
+
+    if isinstance(outcomes, list) and isinstance(clob_ids, list) and len(outcomes) == len(clob_ids):
+        # outcomes is usually ["Yes","No"]
+        mapping = {}
+        for name, tid in zip(outcomes, clob_ids):
+            if isinstance(name, str) and tid:
+                mapping[name.strip().upper()] = str(tid)
+        if "YES" in mapping and "NO" in mapping:
+            return mapping["YES"], mapping["NO"]
+
+    # 2) tokens list with outcome/label + tokenId
+    tokens = gamma_market.get("tokens")
+    if isinstance(tokens, str):
+        tokens = _maybe_json_list(tokens)
+    if isinstance(tokens, list):
+        mapping = {}
+        for t in tokens:
+            if not isinstance(t, dict):
+                continue
+            label = (t.get("outcome") or t.get("label") or t.get("name") or "").strip().upper()
+            tid = t.get("token_id") or t.get("tokenId") or t.get("clobTokenId") or t.get("clob_token_id")
+            if label and tid:
+                mapping[label] = str(tid)
+        if "YES" in mapping and "NO" in mapping:
+            return mapping["YES"], mapping["NO"]
 
     return None
 
-
-def extract_yes_no_token_ids(market: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+def fetch_gamma_market_and_tokens(poly_slug: str) -> Optional[Tuple[Dict[str, Any], str, str]]:
     """
-    Best-effort extraction for YES/NO token ids used by CLOB.
-    Gamma fields vary. We try several common patterns.
+    Primary: exact lookup with FULL slug (poly_slug)
+    Fallback: scan for base slug markets and pick exact match on slug.
     """
-    # Try direct fields
-    for k_yes, k_no in [
-        ("yesTokenId", "noTokenId"),
-        ("yes_token_id", "no_token_id"),
-        ("clobTokenIdYes", "clobTokenIdNo"),
-        ("clob_token_id_yes", "clob_token_id_no"),
-    ]:
-        if market.get(k_yes) and market.get(k_no):
-            return str(market[k_yes]), str(market[k_no])
+    # exact
+    m = gamma_get_market_by_slug_exact(poly_slug)
+    if m:
+        ids = extract_yes_no_token_ids(m)
+        if ids:
+            return m, ids[0], ids[1]
 
-    # Try outcomes/outcomePrices
-    outcomes = _maybe_json_list(market.get("outcomes"))
-    token_ids = _maybe_json_list(market.get("clobTokenIds") or market.get("clobTokenId") or market.get("tokenIds"))
-
-    # clobTokenIds is often a JSON-string list matching outcomes order
-    if isinstance(outcomes, list) and isinstance(token_ids, list) and len(outcomes) == len(token_ids):
-        # Normalize outcomes to strings
-        outs = [str(o) for o in outcomes]
-        try:
-            i_yes = outs.index("Yes")
-            i_no = outs.index("No")
-            return str(token_ids[i_yes]), str(token_ids[i_no])
-        except Exception:
-            pass
-
-    # Sometimes nested in "tokens" list
-    tokens = market.get("tokens")
-    if isinstance(tokens, list):
-        yes_id = None
-        no_id = None
-        for t in tokens:
-            name = str(t.get("outcome") or t.get("name") or "").lower()
-            tid = t.get("token_id") or t.get("tokenId") or t.get("clobTokenId")
-            if not tid:
-                continue
-            if name == "yes":
-                yes_id = str(tid)
-            if name == "no":
-                no_id = str(tid)
-        if yes_id and no_id:
-            return yes_id, no_id
-
-    return None, None
-
-
-def fetch_clob_mid_prices(token_yes: str, token_no: str) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    You already have CLOB pricing working. Keep it simple:
-    call the public orderbook endpoint and compute best bid/ask mid or best ask.
-    """
-    base = "https://clob.polymarket.com"
-    try:
-        # Orderbook endpoint documented here :contentReference[oaicite:1]{index=1}
-        r_yes = requests.get(f"{base}/orderbook", params={"token_id": token_yes}, timeout=10)
-        r_no = requests.get(f"{base}/orderbook", params={"token_id": token_no}, timeout=10)
-        if r_yes.status_code != 200 or r_no.status_code != 200:
-            return None, None, "clob"
-
-        ob_yes = r_yes.json()
-        ob_no = r_no.json()
-
-        def best(ob: Dict[str, Any]) -> Optional[float]:
-            # prefer best ask if present else best bid
-            asks = ob.get("asks") or []
-            bids = ob.get("bids") or []
-            if asks:
-                # asks are [price,size] strings
-                return float(asks[0][0])
-            if bids:
-                return float(bids[0][0])
-            return None
-
-        return best(ob_yes), best(ob_no), "clob"
-    except Exception:
-        return None, None, "clob"
+    # fallback scan if base slug is known
+    if POLY_MARKET_SLUG:
+        candidates = gamma_search_markets_by_base(POLY_MARKET_SLUG, limit=250)
+        # find exact match on slug
+        for c in candidates:
+            if isinstance(c, dict) and c.get("slug") == poly_slug:
+                ids = extract_yes_no_token_ids(c)
+                if ids:
+                    return c, ids[0], ids[1]
+        # if still not found, just report
+    return None
 
 
 # ----------------------------
-# Strategy / Actions
+# CLOB price fetch (public book)
 # ----------------------------
-def decide_action(pos: Optional[str], edge: float, signal: str) -> str:
-    # Very simple:
-    # - if signal is YES and no position => ENTER_YES
-    # - if signal is NO and no position => ENTER_NO
-    # - if signal flips against position => EXIT
-    # - else HOLD_SAME_SIDE if signal matches current side, else NO_TRADE
-    if pos is None:
-        if signal == "YES":
-            return "ENTER_YES"
-        if signal == "NO":
-            return "ENTER_NO"
-        return "NO_TRADE"
+def fetch_clob_best_prices(token_yes: str, token_no: str) -> Tuple[float, float]:
+    """
+    Pull top of book for YES and NO.
+    We use /book?token_id=...
+    """
+    def best_bid(token_id: str) -> float:
+        url = f"{POLY_CLOB_HOST}/book"
+        data = http_get_json(url, params={"token_id": token_id}, timeout=10)
+        bids = data.get("bids") if isinstance(data, dict) else None
+        if isinstance(bids, list) and bids:
+            # each bid usually [price, size] or {price, size}
+            b0 = bids[0]
+            if isinstance(b0, list) and b0:
+                return float(b0[0])
+            if isinstance(b0, dict) and "price" in b0:
+                return float(b0["price"])
+        return 0.0
 
-    if pos == "YES":
-        if signal == "NO":
-            return "EXIT"
-        if signal == "YES":
-            return "HOLD_SAME_SIDE"
-        return "NO_TRADE"
-
-    if pos == "NO":
-        if signal == "YES":
-            return "EXIT"
-        if signal == "NO":
-            return "HOLD_SAME_SIDE"
-        return "NO_TRADE"
-
-    return "NO_TRADE"
+    p_yes = best_bid(token_yes)
+    p_no = best_bid(token_no)
+    return p_yes, p_no
 
 
-def compute_signal(edge: float) -> str:
-    if edge >= UP_THRESHOLD:
-        return "YES"
-    if edge <= -DOWN_THRESHOLD:
-        return "NO"
-    return "HOLD"
+# ----------------------------
+# DB layer (lightweight)
+# ----------------------------
+def db_conn():
+    if not DATABASE_URL:
+        return None
+    return psycopg2.connect(DATABASE_URL)
 
+def db_has_column(cur, table: str, column: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name=%s AND column_name=%s
+        LIMIT 1
+        """,
+        (table, column),
+    )
+    return cur.fetchone() is not None
 
-def in_cooldown(last_trade_ts: Optional[datetime], minutes: int) -> bool:
-    if not last_trade_ts:
+def ensure_tables():
+    if not DATABASE_URL:
+        return
+
+    conn = db_conn()
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    # equity_snapshots: handle your existing schema (it apparently has "price" NOT NULL)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS equity_snapshots (
+          id SERIAL PRIMARY KEY,
+          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          price DOUBLE PRECISION NOT NULL,
+          balance DOUBLE PRECISION NOT NULL,
+          position TEXT,
+          entry_price DOUBLE PRECISION,
+          stake DOUBLE PRECISION,
+          unrealized_pnl DOUBLE PRECISION,
+          equity DOUBLE PRECISION,
+          fair_up DOUBLE PRECISION
+        );
+        """
+    )
+
+    # If older schema exists with mark instead of price, add price.
+    if not db_has_column(cur, "equity_snapshots", "price"):
+        cur.execute("ALTER TABLE equity_snapshots ADD COLUMN price DOUBLE PRECISION;")
+        cur.execute("UPDATE equity_snapshots SET price = COALESCE(price, 0.0);")
+        cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price SET NOT NULL;")
+
+    # live_orders table for idempotency (even if you aren’t placing yet)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS live_orders (
+          id SERIAL PRIMARY KEY,
+          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          poly_slug TEXT NOT NULL,
+          action TEXT NOT NULL,
+          token_id TEXT NOT NULL,
+          side TEXT NOT NULL,
+          price DOUBLE PRECISION NOT NULL,
+          size DOUBLE PRECISION NOT NULL,
+          client_order_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'submitted'
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS live_orders_slug_action_idx
+        ON live_orders(poly_slug, action);
+        """
+    )
+
+    cur.close()
+    conn.close()
+
+def record_equity_snapshot(price: float, balance: float, position: Optional[str], entry_price: Optional[float],
+                          stake: float, unrealized_pnl: float, equity: float, fair_up: Optional[float]):
+    if not DATABASE_URL:
+        return
+
+    conn = db_conn()
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    # your DB expects "price" NOT NULL; do not insert "mark"
+    cur.execute(
+        """
+        INSERT INTO equity_snapshots (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up),
+    )
+
+    cur.close()
+    conn.close()
+
+def live_orders_already_done(poly_slug: str, action: str) -> bool:
+    if not DATABASE_URL:
         return False
-    return (now_utc() - last_trade_ts).total_seconds() < minutes * 60
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM live_orders WHERE poly_slug=%s AND action=%s LIMIT 1",
+        (poly_slug, action),
+    )
+    ok = cur.fetchone() is not None
+    cur.close()
+    conn.close()
+    return ok
+
+def record_live_order(poly_slug: str, action: str, token_id: str, side: str, price: float, size: float,
+                      client_order_id: str, status: str):
+    if not DATABASE_URL:
+        return
+    conn = db_conn()
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO live_orders (poly_slug, action, token_id, side, price, size, client_order_id, status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (poly_slug, action) DO NOTHING
+        """,
+        (poly_slug, action, token_id, side, price, size, client_order_id, status),
+    )
+    cur.close()
+    conn.close()
 
 
 # ----------------------------
-# Live order relay
+# Portfolio state (simple in-memory via env / db optional)
+# NOTE: you already have state working; we keep this minimal + deterministic per run.
 # ----------------------------
-def relay_post(path: str, payload: Dict[str, Any], timeout_sec: int) -> Dict[str, Any]:
-    if not ORDER_RELAY_URL:
-        raise RuntimeError("Missing ORDER_RELAY_URL (set to your function-bun service URL)")
-    url = ORDER_RELAY_URL.rstrip("/") + path
-    r = requests.post(url, json=payload, timeout=timeout_sec)
+def load_state() -> Dict[str, Any]:
+    """
+    Minimal state from env (Railway cron run is stateless unless you persist elsewhere).
+    If you already have more advanced state, keep it; but this bot version
+    operates with a DB-backed / implicit state primarily from your existing pipeline.
+    """
+    # Use “sticky” env vars if you want; otherwise treat as no open position.
+    return {
+        "position": os.getenv("BOT_POSITION", "").strip().upper() or None,  # YES/NO
+        "entry": float(os.getenv("BOT_ENTRY", "0") or 0) or None,
+        "trades_today": int(os.getenv("BOT_TRADES_TODAY", "0") or 0),
+        "pnl_today": float(os.getenv("BOT_PNL_TODAY", "0") or 0),
+        "cooldown": int(os.getenv("BOT_COOLDOWN", "0") or 0),
+        "balance": float(os.getenv("BOT_BALANCE", "0") or 0),
+    }
+
+def decide(signal: str, state: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    return (action, reason)
+    """
+    pos = state["position"]
+    cooldown = state["cooldown"]
+    trades_today = state["trades_today"]
+
+    if trades_today >= MAX_TRADES_PER_DAY:
+        return "NO_TRADE", "MAX_TRADES_PER_DAY"
+
+    if cooldown > 0:
+        return "NO_TRADE", "COOLDOWN"
+
+    if signal == "HOLD":
+        return "NO_TRADE", "signal=HOLD"
+
+    if signal == "YES":
+        if pos is None:
+            return "ENTER_YES", ""
+        if pos == "YES":
+            return "HOLD_SAME_SIDE", ""
+        if pos == "NO":
+            return "EXIT", ""
+    if signal == "NO":
+        if pos is None:
+            return "ENTER_NO", ""
+        if pos == "NO":
+            return "HOLD_SAME_SIDE", ""
+        if pos == "YES":
+            return "EXIT", ""
+
+    return "NO_TRADE", "no_rule"
+
+def compute_signal(poly_yes_price: float, fair_up: float) -> Tuple[str, float]:
+    """
+    edge = fair_up - poly_yes
+    if edge >= EDGE_ENTER => YES
+    if edge <= -EDGE_ENTER => NO
+    else HOLD
+    """
+    edge = fair_up - poly_yes_price
+    if edge >= EDGE_ENTER:
+        return "YES", edge
+    if edge <= -EDGE_ENTER:
+        return "NO", edge
+    return "HOLD", edge
+
+
+# ----------------------------
+# Bun order placement (only when armed)
+# ----------------------------
+def bun_healthcheck() -> Optional[int]:
+    base = BUN_BASE_URL
+    if not base and BUN_ORDER_URL:
+        # derive base from order url
+        base = BUN_ORDER_URL.split("/order")[0].rstrip("/")
+    if not base:
+        return None
     try:
-        data = r.json()
+        r = requests.get(base + "/", timeout=BUN_TIMEOUT_S)
+        return r.status_code
     except Exception:
-        data = {"ok": False, "status_code": r.status_code, "text": r.text}
-    data["_http_status"] = r.status_code
-    return data
+        return None
 
+def place_live_order_via_bun(token_id: str, side: str, price: float, size: float, order_type: str = "GTC") -> Dict[str, Any]:
+    """
+    POST to Bun: /order {token_id, side, price, size, order_type}
+    """
+    url = BUN_ORDER_URL
+    if not url:
+        if not BUN_BASE_URL:
+            raise RuntimeError("Missing BUN_ORDER_URL (or BUN_BASE_URL)")
+        url = BUN_BASE_URL.rstrip("/") + "/order"
 
-def place_live_order(poly_slug: str, token_id: str, side: str, price: float, size: float,
-                     client_order_id: str) -> Dict[str, Any]:
-    """
-    Expected relay contract:
-      POST /place_order
-      { token_id, side, price, size, client_order_id, poly_slug }
-    """
     payload = {
-        "poly_slug": poly_slug,
         "token_id": token_id,
-        "side": side,              # "BUY" or "SELL"
+        "side": side,
         "price": price,
         "size": size,
-        "client_order_id": client_order_id,
+        "order_type": order_type,
     }
-    return relay_post("/place_order", payload, ORDER_TIMEOUT_SEC)
-
-
-def cancel_live_order(order_id: str) -> Dict[str, Any]:
-    payload = {"order_id": order_id}
-    return relay_post("/cancel_order", payload, ORDER_TIMEOUT_SEC)
-
-
-def status_live_order(order_id: str) -> Dict[str, Any]:
-    payload = {"order_id": order_id}
-    return relay_post("/order_status", payload, ORDER_STATUS_TIMEOUT_SEC)
+    return http_post_json(url, payload, timeout=BUN_TIMEOUT_S)
 
 
 # ----------------------------
 # Main
 # ----------------------------
-def main() -> None:
-    log.info(f"{ts()} | INFO | BOOT: bot.py starting")
-    import requests
+def main():
+    log.info("BOOT: bot.py starting")
 
-    try:
-        test = requests.get(f"{os.environ['ORDER_SERVICE_URL']}/", timeout=5)
-        log.info(f"{ts()} | INFO | bun_health_status={test.status_code}")
-    except Exception as e:
-        log.error(f"{ts()} | ERROR | bun_unreachable: {e}")
+    ensure_tables()
 
-    ensure_schema()
+    # optional: health-check bun service (nice to log once you’re in LIVE)
+    hc = bun_healthcheck()
+    if hc is not None:
+        log.info("bun_health_status=%s", hc)
 
-    base_slug = make_poly_slug()
-    poly_slug = slug_for_5m_market(base_slug, now_utc())
+    state = load_state()
+
+    poly_slug = make_poly_slug()
 
     live_mode = RUN_MODE == "LIVE"
-    # “armed” = explicit flags AND live trading enabled (separate from kill switch)
-    live_armed = bool(LIVE_ARMED) and bool(LIVE_TRADING_ENABLED) and live_mode
+    live_armed = live_mode and LIVE_TRADING_ENABLED and LIVE_ARMED and (not KILL_SWITCH)
 
     log.info(
-        f"{ts()} | INFO | run_mode={RUN_MODE} live_mode={live_mode} "
-        f"live_armed={live_armed} poly_slug={poly_slug}"
+        "run_mode=%s live_mode=%s live_armed=%s poly_slug=%s",
+        RUN_MODE,
+        live_mode,
+        live_armed,
+        poly_slug,
     )
 
-    market = fetch_gamma_market_for_slug(poly_slug if POLY_MARKET_SLUG else base_slug)
-    if not market:
-        log.warning(f"{ts()} | WARN | Gamma market not found for slug={base_slug}")
-        log.info(f"{ts()} | INFO | BOOT: bot.py finished cleanly")
+    # 1) Gamma lookup with FULL slug (fix for your current error)
+    gamma = fetch_gamma_market_and_tokens(poly_slug)
+    if not gamma:
+        # Keep the message precise and actionable
+        if POLY_MARKET_SLUG:
+            log.warning("Gamma market not found for slug=%s (base=%s)", poly_slug, POLY_MARKET_SLUG)
+        else:
+            log.warning("Gamma market not found for slug=%s", poly_slug)
+        log.info("BOOT: bot.py finished cleanly")
         return
 
-    yes_token, no_token = extract_yes_no_token_ids(market)
-    if not yes_token or not no_token:
-        log.warning(f"{ts()} | WARN | Could not extract YES/NO token ids from Gamma response.")
-        log.info(f"{ts()} | INFO | BOOT: bot.py finished cleanly")
+    _mkt, token_yes, token_no = gamma
+
+    # 2) Fetch book prices
+    p_yes, p_no = fetch_clob_best_prices(token_yes, token_no)
+
+    # 3) Fair price (placeholder = 0.5; keep your real model if you have one)
+    fair_up = float(os.getenv("FAIR_UP", "0.5"))
+    signal, edge = compute_signal(p_yes, fair_up)
+    action, reason = decide(signal, state)
+
+    # For exit / enter decisions, map to token + side
+    # NOTE: This is a minimal assumption:
+    # - ENTER_YES -> BUY YES token
+    # - ENTER_NO  -> BUY NO token
+    # - EXIT -> SELL the token of the current position
+    pos = state["position"]
+    entry = state["entry"]
+    stake = LIVE_TRADE_SIZE if live_mode else PAPER_TRADE_SIZE
+
+    # Balance: if you have a real wallet balance feed, keep it; otherwise we log the state value.
+    balance = float(state["balance"] or 0.0)
+
+    # If not armed (or kill switch), we do not place orders, but we still log intent
+    intent_block = []
+    if live_mode and (not LIVE_TRADING_ENABLED):
+        intent_block.append("LIVE_TRADING_ENABLED=false")
+    if live_mode and LIVE_TRADING_ENABLED and (not LIVE_ARMED):
+        intent_block.append("not_armed")
+    if live_mode and KILL_SWITCH:
+        intent_block.append("KILL_SWITCH")
+
+    # Compute unrealized pnl for snapshots (very rough)
+    uPnL = 0.0
+    if pos == "YES" and entry:
+        uPnL = (p_yes - entry) * stake
+    if pos == "NO" and entry:
+        uPnL = (p_no - entry) * stake
+    equity = balance + uPnL
+
+    # Record snapshot to DB using "price" (your schema)
+    record_equity_snapshot(
+        price=p_yes,
+        balance=balance,
+        position=pos,
+        entry_price=entry,
+        stake=stake,
+        unrealized_pnl=uPnL,
+        equity=equity,
+        fair_up=fair_up,
+    )
+
+    # Log line (matches your style)
+    log.info(
+        "poly_up=%.3f | poly_down=%.3f | fair_up=%.3f | edge=%+.3f | signal=%s | action=%s | reason=%s | balance=%.2f | pos=%s | entry=%s | trades_today=%s | pnl_today(realized)=%.2f | mode=%s | src=clob",
+        p_yes,
+        p_no,
+        fair_up,
+        edge,
+        signal,
+        action,
+        reason if reason else "+".join(intent_block) if intent_block else "",
+        balance,
+        pos,
+        entry,
+        state["trades_today"],
+        float(state["pnl_today"] or 0.0),
+        RUN_MODE,
+    )
+
+    if STATS_ONLY:
+        log.info("summary | equity=%.2f | uPnL=%.2f | src=clob", equity, uPnL)
+        log.info("BOOT: bot.py finished cleanly")
         return
 
-    p_yes, p_no, src = fetch_clob_mid_prices(yes_token, no_token)
-    if p_yes is None or p_no is None:
-        log.warning(f"{ts()} | WARN | Could not fetch CLOB prices for tokens.")
-        log.info(f"{ts()} | INFO | BOOT: bot.py finished cleanly")
-        return
-
-    # Your fair model: keep your existing approach (0.5-ish)
-    fair_up = 0.500
-    edge = (fair_up - p_yes)  # positive means YES underpriced (good buy)
-
-    signal = compute_signal(edge)
-    action_reason = ""
-    action = "NO_TRADE"
-
-    with db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # load + apply resets
-        daily = load_daily_state(cur)
-        state = get_state(cur)
-
-        if RESET_STATE:
-            state = {"pos": None, "entry": None, "stake": 0.0, "balance": float(state.get("balance") or 0.0)}
-            save_state(cur, state)
-            log.info(f"{ts()} | INFO | RESET_STATE applied. Position cleared.")
-            conn.commit()
-            log.info(f"{ts()} | INFO | BOOT: bot.py finished cleanly")
+    # 4) Live order execution (Bun) — only when fully armed
+    if live_mode:
+        # If not fully armed, do not place orders
+        if not live_armed:
+            # Still emit summary
+            log.info("summary | equity=%.2f | uPnL=%.2f | src=clob", equity, uPnL)
+            log.info("BOOT: bot.py finished cleanly")
             return
 
-        if RESET_DAILY:
-            # debounce to avoid multiple cron invocations spamming reset
-            last_reset = daily.get("last_reset_ts")
-            do_reset = True
-            if last_reset:
-                last_reset_dt = last_reset if isinstance(last_reset, datetime) else None
-                if last_reset_dt:
-                    mins = (now_utc() - last_reset_dt).total_seconds() / 60.0
-                    if mins < RESET_DAILY_DEBOUNCE_MIN:
-                        do_reset = False
+        # Idempotency per 5m slug + action
+        if action in ("ENTER_YES", "ENTER_NO", "EXIT"):
+            if live_orders_already_done(poly_slug, action):
+                log.warning("LIVE idempotency: already executed action=%s for poly_slug=%s", action, poly_slug)
+                log.info("summary | equity=%.2f | uPnL=%.2f | src=clob", equity, uPnL)
+                log.info("BOOT: bot.py finished cleanly")
+                return
 
-            if do_reset:
-                update_daily_state(cur, 0, 0.0, None)
-                set_last_reset(cur, now_utc())
-                conn.commit()
-                log.info(f"{ts()} | INFO | RESET_DAILY applied (debounced). Continuing run.")
-                daily = load_daily_state(cur)
+            client_order_id = str(uuid.uuid4())
 
-        trades_today = int(daily.get("trades_today") or 0)
-        pnl_today = float(daily.get("pnl_today_realized") or 0.0)
-        last_trade_ts = daily.get("last_trade_ts")
+            try:
+                if action == "ENTER_YES":
+                    resp = place_live_order_via_bun(token_yes, "BUY", p_yes, LIVE_TRADE_SIZE)
+                    record_live_order(poly_slug, action, token_yes, "BUY", p_yes, LIVE_TRADE_SIZE, client_order_id, "submitted")
+                    log.info("LIVE_ORDER ok action=%s client_order_id=%s resp=%s", action, client_order_id, str(resp)[:500])
 
-        pos = state.get("pos")
-        entry = state.get("entry")
-        balance = float(state.get("balance") or 0.0)
-        stake = float(state.get("stake") or 0.0)
+                elif action == "ENTER_NO":
+                    resp = place_live_order_via_bun(token_no, "BUY", p_no, LIVE_TRADE_SIZE)
+                    record_live_order(poly_slug, action, token_no, "BUY", p_no, LIVE_TRADE_SIZE, client_order_id, "submitted")
+                    log.info("LIVE_ORDER ok action=%s client_order_id=%s resp=%s", action, client_order_id, str(resp)[:500])
 
-        # If balance is 0 on fresh LIVE path, don’t crash; keep going.
-        # (Your real balance should come from your own accounting or relay later.)
-        # For paper/live parity, keep balance as stored.
-
-        # Risk gates
-        max_trades = LIVE_MAX_TRADES_PER_DAY if live_mode else MAX_TRADES_PER_DAY
-        cooldown = LIVE_COOLDOWN_MINUTES if live_mode else COOLDOWN_MINUTES
-        max_daily_loss = LIVE_MAX_DAILY_LOSS if live_mode else MAX_DAILY_LOSS
-
-        if ENABLE_DRAWDOWN and pnl_today <= -abs(max_daily_loss):
-            action = "NO_TRADE"
-            action_reason = "MAX_DAILY_LOSS"
-        elif in_cooldown(last_trade_ts, cooldown):
-            action = "NO_TRADE"
-            action_reason = "COOLDOWN"
-        else:
-            action = decide_action(pos, edge, signal)
-            if action in ("ENTER_YES", "ENTER_NO", "EXIT") and trades_today >= max_trades:
-                action = "NO_TRADE"
-                action_reason = "MAX_TRADES_PER_DAY"
-
-        # LIVE rails
-        rails_block = []
-        if live_mode:
-            if not LIVE_TRADING_ENABLED:
-                rails_block.append("not_enabled")
-            if not LIVE_ARMED:
-                rails_block.append("not_armed")
-            if KILL_SWITCH:
-                rails_block.append("KILL_SWITCH")
-
-        # Apply PAPER position simulation always (even in LIVE mode, you’re still persisting a logical position)
-        # Real order placement will be separate and only occurs when live_armed and kill switch is off.
-        realized = 0.0
-        did_trade = False
-
-        if action == "ENTER_YES" and pos is None:
-            pos = "YES"
-            entry = p_yes
-            stake = LIVE_TRADE_SIZE if live_mode else 1.0
-            balance = balance - 1.0  # placeholder; your accounting model can replace this
-            trades_today += 1
-            did_trade = True
-            record_trade(cur, poly_slug, RUN_MODE, action, "BUY", p_yes, stake, pos, entry, 0.0)
-
-        elif action == "ENTER_NO" and pos is None:
-            pos = "NO"
-            entry = p_no
-            stake = LIVE_TRADE_SIZE if live_mode else 1.0
-            balance = balance - 1.0
-            trades_today += 1
-            did_trade = True
-            record_trade(cur, poly_slug, RUN_MODE, action, "BUY", p_no, stake, pos, entry, 0.0)
-
-        elif action == "EXIT" and pos in ("YES", "NO"):
-            exit_price = p_yes if pos == "YES" else p_no
-            # simple PnL proxy; replace with your model if needed
-            realized = (exit_price - float(entry or exit_price)) * float(stake or 0.0)
-            pnl_today += realized
-            pos = None
-            entry = None
-            stake = 0.0
-            trades_today += 1
-            did_trade = True
-            record_trade(cur, poly_slug, RUN_MODE, action, "SELL", exit_price, None, None, None, realized)
-
-        # Update state + daily
-        state = {"pos": pos, "entry": entry, "stake": stake, "balance": balance}
-        save_state(cur, state)
-        if did_trade:
-            update_daily_state(cur, trades_today, pnl_today, now_utc())
-
-        # Equity snapshot
-        unrealized = 0.0
-        if pos == "YES" and entry is not None:
-            unrealized = (p_yes - float(entry)) * float(stake)
-        elif pos == "NO" and entry is not None:
-            unrealized = (p_no - float(entry)) * float(stake)
-
-        equity = balance + unrealized
-        record_equity_snapshot(cur, price=p_yes, balance=balance, position=pos,
-                               entry_price=entry, stake=stake, unrealized_pnl=unrealized, equity=equity)
-
-        # -------- LIVE ORDER MODULE (relay) --------
-        # Only attempt real placement if:
-        #   RUN_MODE=LIVE AND LIVE_TRADING_ENABLED=true AND LIVE_ARMED=true AND KILL_SWITCH=false
-        live_place_ok = (live_mode and LIVE_TRADING_ENABLED and LIVE_ARMED and (not KILL_SWITCH))
-
-        live_action_taken = None
-        live_action_reason = None
-
-        if live_mode and action in ("ENTER_YES", "ENTER_NO", "EXIT"):
-            # Determine token + BUY/SELL
-            if action == "ENTER_YES":
-                token_id = yes_token
-                side = "BUY"
-                price = p_yes
-                size = LIVE_TRADE_SIZE
-                pos_side = "YES"
-            elif action == "ENTER_NO":
-                token_id = no_token
-                side = "BUY"
-                price = p_no
-                size = LIVE_TRADE_SIZE
-                pos_side = "NO"
-            else:  # EXIT
-                # If we are exiting, we SELL the token we currently hold.
-                # If state pos got cleared already above, use prior action intent:
-                # We infer exit token from "signal flip": sell YES if it was YES else sell NO
-                # Best effort: use recorded trade earlier; simplest: sell YES if edge < 0 else sell NO is wrong,
-                # so use last known entry token based on last position BEFORE exit.
-                # We kept pos cleared; rely on last trade row if needed (but keep simple here):
-                # If you want exact, enhance to store held token_id in bot_state.
-                token_id = yes_token  # default
-                side = "SELL"
-                price = p_yes
-                size = LIVE_TRADE_SIZE
-                pos_side = "EXIT"
-
-            client_order_id = stable_client_order_id(poly_slug, action, side)
-
-            # Ensure idempotency: only one order per slug/action/side
-            if live_order_exists(cur, client_order_id):
-                live_action_taken = "SKIP_DUPLICATE"
-                live_action_reason = "idempotent"
-            else:
-                create_live_order(cur, poly_slug, action, pos_side, token_id, client_order_id, price, size)
-
-                if not live_place_ok:
-                    live_action_taken = "NO_LIVE_ORDER"
-                    live_action_reason = "+".join(rails_block) if rails_block else "not_ready"
-                    update_live_order(cur, client_order_id, "blocked", None, live_action_reason)
+                elif action == "EXIT":
+                    # sell whichever token we hold
+                    if pos == "YES":
+                        resp = place_live_order_via_bun(token_yes, "SELL", p_yes, LIVE_TRADE_SIZE)
+                        record_live_order(poly_slug, action, token_yes, "SELL", p_yes, LIVE_TRADE_SIZE, client_order_id, "submitted")
+                        log.info("LIVE_ORDER ok action=%s client_order_id=%s resp=%s", action, client_order_id, str(resp)[:500])
+                    elif pos == "NO":
+                        resp = place_live_order_via_bun(token_no, "SELL", p_no, LIVE_TRADE_SIZE)
+                        record_live_order(poly_slug, action, token_no, "SELL", p_no, LIVE_TRADE_SIZE, client_order_id, "submitted")
+                        log.info("LIVE_ORDER ok action=%s client_order_id=%s resp=%s", action, client_order_id, str(resp)[:500])
+                    else:
+                        log.warning("EXIT requested but no position in state.")
                 else:
-                    try:
-                        resp = place_live_order(poly_slug, token_id, side, float(price), float(size), client_order_id)
-                        raw = json.dumps(resp)
-                        if resp.get("success") is True or resp.get("ok") is True:
-                            oid = resp.get("orderID") or resp.get("order_id")
-                            update_live_order(cur, client_order_id, "submitted", oid, raw)
-                            live_action_taken = "LIVE_ORDER_SUBMITTED"
-                            live_action_reason = resp.get("status") or "submitted"
-                        else:
-                            update_live_order(cur, client_order_id, "error", None, raw)
-                            live_action_taken = "LIVE_ORDER_ERROR"
-                            live_action_reason = resp.get("errorMsg") or resp.get("error") or "unknown_error"
-                    except Exception as e:
-                        update_live_order(cur, client_order_id, "error", None, str(e))
-                        live_action_taken = "LIVE_ORDER_ERROR"
-                        live_action_reason = str(e)
+                    pass
 
-        conn.commit()
+            except Exception as e:
+                log.error("LIVE_ORDER failed action=%s err=%s", action, str(e))
+                # do not crash cron; just finish cleanly
+                log.info("summary | equity=%.2f | uPnL=%.2f | src=clob", equity, uPnL)
+                log.info("BOOT: bot.py finished cleanly")
+                return
 
-    # Output line (keep your existing style)
-    reason_bits = []
-    if action_reason:
-        reason_bits.append(action_reason)
-    if live_mode and rails_block and action in ("ENTER_YES", "ENTER_NO", "EXIT"):
-        reason_bits.append("+".join(rails_block))
-
-    reason_str = ("reason=" + "+".join(reason_bits)) if reason_bits else "reason=signal=" + signal
-
-    # Match your log format closely
-    line = (
-        f"{ts()} | poly_up={p_yes:.3f} | poly_down={p_no:.3f} | fair_up={fair_up:.3f} | "
-        f"edge={edge:+.3f} | signal={signal} | action={action if action!='NO_TRADE' else 'NO_TRADE'} | "
-        f"{reason_str} | balance={0.00 if math.isnan(0.0) else float(getattr(sys.modules[__name__], 'balance', 0.0)):.2f}"
-    )
-
-    # We don’t have the local vars here; print a consistent final line using stored state via DB would be extra queries.
-    # Keep it simple; your structured logs above are the source of truth.
-
-    if not STATS_ONLY:
-        log.info(line)
-
-    log.info(f"{ts()} | INFO | BOOT: bot.py finished cleanly")
+    # Summary
+    log.info("summary | equity=%.2f | uPnL=%.2f | src=clob", equity, uPnL)
+    log.info("BOOT: bot.py finished cleanly")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        log.error(f"{ts()} | ERROR | Fatal error: {e}")
+        log.error("Fatal error: %s", str(e))
         raise

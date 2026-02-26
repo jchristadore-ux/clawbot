@@ -665,22 +665,48 @@ def paper_trade_prob(
 # =========================
 # PERFORMANCE: optional snapshots/drawdown
 # =========================
+# --- add near the top of bot.py (globals area) ---
+_SNAPSHOT_COLS_CACHE = None
+
+
+def _get_equity_snapshot_columns(conn) -> set:
+    """Return set of column names for equity_snapshots (cached)."""
+    global _SNAPSHOT_COLS_CACHE
+    if _SNAPSHOT_COLS_CACHE is not None:
+        return _SNAPSHOT_COLS_CACHE
+
+    cols = set()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'equity_snapshots'
+            """
+        )
+        cols = {r[0] for r in cur.fetchall()}
+
+    _SNAPSHOT_COLS_CACHE = cols
+    return cols
+
+
 def init_snapshots_table():
     """
-    Creates equity_snapshots if missing, and ALSO auto-migrates older schemas
-    by adding any missing columns we now write into (mark, unrealized_pnl, equity, etc).
+    Creates equity_snapshots if missing, and auto-migrates older schemas by adding
+    new columns we use. (Does NOT attempt to drop/alter existing NOT NULL constraints.)
     """
     if not ENABLE_SNAPSHOTS:
         return
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # Create if missing (new schema)
+            # Create a modern table if missing (new installs)
             cur.execute("""
             CREATE TABLE IF NOT EXISTS equity_snapshots (
               snapshot_id BIGSERIAL PRIMARY KEY,
               ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              mark DOUBLE PRECISION NOT NULL,
+              price DOUBLE PRECISION NOT NULL,
+              mark DOUBLE PRECISION NULL,
               balance DOUBLE PRECISION NOT NULL,
               position TEXT NULL,
               entry_price DOUBLE PRECISION NULL,
@@ -690,9 +716,9 @@ def init_snapshots_table():
             );
             """)
 
-            # Auto-migrate older schemas (table exists but missing columns)
-            # Safe to run repeatedly.
+            # Add missing columns (safe on older schemas)
             cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
             cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS mark DOUBLE PRECISION;")
             cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS balance DOUBLE PRECISION;")
             cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS position TEXT;")
@@ -701,24 +727,21 @@ def init_snapshots_table():
             cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS unrealized_pnl DOUBLE PRECISION;")
             cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS equity DOUBLE PRECISION;")
 
-            # Backfill best-effort if your older table used 'price' instead of 'mark'
-            # (ignore if it doesn't exist)
+            # Backfill: if one exists and the other is null, copy across (best effort)
             try:
                 cur.execute("UPDATE equity_snapshots SET mark = price WHERE mark IS NULL AND price IS NOT NULL;")
             except Exception:
                 pass
-
-            # Ensure non-null defaults (without breaking existing rows)
             try:
-                cur.execute("UPDATE equity_snapshots SET balance=0 WHERE balance IS NULL;")
-                cur.execute("UPDATE equity_snapshots SET stake=0 WHERE stake IS NULL;")
-                cur.execute("UPDATE equity_snapshots SET unrealized_pnl=0 WHERE unrealized_pnl IS NULL;")
-                cur.execute("UPDATE equity_snapshots SET equity=0 WHERE equity IS NULL;")
-                cur.execute("UPDATE equity_snapshots SET mark=0 WHERE mark IS NULL;")
+                cur.execute("UPDATE equity_snapshots SET price = mark WHERE price IS NULL AND mark IS NOT NULL;")
             except Exception:
                 pass
 
         conn.commit()
+
+    # reset cache so new columns are visible immediately
+    global _SNAPSHOT_COLS_CACHE
+    _SNAPSHOT_COLS_CACHE = None
 
 
 def record_equity_snapshot(mark: float, balance: float, position: Optional[str],
@@ -728,15 +751,55 @@ def record_equity_snapshot(mark: float, balance: float, position: Optional[str],
         return
 
     with db_conn() as conn:
+        cols = _get_equity_snapshot_columns(conn)
+
+        # Build dynamic INSERT based on existing schema
+        insert_cols = []
+        values = []
+
+        # IMPORTANT: if 'price' exists and is NOT NULL in your schema, we MUST populate it.
+        if "price" in cols:
+            insert_cols.append("price")
+            values.append(float(mark))  # set price = mark
+
+        if "mark" in cols:
+            insert_cols.append("mark")
+            values.append(float(mark))
+
+        if "balance" in cols:
+            insert_cols.append("balance")
+            values.append(float(balance))
+
+        if "position" in cols:
+            insert_cols.append("position")
+            values.append(position)
+
+        if "entry_price" in cols:
+            insert_cols.append("entry_price")
+            values.append(entry_price)
+
+        if "stake" in cols:
+            insert_cols.append("stake")
+            values.append(float(stake))
+
+        if "unrealized_pnl" in cols:
+            insert_cols.append("unrealized_pnl")
+            values.append(float(unrealized_pnl))
+
+        if "equity" in cols:
+            insert_cols.append("equity")
+            values.append(float(equity))
+
+        if not insert_cols:
+            return  # nothing to write
+
+        placeholders = ", ".join(["%s"] * len(insert_cols))
+        col_sql = ", ".join(insert_cols)
+
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO equity_snapshots
-                  (mark, balance, position, entry_price, stake, unrealized_pnl, equity)
-                VALUES
-                  (%s, %s, %s, %s, %s, %s, %s);
-                """,
-                (mark, balance, position, entry_price, stake, unrealized_pnl, equity),
+                f"INSERT INTO equity_snapshots ({col_sql}) VALUES ({placeholders});",
+                tuple(values),
             )
         conn.commit()
 

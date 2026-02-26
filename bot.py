@@ -666,10 +666,16 @@ def paper_trade_prob(
 # PERFORMANCE: optional snapshots/drawdown
 # =========================
 def init_snapshots_table():
+    """
+    Creates equity_snapshots if missing, and ALSO auto-migrates older schemas
+    by adding any missing columns we now write into (mark, unrealized_pnl, equity, etc).
+    """
     if not ENABLE_SNAPSHOTS:
         return
+
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # Create if missing (new schema)
             cur.execute("""
             CREATE TABLE IF NOT EXISTS equity_snapshots (
               snapshot_id BIGSERIAL PRIMARY KEY,
@@ -683,13 +689,44 @@ def init_snapshots_table():
               equity DOUBLE PRECISION NOT NULL
             );
             """)
+
+            # Auto-migrate older schemas (table exists but missing columns)
+            # Safe to run repeatedly.
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS mark DOUBLE PRECISION;")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS balance DOUBLE PRECISION;")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS position TEXT;")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS entry_price DOUBLE PRECISION;")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS stake DOUBLE PRECISION;")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS unrealized_pnl DOUBLE PRECISION;")
+            cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS equity DOUBLE PRECISION;")
+
+            # Backfill best-effort if your older table used 'price' instead of 'mark'
+            # (ignore if it doesn't exist)
+            try:
+                cur.execute("UPDATE equity_snapshots SET mark = price WHERE mark IS NULL AND price IS NOT NULL;")
+            except Exception:
+                pass
+
+            # Ensure non-null defaults (without breaking existing rows)
+            try:
+                cur.execute("UPDATE equity_snapshots SET balance=0 WHERE balance IS NULL;")
+                cur.execute("UPDATE equity_snapshots SET stake=0 WHERE stake IS NULL;")
+                cur.execute("UPDATE equity_snapshots SET unrealized_pnl=0 WHERE unrealized_pnl IS NULL;")
+                cur.execute("UPDATE equity_snapshots SET equity=0 WHERE equity IS NULL;")
+                cur.execute("UPDATE equity_snapshots SET mark=0 WHERE mark IS NULL;")
+            except Exception:
+                pass
+
         conn.commit()
+
 
 def record_equity_snapshot(mark: float, balance: float, position: Optional[str],
                           entry_price: Optional[float], stake: float,
                           unrealized_pnl: float, equity: float):
     if not ENABLE_SNAPSHOTS:
         return
+
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(

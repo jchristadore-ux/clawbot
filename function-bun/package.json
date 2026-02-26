@@ -6,7 +6,7 @@
     "start": "bun run index.ts"
   },
   "dependencies": {
-    "hono": "^4.0.0",
-    "@polymarket/clob-client": "^x.y.z"
+    "hono": "latest",
+    "@polymarket/clob-client": "latest"
   }
 }

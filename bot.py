@@ -5,7 +5,7 @@ import uuid
 import math
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import requests
 import psycopg2
@@ -733,6 +733,12 @@ def main():
     log_line("INFO", f"run_mode={run_mode} live_mode={live_mode} live_armed={live_armed} poly_slug={poly_slug}")
 
     mkt = fetch_gamma_market_by_slug(poly_slug)
+    if env_bool("DEBUG_POLY", False):
+    log_line("DEBUG", f"GAMMA RAW KEYS: {list(mkt.keys())}")
+    log_line("DEBUG", f"GAMMA outcomes: {mkt.get('outcomes')}")
+    log_line("DEBUG", f"GAMMA outcomeNames: {mkt.get('outcomeNames')}")
+    log_line("DEBUG", f"GAMMA clobTokenIds: {mkt.get('clobTokenIds')}")
+    log_line("DEBUG", f"GAMMA tokens: {mkt.get('tokens')}")
     if not mkt:
         log_line("WARN", f"poly_slug={poly_slug} candidate_markets=0")
         log_line("INFO", "BOOT: bot.py finished cleanly")

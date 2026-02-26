@@ -254,12 +254,18 @@ def db_conn():
     return psycopg2.connect(DATABASE_URL)
 
 def db_has_column(cur, table: str, column: str) -> bool:
+    """
+    Check whether a column exists WITHOUT closing the cursor/connection.
+    Must be side-effect free because callers may reuse the cursor.
+    """
     cur.execute(
         """
         SELECT 1
         FROM information_schema.columns
-        WHERE table_name=%s AND column_name=%s
-        LIMIT 1
+        WHERE table_schema = 'public'
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1;
         """,
         (table, column),
     )

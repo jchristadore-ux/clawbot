@@ -1,1 +1,9 @@
-
+{
+  "name": "function-bun",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@polymarket/clob-client": "^4.0.0",
+    "hono": "^4.0.0"
+  }
+}

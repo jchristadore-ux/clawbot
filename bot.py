@@ -272,30 +272,97 @@ def db_has_column(cur, table: str, column: str) -> bool:
     return cur.fetchone() is not None
 
 def ensure_tables():
-    if not DATABASE_URL:
-        return
+    import os
+    import psycopg2
 
-    conn = db_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("Missing DATABASE_URL")
 
-    # ---- equity_snapshots (keep as-is / compatible) ----
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS equity_snapshots (
-          id SERIAL PRIMARY KEY,
-          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          price DOUBLE PRECISION NOT NULL,
-          balance DOUBLE PRECISION NOT NULL,
-          position TEXT,
-          entry_price DOUBLE PRECISION,
-          stake DOUBLE PRECISION,
-          unrealized_pnl DOUBLE PRECISION,
-          equity DOUBLE PRECISION,
-          fair_up DOUBLE PRECISION
-        );
-        """
-    )
+    conn = psycopg2.connect(dsn)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # --- core tables (create if missing) ---
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                      id INT PRIMARY KEY DEFAULT 1,
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      position TEXT,
+                      entry_price DOUBLE PRECISION,
+                      stake DOUBLE PRECISION,
+                      trades_today INT NOT NULL DEFAULT 0,
+                      pnl_today_realized DOUBLE PRECISION NOT NULL DEFAULT 0,
+                      day_key TEXT
+                    );
+                    """
+                )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS equity_snapshots (
+                      id BIGSERIAL PRIMARY KEY,
+                      ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      poly_slug TEXT,
+                      price DOUBLE PRECISION,
+                      balance DOUBLE PRECISION,
+                      position TEXT,
+                      entry_price DOUBLE PRECISION,
+                      stake DOUBLE PRECISION,
+                      unrealized_pnl DOUBLE PRECISION,
+                      equity DOUBLE PRECISION,
+                      edge DOUBLE PRECISION
+                    );
+                    """
+                )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS live_orders (
+                      id BIGSERIAL PRIMARY KEY,
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      poly_slug TEXT NOT NULL,
+                      side TEXT NOT NULL,                 -- YES / NO
+                      action TEXT NOT NULL,               -- ENTER / EXIT
+                      token_id TEXT,
+                      client_order_id TEXT,
+                      status TEXT NOT NULL DEFAULT 'NEW', -- NEW/SENT/FILLED/CANCELED/ERROR
+                      req JSONB,
+                      resp JSONB
+                    );
+                    """
+                )
+
+                # --- migrations for older schemas ---
+                # Ensure poly_slug exists everywhere we use it
+                cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
+                cur.execute("ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
+
+                # Handle mark -> price rename if you created an older schema with 'mark'
+                cur.execute(
+                    """
+                    DO $$
+                    BEGIN
+                      IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='equity_snapshots' AND column_name='mark'
+                      ) AND NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema='public' AND table_name='equity_snapshots' AND column_name='price'
+                      ) THEN
+                        ALTER TABLE equity_snapshots RENAME COLUMN mark TO price;
+                      END IF;
+                    END $$;
+                    """
+                )
+
+                # Ensure price exists and allow NULL (prevents your NOT NULL crash)
+                cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
+                cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price DROP NOT NULL;")
+
+    finally:
+        conn.close()
 
     # If older schema exists with "mark" instead of "price"
     if not db_has_column(cur, "equity_snapshots", "price"):

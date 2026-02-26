@@ -253,7 +253,7 @@ def db_conn():
         return None
     return psycopg2.connect(DATABASE_URL)
 
-def db_has_column(cur, table: str, column: str) -> bool:
+#def db_has_column(cur, table: str, column: str) -> bool:
     """
     Check whether a column exists WITHOUT closing the cursor/connection.
     Must be side-effect free because callers may reuse the cursor.
@@ -323,11 +323,11 @@ def ensure_tables():
                       id BIGSERIAL PRIMARY KEY,
                       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                       poly_slug TEXT NOT NULL,
-                      side TEXT NOT NULL,                 -- YES / NO
-                      action TEXT NOT NULL,               -- ENTER / EXIT
+                      side TEXT NOT NULL,
+                      action TEXT NOT NULL,
                       token_id TEXT,
                       client_order_id TEXT,
-                      status TEXT NOT NULL DEFAULT 'NEW', -- NEW/SENT/FILLED/CANCELED/ERROR
+                      status TEXT NOT NULL DEFAULT 'NEW',
                       req JSONB,
                       resp JSONB
                     );
@@ -335,11 +335,10 @@ def ensure_tables():
                 )
 
                 # --- migrations for older schemas ---
-                # Ensure poly_slug exists everywhere we use it
                 cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
                 cur.execute("ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
 
-                # Handle mark -> price rename if you created an older schema with 'mark'
+                # mark -> price rename if you used 'mark' previously
                 cur.execute(
                     """
                     DO $$
@@ -357,7 +356,7 @@ def ensure_tables():
                     """
                 )
 
-                # Ensure price exists and allow NULL (prevents your NOT NULL crash)
+                # ensure price exists and is nullable (prevents NOT NULL crash)
                 cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
                 cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price DROP NOT NULL;")
 
@@ -365,10 +364,10 @@ def ensure_tables():
         conn.close()
 
     # If older schema exists with "mark" instead of "price"
-    if not db_has_column(cur, "equity_snapshots", "price"):
-        cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
-        cur.execute("UPDATE equity_snapshots SET price = COALESCE(price, 0.0) WHERE price IS NULL;")
-        cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price SET NOT NULL;")
+    #if not db_has_column(cur, "equity_snapshots", "price"):
+        #cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
+        #cur.execute("UPDATE equity_snapshots SET price = COALESCE(price, 0.0) WHERE price IS NULL;")
+        #cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price SET NOT NULL;")
 
     # ---- live_orders (MIGRATION-SAFE) ----
     cur.execute(
@@ -400,8 +399,8 @@ def ensure_tables():
         ("status", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'submitted';"),
         ("ts", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL DEFAULT NOW();"),
     ]:
-        if not db_has_column(cur, "live_orders", col):
-            cur.execute(ddl)
+        #if not db_has_column(cur, "live_orders", col):
+            #cur.execute(ddl)
 
     # Backfill poly_slug from older column names if they exist
     if db_has_column(cur, "live_orders", "slug") and db_has_column(cur, "live_orders", "poly_slug"):
@@ -477,10 +476,10 @@ def record_equity_snapshot(price: float, balance: float, position: Optional[str]
 
     conn = db_conn()
     conn.autocommit = True
-    cur = conn.cursor()
+    #cur = conn.cursor()
 
     # your DB expects "price" NOT NULL; do not insert "mark"
-    cur.execute(
+    #cur.execute(
         """
         INSERT INTO equity_snapshots (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
@@ -488,8 +487,8 @@ def record_equity_snapshot(price: float, balance: float, position: Optional[str]
         (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up),
     )
 
-    cur.close()
-    conn.close()
+    #cur.close()
+    #conn.close()
 
 def live_orders_already_done(poly_slug: str, action: str) -> bool:
     if not DATABASE_URL:

@@ -578,6 +578,13 @@ def status_live_order(order_id: str) -> Dict[str, Any]:
 # ----------------------------
 def main() -> None:
     log.info(f"{ts()} | INFO | BOOT: bot.py starting")
+    import requests
+
+    try:
+        test = requests.get(f"{os.environ['ORDER_SERVICE_URL']}/", timeout=5)
+        log.info(f"{ts()} | INFO | bun_health_status={test.status_code}")
+    except Exception as e:
+        log.error(f"{ts()} | ERROR | bun_unreachable: {e}")
 
     ensure_schema()
 

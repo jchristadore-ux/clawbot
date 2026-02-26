@@ -485,8 +485,6 @@ def record_equity_snapshot(price: float, balance: float, position: Optional[str]
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up),
-    )
-
     #cur.close()
     #conn.close()
 

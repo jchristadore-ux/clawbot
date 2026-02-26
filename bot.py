@@ -5,6 +5,7 @@ import uuid
 import math
 import logging
 from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 
 import requests
 import psycopg2

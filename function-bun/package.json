@@ -1,9 +1,8 @@
 {
   "name": "function-bun",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "dependencies": {
-    "@polymarket/clob-client": "^4.0.0",
-    "hono": "^4.0.0"
+  "scripts": {
+    "start": "bun run index.ts"
   }
 }

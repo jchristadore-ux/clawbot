@@ -734,11 +734,11 @@ def main():
 
     mkt = fetch_gamma_market_by_slug(poly_slug)
     if env_bool("DEBUG_POLY", False):
-    log_line("DEBUG", f"GAMMA RAW KEYS: {list(mkt.keys())}")
-    log_line("DEBUG", f"GAMMA outcomes: {mkt.get('outcomes')}")
-    log_line("DEBUG", f"GAMMA outcomeNames: {mkt.get('outcomeNames')}")
-    log_line("DEBUG", f"GAMMA clobTokenIds: {mkt.get('clobTokenIds')}")
-    log_line("DEBUG", f"GAMMA tokens: {mkt.get('tokens')}")
+        log_line("DEBUG", f"GAMMA RAW KEYS: {list(mkt.keys())}")
+        log_line("DEBUG", f"GAMMA outcomes: {mkt.get('outcomes')}")
+        log_line("DEBUG", f"GAMMA outcomeNames: {mkt.get('outcomeNames')}")
+        log_line("DEBUG", f"GAMMA clobTokenIds: {mkt.get('clobTokenIds')}")
+        log_line("DEBUG", f"GAMMA tokens: {mkt.get('tokens')}")
     if not mkt:
         log_line("WARN", f"poly_slug={poly_slug} candidate_markets=0")
         log_line("INFO", "BOOT: bot.py finished cleanly")

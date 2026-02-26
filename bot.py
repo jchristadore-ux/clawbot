@@ -385,13 +385,53 @@ def fetch_gamma_market_by_slug(slug: str) -> dict:
     # best match
     return data[0]
 
+def _maybe_json_list(x):
+    """
+    Gamma sometimes returns arrays as JSON-encoded strings.
+    Examples:
+      '["Up","Down"]' -> ["Up","Down"]
+      ["Up","Down"] -> ["Up","Down"]
+      "Up,Down" -> ["Up","Down"]
+    """
+    if x is None:
+        return None
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
+        if "," in s:
+            return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
+        return [s]
+    return None
 
-def extract_token_ids(mkt: dict):
+
+def _norm_outcome(name: str) -> str:
+    n = (name or "").strip().lower()
+    # Map a few common variants into canonical buckets
+    if n in ("yes", "y", "true", "up", "higher", "increase"):
+        return "YES"
+    if n in ("no", "n", "false", "down", "lower", "decrease"):
+        return "NO"
+    return n.upper()
+
+def extract_token_ids(mkt: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Tries to find YES/NO token ids from gamma market payload.
-    Different gamma payloads exist; we handle the common shapes.
+    Returns (YES_token_id, NO_token_id) for a 2-outcome market.
+    Works for YES/NO markets and UP/DOWN markets.
+
+    Supports Gamma shapes:
+      - clobTokenIds + outcomes/outcomeNames (lists or JSON strings)
+      - tokens: [{token_id/outcome}, ...]
+      - fallback: 2 clobTokenIds with no outcomes (best effort)
     """
-    # Some gamma payloads have "tokens" list with {token_id, outcome}
+    # 1) Try tokens[] structure first (most explicit)
     tokens = mkt.get("tokens")
     if isinstance(tokens, str):
         try:
@@ -399,39 +439,45 @@ def extract_token_ids(mkt: dict):
         except Exception:
             tokens = None
 
-    if isinstance(tokens, list):
-        yes = None
-        no = None
+    if isinstance(tokens, list) and tokens:
+        yes_tid = None
+        no_tid = None
         for t in tokens:
             if not isinstance(t, dict):
                 continue
-            outcome = str(t.get("outcome", "")).strip().lower()
-            tid = str(t.get("token_id") or t.get("tokenId") or t.get("id") or "").strip()
-            if not tid:
+            tid = t.get("token_id") or t.get("tokenId") or t.get("id") or t.get("clobTokenId")
+            outcome = t.get("outcome") or t.get("outcomeName") or t.get("name")
+            if tid is None or outcome is None:
                 continue
-            if outcome == "yes":
-                yes = tid
-            elif outcome == "no":
-                no = tid
-        if yes and no:
-            return yes, no
+            bucket = _norm_outcome(str(outcome))
+            if bucket == "YES":
+                yes_tid = str(tid)
+            elif bucket == "NO":
+                no_tid = str(tid)
 
-    # Fallback: outcomes/outcomePrices arrays (older)
-    outcomes = _maybe_json_list(mkt.get("outcomes"))
-    if not outcomes:
-        outcomes = _maybe_json_list(mkt.get("outcomeNames"))
-    # token ids sometimes in "clobTokenIds" or similar arrays
-    clob_ids = _maybe_json_list(mkt.get("clobTokenIds")) or _maybe_json_list(mkt.get("clob_token_ids"))
+        if yes_tid and no_tid:
+            return yes_tid, no_tid
 
-    if outcomes and clob_ids and len(outcomes) == len(clob_ids):
-        yes = no = None
-        for o, tid in zip(outcomes, clob_ids):
-            if str(o).strip().lower() == "yes":
-                yes = str(tid)
-            elif str(o).strip().lower() == "no":
-                no = str(tid)
-        if yes and no:
-            return yes, no
+    # 2) Try clobTokenIds + outcomes/outcomeNames alignment
+    outcomes = _maybe_json_list(mkt.get("outcomes")) or _maybe_json_list(mkt.get("outcomeNames"))
+    clob_ids = _maybe_json_list(mkt.get("clobTokenIds")) or _maybe_json_list(mkt.get("clobTokenIDs"))
+
+    if isinstance(outcomes, list) and isinstance(clob_ids, list) and len(outcomes) >= 2 and len(clob_ids) >= 2:
+        yes_tid = None
+        no_tid = None
+        for name, tid in zip(outcomes, clob_ids):
+            bucket = _norm_outcome(str(name))
+            if bucket == "YES":
+                yes_tid = str(tid)
+            elif bucket == "NO":
+                no_tid = str(tid)
+
+        if yes_tid and no_tid:
+            return yes_tid, no_tid
+
+    # 3) Last resort: if we only have 2 token ids, assume [YES, NO] ordering
+    if isinstance(clob_ids, list) and len(clob_ids) == 2:
+        return str(clob_ids[0]), str(clob_ids[1])
 
     return None, None
 
@@ -748,7 +794,7 @@ def main():
 
     yes_token, no_token = extract_token_ids(mkt)
     if not yes_token or not no_token:
-        log_line("WARN", "Could not extract YES/NO token ids from Gamma response.")
+        log_line("WARN", f"Could not extract token ids. keys={list(mkt.keys())} outcomes={mkt.get('outcomes')} outcomeNames={mkt.get('outcomeNames')} clobTokenIds={mkt.get('clobTokenIds')} tokens={mkt.get('tokens')}")       
         log_line("INFO", "BOOT: bot.py finished cleanly")
         return
 

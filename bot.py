@@ -273,7 +273,7 @@ def ensure_tables():
     conn.autocommit = True
     cur = conn.cursor()
 
-    # equity_snapshots: handle your existing schema (it apparently has "price" NOT NULL)
+    # ---- equity_snapshots (keep as-is / compatible) ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -290,6 +290,79 @@ def ensure_tables():
         );
         """
     )
+
+    # If older schema exists with "mark" instead of "price"
+    if not db_has_column(cur, "equity_snapshots", "price"):
+        cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
+        cur.execute("UPDATE equity_snapshots SET price = COALESCE(price, 0.0) WHERE price IS NULL;")
+        cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price SET NOT NULL;")
+
+    # ---- live_orders (MIGRATION-SAFE) ----
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS live_orders (
+          id SERIAL PRIMARY KEY,
+          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          poly_slug TEXT,
+          action TEXT,
+          token_id TEXT,
+          side TEXT,
+          price DOUBLE PRECISION,
+          size DOUBLE PRECISION,
+          client_order_id TEXT,
+          status TEXT NOT NULL DEFAULT 'submitted'
+        );
+        """
+    )
+
+    # Add missing columns to existing live_orders tables (older schema)
+    for col, ddl in [
+        ("poly_slug", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS poly_slug TEXT;"),
+        ("action", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS action TEXT;"),
+        ("token_id", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS token_id TEXT;"),
+        ("side", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS side TEXT;"),
+        ("price", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;"),
+        ("size", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS size DOUBLE PRECISION;"),
+        ("client_order_id", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS client_order_id TEXT;"),
+        ("status", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'submitted';"),
+        ("ts", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL DEFAULT NOW();"),
+    ]:
+        if not db_has_column(cur, "live_orders", col):
+            cur.execute(ddl)
+
+    # Backfill poly_slug from older column names if they exist
+    if db_has_column(cur, "live_orders", "slug") and db_has_column(cur, "live_orders", "poly_slug"):
+        cur.execute("UPDATE live_orders SET poly_slug = slug WHERE poly_slug IS NULL;")
+
+    if db_has_column(cur, "live_orders", "market_slug") and db_has_column(cur, "live_orders", "poly_slug"):
+        cur.execute("UPDATE live_orders SET poly_slug = market_slug WHERE poly_slug IS NULL;")
+
+    # Backfill action if older column exists
+    if db_has_column(cur, "live_orders", "event") and db_has_column(cur, "live_orders", "action"):
+        cur.execute("UPDATE live_orders SET action = event WHERE action IS NULL;")
+
+    # Ensure NOT NULL where we depend on it going forward (only if the table is empty or already compatible)
+    # We won’t force NOT NULL if existing rows would violate it.
+    cur.execute("SELECT COUNT(*) FROM live_orders WHERE poly_slug IS NULL OR action IS NULL;")
+    bad = cur.fetchone()[0]
+    if bad == 0:
+        cur.execute("ALTER TABLE live_orders ALTER COLUMN poly_slug SET NOT NULL;")
+        cur.execute("ALTER TABLE live_orders ALTER COLUMN action SET NOT NULL;")
+
+    # Drop any old conflicting indexes, then create our idempotency index
+    # (safe: IF EXISTS)
+    cur.execute("DROP INDEX IF EXISTS live_orders_slug_action_idx;")
+    cur.execute("DROP INDEX IF EXISTS live_orders_poly_slug_action_idx;")
+
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS live_orders_poly_slug_action_idx
+        ON live_orders(poly_slug, action);
+        """
+    )
+
+    cur.close()
+    conn.close()
 
     # If older schema exists with mark instead of price, add price.
     if not db_has_column(cur, "equity_snapshots", "price"):

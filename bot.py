@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os
+import osga
 import sys
 import json
 import time
@@ -501,14 +501,12 @@ def main():
         poly_slug,
     )
 
-    # 1) Gamma lookup with FULL slug (fix for your current error)
-    gamma = fetch_gamma_market_and_tokens(poly_slug)
+    # 1) Gamma lookup with BASE slug (Gamma does NOT support the timestamped instance slug)
+    base_slug = normalize_base_slug(POLY_MARKET_SLUG or poly_slug)
+
+    gamma = fetch_gamma_market_and_tokens(base_slug)
     if not gamma:
-        # Keep the message precise and actionable
-        if POLY_MARKET_SLUG:
-            log.warning("Gamma market not found for slug=%s (base=%s)", poly_slug, POLY_MARKET_SLUG)
-        else:
-            log.warning("Gamma market not found for slug=%s", poly_slug)
+        log.warning("Gamma market not found for slug=%s (poly_slug=%s)", base_slug, poly_slug)
         log.info("BOOT: bot.py finished cleanly")
         return
 

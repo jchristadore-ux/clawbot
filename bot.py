@@ -275,30 +275,30 @@ def midpoint_from_best(best_bid: Optional[float], best_ask: Optional[float]) -> 
 # Market selection: ensure tradable
 # -----------------------------
 
-def gamma_public_search(query: str, limit: int) -> List[dict]:
+def gamma_public_search(q: str, limit: int) -> List[dict]:
     """
-    Use Gamma /public-search to find markets/events/profiles by keyword. :contentReference[oaicite:3]{index=3}
-    We extract markets from results when present.
+    Gamma /public-search expects query parameter name `q` (not `query`) in your environment.
     """
-    j = http_get_json(f"{GAMMA_HOST}/public-search", params={"query": query, "limit": limit})
+    j = http_get_json(f"{GAMMA_HOST}/public-search", params={"q": q, "limit": limit})
     if not isinstance(j, dict):
         return []
 
     markets: List[dict] = []
 
-    # Gamma search payloads can vary; we defensively look for likely keys.
-    for key in ("markets", "market", "results", "data"):
+    # Defensive extraction (Gamma payloads can vary)
+    for key in ("markets", "results", "data"):
         block = j.get(key)
         if isinstance(block, list):
             for item in block:
-                if isinstance(item, dict):
-                    # Some results are markets directly
-                    if "clobTokenIds" in item and "outcomes" in item:
-                        markets.append(item)
-                    # Some results might be wrapped
-                    m = item.get("market") if isinstance(item.get("market"), dict) else None
-                    if m and "clobTokenIds" in m and "outcomes" in m:
-                        markets.append(m)
+                if not isinstance(item, dict):
+                    continue
+                # market object directly
+                if "clobTokenIds" in item and "outcomes" in item:
+                    markets.append(item)
+                # wrapper object
+                inner = item.get("market")
+                if isinstance(inner, dict) and "clobTokenIds" in inner and "outcomes" in inner:
+                    markets.append(inner)
 
     # Dedup by slug
     seen = set()
@@ -308,30 +308,29 @@ def gamma_public_search(query: str, limit: int) -> List[dict]:
         if s and s not in seen:
             seen.add(s)
             deduped.append(m)
-    return deduped
 
+    return deduped
 
 def gamma_search_markets_by_prefix(prefix: str, limit: int) -> List[dict]:
     """
     Search strategy:
-    - First: exact-ish query derived from prefix
-    - Then: broader BTC/Bitcoin query if nothing found
+    - First: prefix-derived query (btc updown 5m)
+    - Then: broader bitcoin query
     """
     q1 = prefix.replace("-", " ").strip()
     markets = gamma_public_search(q1, limit)
 
     if not markets:
-        # broader fallback
         markets = gamma_public_search("bitcoin", limit)
 
-    # Filter if prefix actually exists in slug, but don't require it (because your prefix may be synthetic)
+    # Filter by prefix if it actually appears in slug; otherwise return whatever we found.
     filtered = []
     for m in markets:
         s = str(m.get("slug", "")).strip()
-        if prefix in s or not prefix:
+        if prefix in s:
             filtered.append(m)
 
-    return filtered or markets
+    return filtered if filtered else markets
 
 def market_has_books(yes_token: str, no_token: str) -> bool:
     _, _, yes_has = clob_book_best(yes_token)

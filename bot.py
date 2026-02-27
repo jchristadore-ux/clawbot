@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import osga
+import os
 import sys
 import json
 import time

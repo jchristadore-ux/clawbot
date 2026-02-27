@@ -1,11 +1,10 @@
 import os
 import json
 import time
-import math
 import logging
 import re
 from datetime import datetime, timezone, date
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import requests
 import psycopg2
@@ -43,9 +42,7 @@ def utc_now() -> datetime:
 
 
 def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
-    """
-    Returns the start epoch (UTC seconds) of the current 5-minute window.
-    """
+    """Start epoch of the current 5-minute bucket."""
     if ts is None:
         ts = time.time()
     return int(ts // 300) * 300
@@ -53,15 +50,14 @@ def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
 
 def make_poly_slug() -> str:
     """
-    Builds the rolling 5-minute Polymarket slug.
+    Builds rolling 5-minute Polymarket slug: <prefix>-<bucket_epoch>
 
     Expected env:
-      - POLY_MARKET_SLUG = btc-updown-5m     (no epoch suffix)
-      - POLY_EVENT_SLUG  optional fallback
+      - POLY_MARKET_SLUG=btc-updown-5m   (no epoch)
+      - POLY_EVENT_SLUG optional fallback
 
     Hardening:
-      - If someone mistakenly sets POLY_MARKET_SLUG=btc-updown-5m-<epoch>
-        or btc-updown-5m-<start>-<end>, we strip the trailing epoch(s).
+      - If env accidentally includes -<epoch> or -<start>-<end>, strip trailing epochs.
     """
     base = (os.getenv("POLY_MARKET_SLUG") or "").strip()
     event = (os.getenv("POLY_EVENT_SLUG") or "").strip()
@@ -69,7 +65,7 @@ def make_poly_slug() -> str:
         raise RuntimeError("Missing POLY_MARKET_SLUG or POLY_EVENT_SLUG")
 
     prefix = base or event
-    prefix = re.sub(r"(-\d{10}){1,2}$", "", prefix)  # strip trailing epoch(s)
+    prefix = re.sub(r"(-\d{10}){1,2}$", "", prefix)  # strip trailing epoch(s) if present
 
     return f"{prefix}-{five_min_bucket_epoch()}"
 
@@ -78,7 +74,7 @@ def http_get_json(
     url: str,
     params: Optional[dict] = None,
     headers: Optional[dict] = None,
-    timeout: int = 20,
+    timeout: int = 20
 ) -> Optional[dict]:
     try:
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -93,7 +89,7 @@ def http_post_json(
     url: str,
     payload: dict,
     headers: Optional[dict] = None,
-    timeout: int = 25,
+    timeout: int = 25
 ) -> Tuple[int, Optional[dict], str]:
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -105,6 +101,29 @@ def http_post_json(
         return r.status_code, j, text
     except Exception as e:
         return 0, None, str(e)
+
+
+def _maybe_json_list(x) -> Optional[List[Any]]:
+    """
+    Gamma often returns list fields as JSON-encoded strings.
+    Accepts:
+      - list -> list
+      - '["a","b"]' -> list
+      - None -> None
+    """
+    if x is None:
+        return None
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                v = json.loads(s)
+                return v if isinstance(v, list) else None
+            except Exception:
+                return None
+    return None
 
 
 # ----------------------------
@@ -120,39 +139,30 @@ def db_conn():
 
 
 def ensure_tables():
-    """
-    Ensures bot_state exists and has all columns load_state/save_state expect.
-    Also ensures equity_snapshots exists for record_equity_snapshot.
-    """
+    """Ensures bot_state + equity_snapshots exist and have required columns."""
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     conn.autocommit = True
     cur = conn.cursor()
 
-    # Ensure table exists (empty stub is fine; we'll add columns)
     cur.execute("CREATE TABLE IF NOT EXISTS bot_state ();")
 
-    # Core identity / timing
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS id INTEGER;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS as_of_date DATE;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;")
     cur.execute("ALTER TABLE bot_state ALTER COLUMN updated_at SET DEFAULT NOW();")
 
-    # Position state
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS position TEXT;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_price DOUBLE PRECISION;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_ts TIMESTAMPTZ;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_action TEXT;")
 
-    # Fields expected by load_state()
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS stake DOUBLE PRECISION;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS trades_today INTEGER;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS pnl_today_realized DOUBLE PRECISION;")
 
-    # Helpful extras (safe if unused)
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_trade_ts TIMESTAMPTZ;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS equity DOUBLE PRECISION;")
 
-    # Ensure single row exists
     cur.execute("""
         INSERT INTO bot_state (
             id, as_of_date, position, entry_price, entry_ts, last_action,
@@ -164,7 +174,6 @@ def ensure_tables():
         WHERE NOT EXISTS (SELECT 1 FROM bot_state WHERE id = 1);
     """)
 
-    # equity snapshots table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS equity_snapshots (
             id SERIAL PRIMARY KEY,
@@ -182,28 +191,6 @@ def ensure_tables():
 
     cur.close()
     conn.close()
-
-
-def _maybe_json_list(x):
-    """
-    Gamma sometimes returns list-y fields as JSON-encoded strings.
-    Converts:
-      - '["Up","Down"]' -> ["Up","Down"]
-      - ["Up","Down"] -> ["Up","Down"]
-      - None -> None
-    """
-    if x is None:
-        return None
-    if isinstance(x, list):
-        return x
-    if isinstance(x, str):
-        s = x.strip()
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                return json.loads(s)
-            except Exception:
-                return None
-    return None
 
 
 def load_state() -> Dict[str, Any]:
@@ -239,7 +226,8 @@ def save_state(state: Dict[str, Any]) -> None:
             cur.execute(
                 """
                 UPDATE bot_state
-                SET as_of_date=%s, position=%s, entry_price=%s, stake=%s, trades_today=%s, pnl_today_realized=%s, updated_at=NOW()
+                SET as_of_date=%s, position=%s, entry_price=%s, stake=%s,
+                    trades_today=%s, pnl_today_realized=%s, updated_at=NOW()
                 WHERE id=1;
                 """,
                 (
@@ -262,7 +250,7 @@ def record_equity_snapshot(
     stake: float,
     unrealized_pnl: float,
     equity: float,
-    poly_slug: str,
+    poly_slug: str
 ) -> None:
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -277,38 +265,41 @@ def record_equity_snapshot(
 
 
 # ----------------------------
-# Gamma/CLOB data
+# Gamma/CLOB
 # ----------------------------
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
-# Note:
-# - POLY_MARKET_SLUG should be base (btc-updown-5m) WITHOUT epoch.
-# - POLY_GAMMA_SLUG optional; if set, should also be base WITHOUT epoch.
 POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
 POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip() or POLY_MARKET_SLUG
 
 
-def extract_yes_no_token_ids(market: dict):
+def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
     """
-    Robustly maps tokenIds to YES/NO for:
+    Robust YES/NO token mapping.
+
+    IMPORTANT PATCH:
+      - Gamma often uses 'clobTokenIds' (JSON-encoded string) rather than 'tokenIds'.
+
+    Supports:
       - YES/NO markets
       - UP/DOWN markets (Up=YES, Down=NO)
       - generic 2-outcome markets (index 0=YES, index 1=NO)
-
-    Returns: (yes_token_id, no_token_id) as strings, or (None, None)
     """
     outcomes = _maybe_json_list(market.get("outcomes"))
-    token_ids = _maybe_json_list(market.get("tokenIds")) or _maybe_json_list(market.get("tokenIDs"))
+
+    # token ids may appear in multiple places; prefer clobTokenIds when present
+    token_ids = (
+        _maybe_json_list(market.get("clobTokenIds"))
+        or _maybe_json_list(market.get("clobTokenIDs"))
+        or _maybe_json_list(market.get("tokenIds"))
+        or _maybe_json_list(market.get("tokenIDs"))
+    )
+
     if not outcomes or not token_ids or len(outcomes) != len(token_ids):
         return (None, None)
 
-    labels = []
-    for o in outcomes:
-        if isinstance(o, str):
-            labels.append(o.strip().upper())
-        else:
-            labels.append(str(o).strip().upper())
+    labels = [str(o).strip().upper() for o in outcomes]
 
     # Direct YES/NO
     try:
@@ -318,7 +309,7 @@ def extract_yes_no_token_ids(market: dict):
     except ValueError:
         pass
 
-    # UP/DOWN -> YES/NO
+    # UP/DOWN
     if "UP" in labels and "DOWN" in labels:
         up_i = labels.index("UP")
         down_i = labels.index("DOWN")
@@ -333,21 +324,15 @@ def extract_yes_no_token_ids(market: dict):
 
 def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
     """
-    Gamma resolver for rolling 5-minute BTC up/down markets.
+    Resolver strategy:
+      1) Try MARKET by slug (direct)
+      2) Try EVENT by slug; then pick a market:
+         - if event embeds markets -> take first
+         - else fetch markets by event_id
+      3) Fallback scan /events with minimal params (limit/offset only) to avoid 422
 
-    Key behaviors:
-      - Tries MARKET by slug first.
-      - If not found, tries EVENT by slug (5m slugs are often event slugs).
-      - If event doesn't embed markets, fetches markets by event_id.
-      - Fallback scan uses /events with MINIMAL params (limit/offset only) to avoid 422.
-
-    Returns dict for main():
-      {
-        "market": <market_obj>,
-        "yes_token_id": "...",
-        "no_token_id": "...",
-        "slug": "<market_slug or event-derived slug>"
-      }
+    Returns:
+      {"market": m, "yes_token_id": y, "no_token_id": n, "slug": m.slug}
     """
     GAMMA_BASE = POLY_GAMMA_HOST
 
@@ -357,7 +342,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
     def _prefix(slug: str):
         return re.sub(r"(-\d{9,12}){1,2}$", "", (slug or "").strip())
 
-    def _gamma_get_market_by_slug_exact(slug: str):
+    def _gamma_get_market_by_slug_exact(slug: str) -> Optional[dict]:
         slug = (slug or "").strip()
         if not slug:
             return None
@@ -376,7 +361,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
 
         return None
 
-    def _gamma_get_event_by_slug_exact(slug: str):
+    def _gamma_get_event_by_slug_exact(slug: str) -> Optional[dict]:
         slug = (slug or "").strip()
         if not slug:
             return None
@@ -395,7 +380,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
 
         return None
 
-    def _gamma_get_markets_by_event_id(event_id: Any):
+    def _gamma_get_markets_by_event_id(event_id: Any) -> List[dict]:
         if event_id is None:
             return []
         r = requests.get(f"{GAMMA_BASE}/markets", params={"event_id": str(event_id)}, timeout=20)
@@ -410,11 +395,9 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
 
         markets = ev.get("markets")
         markets = markets if isinstance(markets, list) else _maybe_json_list(markets)
-
         if isinstance(markets, list) and markets:
             return markets[0]
 
-        # If event doesn't embed markets, try event_id -> markets
         eid = ev.get("id") or ev.get("event_id") or ev.get("eventId")
         if eid:
             mkts = _gamma_get_markets_by_event_id(eid)
@@ -423,8 +406,8 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
 
         return None
 
-    # This is the 422-safe events pager: ONLY limit/offset.
-    def _gamma_list_events(limit: int = 200, offset: int = 0):
+    def _gamma_list_events(limit: int = 200, offset: int = 0) -> List[dict]:
+        # 422-safe: only limit/offset
         params = {"limit": int(limit), "offset": int(offset)}
         r = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=25)
         if r.status_code != 200:
@@ -432,22 +415,18 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
         j = r.json()
         return j if isinstance(j, list) else []
 
-    # --- Targets
     env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
     pfx = _prefix(env_base) or _prefix(poly_slug)
 
     e = _epochs(poly_slug)
     start_epoch = e[0] if len(e) >= 1 else None
-    end_epoch = e[-1] if len(e) >= 2 else (e[-1] if e else None)
+    end_epoch = e[-1] if len(e) >= 1 else None
 
     tried = []
     tried.append(("prefix", pfx))
     tried.append(("start_epoch", start_epoch))
     tried.append(("end_epoch", end_epoch))
 
-    # Candidate slugs:
-    #  - canonical one-epoch: <prefix>-<epoch>
-    #  - the provided poly_slug (already one-epoch in your current logs)
     candidates = []
     if pfx and start_epoch:
         candidates.append(f"{pfx}-{start_epoch}")
@@ -456,11 +435,10 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
     if poly_slug:
         candidates.append(poly_slug)
 
-    # de-dupe preserve order
     seen = set()
     candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
 
-    # 1) Direct lookup: MARKET then EVENT
+    # 1) Direct: market then event
     for slug in candidates:
         tried.append(("market_by_slug", slug))
         m = _gamma_get_market_by_slug_exact(slug)
@@ -478,7 +456,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
                 if y and n:
                     return {"market": m2, "yes_token_id": y, "no_token_id": n, "slug": (m2.get("slug") or "")}
 
-    # 2) Fallback: scan events (minimal params to avoid 422)
+    # 2) Fallback: scan events and score by prefix + nearest epoch
     def _extract_last_epoch(s: str) -> Optional[int]:
         nums = re.findall(r"\d{9,12}", s or "")
         if not nums:
@@ -489,15 +467,11 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
             return None
 
     def _score_event(ev: dict) -> int:
-        if not ev or not isinstance(ev, dict):
-            return 0
         eslug = (ev.get("slug") or "").strip()
         if not eslug or not pfx or not eslug.startswith(pfx):
             return 0
-
         score = 10
         ep = _extract_last_epoch(eslug)
-
         if ep is not None and start_epoch is not None:
             try:
                 se = int(start_epoch)
@@ -509,10 +483,9 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
                     score += 40
             except Exception:
                 pass
-
         return score
 
-    best = None  # (score, market_obj, event_slug)
+    best = None  # (score, market_obj)
     pages = 50
     limit = 200
 
@@ -527,13 +500,11 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
             sc = _score_event(ev)
             if sc <= 0:
                 continue
-
             m3 = _event_pick_market(ev)
             if not m3:
                 continue
-
             if best is None or sc > best[0]:
-                best = (sc, m3, (ev.get("slug") or "").strip())
+                best = (sc, m3)
 
         if best and best[0] >= 110:
             break
@@ -575,7 +546,6 @@ def bun_health() -> Optional[int]:
     if not BUN_BASE_URL:
         return None
     code, _, _ = http_post_json(f"{BUN_BASE_URL}/__ping", payload={}, timeout=8)
-    # If you didn’t implement /__ping, we’ll also accept GET /
     if code == 0 or code >= 400:
         try:
             r = requests.get(f"{BUN_BASE_URL}/", timeout=8)
@@ -607,17 +577,14 @@ def bun_place_order(token_id: str, side: str, price: float, size: float) -> Tupl
 # ----------------------------
 # Strategy / Risk
 # ----------------------------
-EDGE_ENTER = env_float("EDGE_ENTER", 0.10)      # enter when |edge| >= this
-EDGE_EXIT = env_float("EDGE_EXIT", 0.02)        # optional: exit when signal flips OR edge shrinks
+EDGE_ENTER = env_float("EDGE_ENTER", 0.10)
+EDGE_EXIT = env_float("EDGE_EXIT", 0.02)
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "60"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 LIVE_TRADE_SIZE = env_float("LIVE_TRADE_SIZE", 1.0)
 
 
 def compute_signal(poly_up: float, fair_up: float) -> Tuple[str, float]:
-    """
-    edge = fair_up - poly_up
-    """
     edge = fair_up - poly_up
     if edge >= EDGE_ENTER:
         return "YES", edge
@@ -631,7 +598,6 @@ def compute_signal(poly_up: float, fair_up: float) -> Tuple[str, float]:
 # ----------------------------
 def main() -> None:
     log.info("BOOT: bot.py starting")
-
     ensure_tables()
 
     run_mode = os.getenv("RUN_MODE", "DRY_RUN").strip().upper()
@@ -644,7 +610,6 @@ def main() -> None:
     poly_slug = make_poly_slug()
     log.info("run_mode=%s live_mode=%s live_armed=%s poly_slug=%s", run_mode, live_mode, live_armed, poly_slug)
 
-    # Optional: bun health log
     if BUN_BASE_URL:
         hs = bun_health()
         if hs is not None:
@@ -659,13 +624,12 @@ def main() -> None:
         state["pnl_today_realized"] = 0.0
         save_state(state)
 
-    # Pull Gamma market + token IDs
+    # Resolve Gamma -> token ids
     gamma = fetch_gamma_market_and_tokens(poly_slug)
-
     yes_token = gamma["yes_token_id"]
     no_token = gamma["no_token_id"]
 
-    # Market prices (midpoints)
+    # Midpoints
     p_yes = clob_midpoint(yes_token)
     p_no = clob_midpoint(no_token)
     if p_yes is None or p_no is None:
@@ -676,9 +640,7 @@ def main() -> None:
     poly_up = float(p_yes)
     poly_down = float(p_no)
 
-    # Simple fair value baseline (you can replace later with your model)
-    fair_up = 0.50
-
+    fair_up = 0.50  # placeholder
     signal, edge = compute_signal(poly_up, fair_up)
 
     position = state["position"]  # "YES" / "NO" / None
@@ -691,12 +653,10 @@ def main() -> None:
     reason = ""
     balance = float(os.getenv("PAPER_BALANCE", "0").strip() or 0.0)
 
-    # Trade limit
     if trades_today >= MAX_TRADES_PER_DAY:
         reason = "MAX_TRADES_PER_DAY"
         action = "NO_TRADE"
     else:
-        # Decide action
         if position is None:
             if signal == "YES":
                 action = "ENTER_YES"
@@ -706,7 +666,6 @@ def main() -> None:
                 action = "NO_TRADE"
                 reason = "signal=HOLD"
         else:
-            # Exit if signal flips
             if position == "YES" and signal == "NO":
                 action = "EXIT"
             elif position == "NO" and signal == "YES":
@@ -715,12 +674,11 @@ def main() -> None:
                 action = "NO_TRADE"
                 reason = "signal=HOLD" if signal == "HOLD" else "HOLD_SAME_SIDE"
 
-    # Safety rails for LIVE
     if live_mode and not live_armed and action.startswith("ENTER"):
         reason = "not_armed" + ("+KILL_SWITCH" if kill_switch else "")
         action = "NO_TRADE"
 
-    # Execute (PAPER/LIVE)
+    # Execute
     if action == "ENTER_YES":
         fill_price = poly_up
         if run_mode == "PAPER":
@@ -762,7 +720,6 @@ def main() -> None:
                 reason = msg
 
     elif action == "EXIT":
-        # For binary positions, we “sell” the same token we bought.
         if position == "YES":
             exit_price = poly_up
             token = yes_token
@@ -771,7 +728,6 @@ def main() -> None:
             token = no_token
 
         if entry is None:
-            # corrupted state; clear
             state["position"] = None
             state["entry_price"] = None
             state["stake"] = 0.0
@@ -798,7 +754,7 @@ def main() -> None:
                     action = "NO_TRADE"
                     reason = msg
 
-    # Recompute for snapshot
+    # Snapshot
     state2 = load_state()
     position2 = state2["position"]
     entry2 = state2["entry_price"]
@@ -812,7 +768,7 @@ def main() -> None:
         mark_price = poly_down
     else:
         u = 0.0
-        mark_price = poly_up  # store something valid/non-null
+        mark_price = poly_up
 
     equity = balance + u
 

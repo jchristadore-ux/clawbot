@@ -265,7 +265,7 @@ def ensure_tables():
     try:
         with conn:
             with conn.cursor() as cur:
-                # --- bot_state ---
+
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS bot_state (
                         id INT PRIMARY KEY DEFAULT 1,
@@ -279,7 +279,6 @@ def ensure_tables():
                     );
                 """)
 
-                # --- equity_snapshots ---
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS equity_snapshots (
                         id BIGSERIAL PRIMARY KEY,
@@ -296,7 +295,6 @@ def ensure_tables():
                     );
                 """)
 
-                # --- live_orders ---
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS live_orders (
                         id BIGSERIAL PRIMARY KEY,
@@ -312,33 +310,6 @@ def ensure_tables():
                     );
                 """)
 
-                # --- safe migrations ---
-                cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
-                cur.execute("ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
-
-                # mark -> price rename if needed
-                cur.execute("""
-                    DO $$
-                    BEGIN
-                        IF EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_schema='public'
-                            AND table_name='equity_snapshots'
-                            AND column_name='mark'
-                        ) AND NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_schema='public'
-                            AND table_name='equity_snapshots'
-                            AND column_name='price'
-                        ) THEN
-                            ALTER TABLE equity_snapshots RENAME COLUMN mark TO price;
-                        END IF;
-                    END $$;
-                """)
-
-                cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
-                cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price DROP NOT NULL;")
-
     finally:
         conn.close()
 
@@ -352,8 +323,7 @@ def record_equity_snapshot(price: float, balance: float, position: Optional[str]
     #cur = conn.cursor()
 
     # your DB expects "price" NOT NULL; do not insert "mark"
-    #cur.execute(
-        """
+    #cur.execute("""
         INSERT INTO equity_snapshots (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """,

@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, Tuple
 
 import requests
 import psycopg2
-
+F
 
 # ----------------------------
 # Logging
@@ -98,14 +98,19 @@ def db_conn():
 
 def ensure_tables():
     """
-    Fixes the Railway error:
-      psycopg2.errors.UndefinedColumn: column "id" of relation "bot_state" does not exist
+    Fixes:
+      psycopg2.errors.InvalidTableDefinition: multiple primary keys for table "bot_state" are not allowed
 
     We:
-      1) Create bot_state with an id column if it doesn't exist
-      2) If bot_state exists but is missing id, we ALTER TABLE to add it
-      3) Keep a single-row state via id=1 (or you can move to a unique as_of_date later)
+      - Create bot_state if missing
+      - Add id column if missing
+      - If a PK already exists, DO NOT try to add another.
+      - If id exists but isn't the PK, we still keep single-row behavior via upsert on id=1
+        (and we add a UNIQUE constraint on id if needed so ON CONFLICT works).
     """
+    import os
+    import psycopg2
+
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     conn.autocommit = True
     cur = conn.cursor()
@@ -113,7 +118,7 @@ def ensure_tables():
     # Create table (fresh installs)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
-            id INTEGER PRIMARY KEY,
+            id INTEGER,
             as_of_date DATE,
             position TEXT,
             entry_price DOUBLE PRECISION,
@@ -123,21 +128,49 @@ def ensure_tables():
         );
     """)
 
-    # Migrate older table missing id
+    # Ensure id column exists
     cur.execute("""
-        SELECT column_name
+        SELECT 1
         FROM information_schema.columns
         WHERE table_name='bot_state' AND column_name='id';
     """)
     has_id = cur.fetchone() is not None
     if not has_id:
-        # Add id + backfill to 1 for existing rows (if any)
         cur.execute("ALTER TABLE bot_state ADD COLUMN id INTEGER;")
+        cur.execute("UPDATE bot_state SET id = 1 WHERE id IS NULL;")
+
+    # Does table already have a primary key?
+    cur.execute("""
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'bot_state'::regclass
+          AND contype = 'p';
+    """)
+    has_pk = cur.fetchone() is not None
+
+    # If no PK exists, make id the PK (safe)
+    if not has_pk:
         cur.execute("UPDATE bot_state SET id = 1 WHERE id IS NULL;")
         cur.execute("ALTER TABLE bot_state ALTER COLUMN id SET NOT NULL;")
         cur.execute("ALTER TABLE bot_state ADD PRIMARY KEY (id);")
+    else:
+        # PK exists (maybe on another column). Ensure we can still upsert on id=1.
+        # Add UNIQUE(id) if it doesn't already exist.
+        cur.execute("""
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid = 'bot_state'::regclass
+              AND contype IN ('u','p')
+              AND conkey = ARRAY[
+                  (SELECT attnum FROM pg_attribute
+                   WHERE attrelid='bot_state'::regclass AND attname='id')
+              ];
+        """)
+        id_is_unique_or_pk = cur.fetchone() is not None
+        if not id_is_unique_or_pk:
+            cur.execute("ALTER TABLE bot_state ADD CONSTRAINT bot_state_id_key UNIQUE (id);")
 
-    # Ensure we always have the single state row at id=1
+    # Ensure the single-row state at id=1 exists
     cur.execute("""
         INSERT INTO bot_state (id, as_of_date, position, entry_price, entry_ts, last_action)
         VALUES (1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT')

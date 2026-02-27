@@ -302,31 +302,91 @@ def fetch_gamma_market_by_slug(slug: str) -> Optional[dict]:
         return None
     return j
 
+def _norm_outcome_name(s: str) -> str:
+    s = (s or "").strip().upper()
+    if s in ("YES", "Y"):
+        return "YES"
+    if s in ("NO", "N"):
+        return "NO"
+    if s in ("UP", "HIGHER", "ABOVE", "INCREASE", "BULL"):
+        return "YES"   # treat UP as YES-side
+    if s in ("DOWN", "LOWER", "BELOW", "DECREASE", "BEAR"):
+        return "NO"    # treat DOWN as NO-side
+    return s
+
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
     """
-    Gamma markets frequently provide:
-      outcomes: ["Yes","No"]  OR a JSON-encoded string
-      clobTokenIds: ["...","..."] OR a JSON-encoded string
+    Robust extraction for rolling markets where outcomes can be Yes/No or Up/Down.
+    Tries multiple Gamma shapes:
+      - outcomes + clobTokenIds
+      - outcomePrices + outcomes + clobTokenIds (strings)
+      - tokens[] objects
+      - outcomeTokens/outcomeTokenIds variants
+    Returns (yes_token_id, no_token_id) where yes = UP/YES side.
     """
+
+    # 0) If Gamma wrapped it
+    if "market" in market and isinstance(market["market"], dict):
+        market = market["market"]
+
+    # 1) Classic fields: outcomes + clobTokenIds (often JSON strings)
     outcomes = _maybe_json(market.get("outcomes"))
     token_ids = _maybe_json(market.get("clobTokenIds"))
 
-    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
-        return None, None
-    if len(outcomes) != len(token_ids):
-        return None, None
+    if isinstance(outcomes, list) and isinstance(token_ids, list) and len(outcomes) == len(token_ids):
+        yes_id, no_id = None, None
+        for o, tid in zip(outcomes, token_ids):
+            if not isinstance(o, str):
+                continue
+            side = _norm_outcome_name(o)
+            if side == "YES":
+                yes_id = str(tid)
+            elif side == "NO":
+                no_id = str(tid)
+        if yes_id and no_id:
+            return yes_id, no_id
 
-    yes_id, no_id = None, None
-    for o, tid in zip(outcomes, token_ids):
-        if not isinstance(o, str):
-            continue
-        key = o.strip().upper()
-        if key == "YES":
-            yes_id = str(tid)
-        elif key == "NO":
-            no_id = str(tid)
-    return yes_id, no_id
+    # 2) Sometimes tokens are embedded
+    tokens = market.get("tokens") or market.get("outcomeTokens") or market.get("outcome_tokens")
+    if isinstance(tokens, str):
+        tokens = _maybe_json(tokens)
+    if isinstance(tokens, list):
+        yes_id, no_id = None, None
+        for t in tokens:
+            if not isinstance(t, dict):
+                continue
+            name = t.get("outcome") or t.get("name") or t.get("label") or ""
+            tid = t.get("clobTokenId") or t.get("clobTokenID") or t.get("tokenId") or t.get("token_id")
+            if tid is None:
+                continue
+            side = _norm_outcome_name(str(name))
+            if side == "YES":
+                yes_id = str(tid)
+            elif side == "NO":
+                no_id = str(tid)
+        if yes_id and no_id:
+            return yes_id, no_id
+
+    # 3) Fallback: try to find any 2 token ids + map by outcomes heuristics
+    # If we have outcomes but token field name differs
+    for key in ("tokenIds", "token_ids", "clob_token_ids", "clobTokenIDs"):
+        maybe = market.get(key)
+        maybe = _maybe_json(maybe)
+        if isinstance(maybe, list) and isinstance(outcomes, list) and len(maybe) == len(outcomes):
+            yes_id, no_id = None, None
+            for o, tid in zip(outcomes, maybe):
+                if not isinstance(o, str):
+                    continue
+                side = _norm_outcome_name(o)
+                if side == "YES":
+                    yes_id = str(tid)
+                elif side == "NO":
+                    no_id = str(tid)
+            if yes_id and no_id:
+                return yes_id, no_id
+
+    return None, None
 
 
 def clob_midpoint(token_id: str) -> Tuple[int, Optional[float], str]:
@@ -374,8 +434,14 @@ def resolve_tradable_rolling_market(
 
         yes_id, no_id = extract_yes_no_token_ids(m)
         if not yes_id or not no_id:
-            log.warning("Token extraction failed for slug=%s", slug)
-            continue
+            log.warning(
+                "Token extraction failed for slug=%s keys=%s outcomes=%s clobTokenIds=%s",
+                slug,
+                sorted(list(m.keys()))[:40],
+                str(m.get("outcomes"))[:200],
+                str(m.get("clobTokenIds"))[:200],
+    )
+    continue
 
         y_ok = has_live_book(yes_id)
         n_ok = has_live_book(no_id)

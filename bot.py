@@ -275,7 +275,7 @@ POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip() or POLY_MARKET_SLUG
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
     def maybe_json(x):
-        :contentReference[oaicite:6]{index=6}urn None
+        return None
         if isinstance(x, (list, dict)):
             return x
         if isinstance(x, str):

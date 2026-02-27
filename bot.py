@@ -253,24 +253,6 @@ def db_conn():
         return None
     return psycopg2.connect(DATABASE_URL)
 
-#def db_has_column(cur, table: str, column: str) -> bool:
-    """
-    Check whether a column exists WITHOUT closing the cursor/connection.
-    Must be side-effect free because callers may reuse the cursor.
-    """
-    cur.execute(
-        """
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = %s
-          AND column_name = %s
-        LIMIT 1;
-        """,
-        (table, column),
-    )
-    return cur.fetchone() is not None
-
 def ensure_tables():
     import os
     import psycopg2
@@ -283,191 +265,82 @@ def ensure_tables():
     try:
         with conn:
             with conn.cursor() as cur:
-                # --- core tables (create if missing) ---
-                cur.execute(
-                    """
+                # --- bot_state ---
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS bot_state (
-                      id INT PRIMARY KEY DEFAULT 1,
-                      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                      position TEXT,
-                      entry_price DOUBLE PRECISION,
-                      stake DOUBLE PRECISION,
-                      trades_today INT NOT NULL DEFAULT 0,
-                      pnl_today_realized DOUBLE PRECISION NOT NULL DEFAULT 0,
-                      day_key TEXT
+                        id INT PRIMARY KEY DEFAULT 1,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        position TEXT,
+                        entry_price DOUBLE PRECISION,
+                        stake DOUBLE PRECISION,
+                        trades_today INT NOT NULL DEFAULT 0,
+                        pnl_today_realized DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        day_key TEXT
                     );
-                    """
-                )
+                """)
 
-                cur.execute(
-                    """
+                # --- equity_snapshots ---
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS equity_snapshots (
-                      id BIGSERIAL PRIMARY KEY,
-                      ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                      poly_slug TEXT,
-                      price DOUBLE PRECISION,
-                      balance DOUBLE PRECISION,
-                      position TEXT,
-                      entry_price DOUBLE PRECISION,
-                      stake DOUBLE PRECISION,
-                      unrealized_pnl DOUBLE PRECISION,
-                      equity DOUBLE PRECISION,
-                      edge DOUBLE PRECISION
+                        id BIGSERIAL PRIMARY KEY,
+                        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        poly_slug TEXT,
+                        price DOUBLE PRECISION,
+                        balance DOUBLE PRECISION,
+                        position TEXT,
+                        entry_price DOUBLE PRECISION,
+                        stake DOUBLE PRECISION,
+                        unrealized_pnl DOUBLE PRECISION,
+                        equity DOUBLE PRECISION,
+                        edge DOUBLE PRECISION
                     );
-                    """
-                )
+                """)
 
-                cur.execute(
-                    """
+                # --- live_orders ---
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS live_orders (
-                      id BIGSERIAL PRIMARY KEY,
-                      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                      poly_slug TEXT NOT NULL,
-                      side TEXT NOT NULL,
-                      action TEXT NOT NULL,
-                      token_id TEXT,
-                      client_order_id TEXT,
-                      status TEXT NOT NULL DEFAULT 'NEW',
-                      req JSONB,
-                      resp JSONB
+                        id BIGSERIAL PRIMARY KEY,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        poly_slug TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        token_id TEXT,
+                        client_order_id TEXT,
+                        status TEXT NOT NULL DEFAULT 'NEW',
+                        req JSONB,
+                        resp JSONB
                     );
-                    """
-                )
+                """)
 
-                # --- migrations for older schemas ---
+                # --- safe migrations ---
                 cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
                 cur.execute("ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS poly_slug TEXT;")
 
-                # mark -> price rename if you used 'mark' previously
-                cur.execute(
-                    """
+                # mark -> price rename if needed
+                cur.execute("""
                     DO $$
                     BEGIN
-                      IF EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_schema='public' AND table_name='equity_snapshots' AND column_name='mark'
-                      ) AND NOT EXISTS (
-                        SELECT 1 FROM information_schema.columns
-                        WHERE table_schema='public' AND table_name='equity_snapshots' AND column_name='price'
-                      ) THEN
-                        ALTER TABLE equity_snapshots RENAME COLUMN mark TO price;
-                      END IF;
+                        IF EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_schema='public'
+                            AND table_name='equity_snapshots'
+                            AND column_name='mark'
+                        ) AND NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_schema='public'
+                            AND table_name='equity_snapshots'
+                            AND column_name='price'
+                        ) THEN
+                            ALTER TABLE equity_snapshots RENAME COLUMN mark TO price;
+                        END IF;
                     END $$;
-                    """
-                )
+                """)
 
-                # ensure price exists and is nullable (prevents NOT NULL crash)
                 cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
                 cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price DROP NOT NULL;")
 
     finally:
         conn.close()
-
-    # If older schema exists with "mark" instead of "price"
-    #if not db_has_column(cur, "equity_snapshots", "price"):
-        #cur.execute("ALTER TABLE equity_snapshots ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;")
-        #cur.execute("UPDATE equity_snapshots SET price = COALESCE(price, 0.0) WHERE price IS NULL;")
-        #cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price SET NOT NULL;")
-
-    # ---- live_orders (MIGRATION-SAFE) ----
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS live_orders (
-          id SERIAL PRIMARY KEY,
-          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          poly_slug TEXT,
-          action TEXT,
-          token_id TEXT,
-          side TEXT,
-          price DOUBLE PRECISION,
-          size DOUBLE PRECISION,
-          client_order_id TEXT,
-          status TEXT NOT NULL DEFAULT 'submitted'
-        );
-        """
-    )
-
-    # Add missing columns to existing live_orders tables (older schema)
-    for col, ddl in [
-        ("poly_slug", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS poly_slug TEXT;"),
-        ("action", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS action TEXT;"),
-        ("token_id", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS token_id TEXT;"),
-        ("side", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS side TEXT;"),
-        ("price", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;"),
-        ("size", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS size DOUBLE PRECISION;"),
-        ("client_order_id", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS client_order_id TEXT;"),
-        ("status", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'submitted';"),
-        ("ts", "ALTER TABLE live_orders ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL DEFAULT NOW();"),
-    ]:
-        #if not db_has_column(cur, "live_orders", col):
-            #cur.execute(ddl)
-
-    # Backfill poly_slug from older column names if they exist
-    if db_has_column(cur, "live_orders", "slug") and db_has_column(cur, "live_orders", "poly_slug"):
-        cur.execute("UPDATE live_orders SET poly_slug = slug WHERE poly_slug IS NULL;")
-
-    if db_has_column(cur, "live_orders", "market_slug") and db_has_column(cur, "live_orders", "poly_slug"):
-        cur.execute("UPDATE live_orders SET poly_slug = market_slug WHERE poly_slug IS NULL;")
-
-    # Backfill action if older column exists
-    if db_has_column(cur, "live_orders", "event") and db_has_column(cur, "live_orders", "action"):
-        cur.execute("UPDATE live_orders SET action = event WHERE action IS NULL;")
-
-    # Ensure NOT NULL where we depend on it going forward (only if the table is empty or already compatible)
-    # We won’t force NOT NULL if existing rows would violate it.
-    cur.execute("SELECT COUNT(*) FROM live_orders WHERE poly_slug IS NULL OR action IS NULL;")
-    bad = cur.fetchone()[0]
-    if bad == 0:
-        cur.execute("ALTER TABLE live_orders ALTER COLUMN poly_slug SET NOT NULL;")
-        cur.execute("ALTER TABLE live_orders ALTER COLUMN action SET NOT NULL;")
-
-    # Drop any old conflicting indexes, then create our idempotency index
-    # (safe: IF EXISTS)
-    cur.execute("DROP INDEX IF EXISTS live_orders_slug_action_idx;")
-    cur.execute("DROP INDEX IF EXISTS live_orders_poly_slug_action_idx;")
-
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS live_orders_poly_slug_action_idx
-        ON live_orders(poly_slug, action);
-        """
-    )
-
-    cur.close()
-    conn.close()
-
-    # If older schema exists with mark instead of price, add price.
-    if not db_has_column(cur, "equity_snapshots", "price"):
-        cur.execute("ALTER TABLE equity_snapshots ADD COLUMN price DOUBLE PRECISION;")
-        cur.execute("UPDATE equity_snapshots SET price = COALESCE(price, 0.0);")
-        cur.execute("ALTER TABLE equity_snapshots ALTER COLUMN price SET NOT NULL;")
-
-    # live_orders table for idempotency (even if you aren’t placing yet)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS live_orders (
-          id SERIAL PRIMARY KEY,
-          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          poly_slug TEXT NOT NULL,
-          action TEXT NOT NULL,
-          token_id TEXT NOT NULL,
-          side TEXT NOT NULL,
-          price DOUBLE PRECISION NOT NULL,
-          size DOUBLE PRECISION NOT NULL,
-          client_order_id TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'submitted'
-        );
-        """
-    )
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS live_orders_slug_action_idx
-        ON live_orders(poly_slug, action);
-        """
-    )
-
-    cur.close()
-    conn.close()
 
 def record_equity_snapshot(price: float, balance: float, position: Optional[str], entry_price: Optional[float],
                           stake: float, unrealized_pnl: float, equity: float, fair_up: Optional[float]):

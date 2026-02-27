@@ -279,7 +279,6 @@ def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]
         if isinstance(x, (list, dict)):
             return x
         if isinstance(x, str):
-            s :contentReference[oaicite:7]{index=7}s:
                 return None
             try:
                 return json.loads(s)

@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Johnny 5 - Polymarket bot (direct trading, hands-free ready)
+Johnny 5 - Polymarket bot (direct trading + auto market selection)
 
-What this file does:
-- Resolve market by slug via Gamma
-- Map outcomes to token IDs (YES/NO or UP/DOWN -> yes/no convention)
-- Read orderbook + midpoints from CLOB public endpoints
-- Compute a signal (hook to your edge logic later)
-- If LIVE_ARMED=true, place signed limit orders directly via py-clob-client
+Key upgrade:
+- If the provided rolling 5m slug resolves to tokens with NO orderbook (404),
+  the bot auto-searches Gamma for a tradable market whose slug contains POLY_PREFIX,
+  validates books exist for BOTH sides, and trades that instead.
 
-Hands-free operation:
-- If your infrastructure already runs this every 5 minutes, you're done.
-- Otherwise set RUN_LOOP=true and (optionally) POLY_PREFIX to auto-compute rolling slugs.
+This is designed to restore "hands-free every 5 minutes" behavior even when some
+rolling windows have no CLOB orderbook.
+
+Trading:
+- Uses py-clob-client to sign & post orders directly (Option A).
+- Orders are ONLY placed when LIVE_ARMED=true.
 
 Docs:
-- Polymarket recommends using SDK clients for signing/auth/submission. (py-clob-client) :contentReference[oaicite:4]{index=4}
-- Auth is 2-level: derive API creds with EIP-712, then use HMAC creds for trading. :contentReference[oaicite:5]{index=5}
+- Trading/auth flow: use SDK clients; derive API creds then trade. 
+- py-clob-client repo/interface. 
 """
 
 from __future__ import annotations
@@ -31,10 +32,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 # ---- Execution client (official) ----
-# pip install py-clob-client
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.order_builder.constants import BUY
 
 
 # -----------------------------
@@ -44,18 +44,14 @@ from py_clob_client.order_builder.constants import BUY, SELL
 GAMMA_HOST = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com").rstrip("/")
 CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com").rstrip("/")
 
-CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon mainnet per docs :contentReference[oaicite:6]{index=6}
+CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon mainnet (typical)
 
 RUN_MODE = os.getenv("RUN_MODE", "LIVE").upper()  # LIVE or PAPER or TEST
 LIVE_MODE = os.getenv("LIVE_MODE", "true").lower() == "true"
 LIVE_ARMED = os.getenv("LIVE_ARMED", "false").lower() == "true"
 
-# Scheduler provides this usually
 POLY_SLUG = os.getenv("POLY_SLUG", "").strip()
-
-# Optional: auto compute rolling slug when running in a loop
-# Example: POLY_PREFIX="btc-updown-5m"
-POLY_PREFIX = os.getenv("POLY_PREFIX", "").strip()
+POLY_PREFIX = os.getenv("POLY_PREFIX", "").strip()  # e.g. btc-updown-5m
 
 RUN_LOOP = os.getenv("RUN_LOOP", "false").lower() == "true"
 LOOP_SLEEP_S = int(os.getenv("LOOP_SLEEP_S", "300"))  # 5 minutes
@@ -67,30 +63,21 @@ HTTP_RETRY_SLEEP_S = float(os.getenv("HTTP_RETRY_SLEEP_S", "0.6"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # ---- Trading config ----
-# Your private key MUST be provided via env var (never paste it here)
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "").strip()
-
-# If you already derived creds, set these (recommended).
 POLY_API_KEY = os.getenv("POLY_API_KEY", "").strip()
 POLY_API_SECRET = os.getenv("POLY_API_SECRET", "").strip()
 POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "").strip()
 
-# Signature type per docs (0 EOA, 1 POLY_PROXY, 2 GNOSIS_SAFE). :contentReference[oaicite:7]{index=7}
 SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "0"))
-
-# Funder address: for EOA type 0, this is usually your wallet address.
-# For proxy/safe accounts, this must be your proxy wallet address. :contentReference[oaicite:8]{index=8}
 FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "").strip()
 
-# Default order sizing (shares)
 ORDER_SIZE_SHARES = float(os.getenv("LIVE_ORDER_SIZE_SHARES", "1.0"))
+TICK_SIZE = float(os.getenv("TICK_SIZE", "0.01"))
 
-# Tick size and negative risk flags (market-specific; keep defaults safe)
-TICK_SIZE = os.getenv("TICK_SIZE", "0.01")
-NEG_RISK = os.getenv("NEG_RISK", "false").lower() == "true"
-
-# Edge threshold placeholder (replace with your real edge)
 EDGE_MIN = float(os.getenv("EDGE_MIN", "0.00"))
+
+# How many Gamma candidates to scan when hunting for a tradable market
+GAMMA_SCAN_LIMIT = int(os.getenv("GAMMA_SCAN_LIMIT", "50"))
 
 
 # -----------------------------
@@ -121,7 +108,7 @@ def http_get_json(url: str, params: Optional[Any] = None) -> Optional[Any]:
                 except Exception:
                     logger.warning("HTTP 200 but JSON decode failed: url=%s params=%s body=%r", url, params, r.text[:200])
                     return None
-            # IMPORTANT: this will explain why you get None midpoints (often 404/no book)
+
             logger.warning("HTTP non-200: url=%s params=%s status=%s body=%r", url, params, r.status_code, r.text[:200])
             return None
         except Exception as e:
@@ -188,7 +175,6 @@ def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]
         elif o in ("NO", "DOWN"):
             no_id = tid
 
-    # positional fallback
     if (yes_id is None or no_id is None) and len(token_ids_str) >= 2:
         if norm[0] in ("YES", "UP") and norm[1] in ("NO", "DOWN"):
             yes_id, no_id = token_ids_str[0], token_ids_str[1]
@@ -241,7 +227,7 @@ def resolve_market(slug: str) -> ResolvedMarket:
 
 
 # -----------------------------
-# CLOB pricing: book + midpoint fallback
+# CLOB book / price helpers
 # -----------------------------
 
 def _parse_price_levels(levels: Any) -> List[float]:
@@ -263,37 +249,117 @@ def _parse_price_levels(levels: Any) -> List[float]:
     return out
 
 
-def clob_book_best(token_id: str) -> Tuple[Optional[float], Optional[float]]:
+def clob_book_best(token_id: str) -> Tuple[Optional[float], Optional[float], bool]:
     """
-    Returns (best_bid, best_ask) for token_id, or (None, None) if missing.
+    Returns (best_bid, best_ask, has_book)
+    has_book==False if CLOB returned 404/no orderbook.
     """
     b = http_get_json(f"{CLOB_HOST}/book", params={"token_id": token_id})
     if not isinstance(b, dict):
-        return None, None
+        return None, None, False
+
     bids = _parse_price_levels(b.get("bids") or [])
     asks = _parse_price_levels(b.get("asks") or [])
     best_bid = max(bids) if bids else None
     best_ask = min(asks) if asks else None
-    return best_bid, best_ask
+    return best_bid, best_ask, True
 
 
-def clob_midpoint(token_id: str) -> Optional[float]:
-    """
-    Try official /midpoint first, then compute from /book.
-    """
-    j = http_get_json(f"{CLOB_HOST}/midpoint", params={"token_id": token_id})
-    if isinstance(j, dict):
-        mp = j.get("mid_price") or j.get("midpoint")
-        if mp is not None:
-            try:
-                return float(mp)
-            except Exception:
-                pass
-
-    best_bid, best_ask = clob_book_best(token_id)
+def midpoint_from_best(best_bid: Optional[float], best_ask: Optional[float]) -> Optional[float]:
     if best_bid is None or best_ask is None:
         return None
     return (best_bid + best_ask) / 2.0
+
+
+# -----------------------------
+# Market selection: ensure tradable
+# -----------------------------
+
+def gamma_search_markets_by_prefix(prefix: str, limit: int) -> List[dict]:
+    """
+    Gamma doesn't have a guaranteed "contains" endpoint, so we do a broad call:
+    - GET /markets?limit=...
+    and then filter slugs client-side.
+
+    This is not perfect, but it's hands-free and works without extra tooling.
+    """
+    # Pull a page of markets and filter by slug substring.
+    j = http_get_json(f"{GAMMA_HOST}/markets", params={"limit": limit})
+    if not isinstance(j, list):
+        return []
+    out = []
+    for m in j:
+        if not isinstance(m, dict):
+            continue
+        s = str(m.get("slug", "")).strip()
+        if prefix in s:
+            out.append(m)
+    # Prefer most recently updated/created if field exists
+    def _score(mk: dict) -> float:
+        for k in ("updatedAt", "updated_at", "createdAt", "created_at"):
+            v = mk.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                # best effort: if ISO, lex sort works for score-ish
+                return float(len(v))
+        return 0.0
+
+    out.sort(key=_score, reverse=True)
+    return out
+
+
+def market_has_books(yes_token: str, no_token: str) -> bool:
+    _, _, yes_has = clob_book_best(yes_token)
+    _, _, no_has = clob_book_best(no_token)
+    return yes_has and no_has
+
+
+def resolve_tradable_market(slug: str, prefix: str) -> ResolvedMarket:
+    """
+    1) Resolve exact slug
+    2) If tokens have no books, hunt within prefix family
+    """
+    rm = resolve_market(slug)
+    if rm.yes_token and rm.no_token:
+        if market_has_books(rm.yes_token, rm.no_token):
+            logger.info("Market is tradable as-is (books exist).")
+            return rm
+        logger.warning("Resolved slug but tokens have no orderbooks; hunting tradable market in prefix=%s", prefix)
+
+    # Hunt
+    candidates = gamma_search_markets_by_prefix(prefix, GAMMA_SCAN_LIMIT)
+    logger.info("Gamma candidate count for prefix=%s: %s", prefix, len(candidates))
+
+    for idx, m in enumerate(candidates, start=1):
+        s = str(m.get("slug", "")).strip()
+        try:
+            yes_token, no_token, outcomes, token_ids = extract_yes_no_token_ids(m)
+            if not yes_token or not no_token:
+                continue
+            if not market_has_books(yes_token, no_token):
+                continue
+
+            market_id = None
+            if "id" in m:
+                market_id = str(m.get("id"))
+            elif "marketId" in m:
+                market_id = str(m.get("marketId"))
+
+            chosen = ResolvedMarket(
+                slug=s,
+                market_id=market_id,
+                outcomes=outcomes,
+                token_ids=token_ids,
+                yes_token=yes_token,
+                no_token=no_token,
+            )
+            logger.info("Selected tradable market #%s slug=%s market_id=%s", idx, chosen.slug, chosen.market_id)
+            return chosen
+        except Exception:
+            continue
+
+    raise RuntimeError(f"No tradable market found for prefix='{prefix}' within last {GAMMA_SCAN_LIMIT} Gamma markets.")
 
 
 # -----------------------------
@@ -301,12 +367,6 @@ def clob_midpoint(token_id: str) -> Optional[float]:
 # -----------------------------
 
 def build_clob_client() -> ClobClient:
-    """
-    Uses py-clob-client, which handles:
-    - L1: derive API creds from private key
-    - L2: authenticated endpoints
-    - EIP-712 order signing and posting
-    """
     if not POLY_PRIVATE_KEY:
         raise RuntimeError("Missing POLY_PRIVATE_KEY env var (required for direct trading).")
 
@@ -314,7 +374,6 @@ def build_clob_client() -> ClobClient:
     if POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE:
         creds = ApiCreds(api_key=POLY_API_KEY, api_secret=POLY_API_SECRET, api_passphrase=POLY_API_PASSPHRASE)
 
-    # Create client (with or without creds)
     client = ClobClient(
         CLOB_HOST,
         CHAIN_ID,
@@ -324,12 +383,9 @@ def build_clob_client() -> ClobClient:
         FUNDER_ADDRESS if FUNDER_ADDRESS else None,
     )
 
-    # If creds not provided, derive them (recommended flow per docs). :contentReference[oaicite:9]{index=9}
     if creds is None:
         derived = client.create_or_derive_api_creds()
-        logger.info("Derived API creds (store these as env vars for stability): apiKey=%s passphrase=%s", derived.api_key, derived.api_passphrase)
-        # IMPORTANT: secret is sensitive; we do not print it. Set it from your logs/tools where you capture it safely.
-        # Rebuild client with derived creds
+        logger.info("Derived API creds (store as env vars): apiKey=%s passphrase=%s", derived.api_key, derived.api_passphrase)
         client = ClobClient(
             CLOB_HOST,
             CHAIN_ID,
@@ -343,20 +399,15 @@ def build_clob_client() -> ClobClient:
 
 
 # -----------------------------
-# Signal / edge placeholder
+# Edge placeholder
 # -----------------------------
 
 def compute_signal(p_yes: float, p_no: float) -> str:
-    """
-    Placeholder. Replace with your real edge logic.
-    """
     if not (0.0 < p_yes < 1.0 and 0.0 < p_no < 1.0):
         return "NO"
     s = p_yes + p_no
     if s < 0.90 or s > 1.10:
         return "NO"
-
-    # Example only:
     if p_yes < 0.48 - EDGE_MIN:
         return "BUY_YES"
     if p_no < 0.48 - EDGE_MIN:
@@ -364,17 +415,13 @@ def compute_signal(p_yes: float, p_no: float) -> str:
     return "NO"
 
 
-# -----------------------------
-# Slug helpers (optional hands-free loop)
-# -----------------------------
+def round_to_tick(px: float) -> float:
+    if TICK_SIZE <= 0:
+        return px
+    return round(px / TICK_SIZE) * TICK_SIZE
+
 
 def compute_current_5m_slug(prefix: str) -> str:
-    """
-    Rolling markets in your system look like: <prefix>-<endEpoch>
-    Example observed: btc-updown-5m-1772219700
-
-    We compute the NEXT 5-min boundary end timestamp in UNIX seconds.
-    """
     now = int(time.time())
     end_ts = ((now // 300) * 300) + 300
     return f"{prefix}-{end_ts}"
@@ -384,29 +431,28 @@ def compute_current_5m_slug(prefix: str) -> str:
 # Execute one cycle
 # -----------------------------
 
-def run_once(slug: str, client: Optional[ClobClient]) -> None:
-    rm = resolve_market(slug)
+def run_once(slug: str, prefix: str, client: Optional[ClobClient]) -> None:
+    rm = resolve_tradable_market(slug, prefix)
+
     logger.info(
-        "resolved_market slug=%s market_id=%s outcomes=%s yes_token=%s no_token=%s",
+        "resolved_tradable_market slug=%s market_id=%s outcomes=%s yes_token=%s no_token=%s",
         rm.slug, rm.market_id, rm.outcomes, rm.yes_token, rm.no_token
     )
 
-    if not rm.yes_token or not rm.no_token:
-        raise RuntimeError(f"Could not map outcome tokens for slug={slug} outcomes={rm.outcomes}")
+    assert rm.yes_token and rm.no_token
 
-    # Prefer book best bid/ask; midpoint as fallback
-    yes_bid, yes_ask = clob_book_best(rm.yes_token)
-    no_bid, no_ask = clob_book_best(rm.no_token)
+    yes_bid, yes_ask, _ = clob_book_best(rm.yes_token)
+    no_bid, no_ask, _ = clob_book_best(rm.no_token)
 
-    p_yes = clob_midpoint(rm.yes_token)
-    p_no = clob_midpoint(rm.no_token)
+    p_yes = midpoint_from_best(yes_bid, yes_ask)
+    p_no = midpoint_from_best(no_bid, no_ask)
 
     if p_yes is None or p_no is None:
-        logger.warning("No usable prices (midpoints) for this window (yes=%s no=%s). Likely no book/liquidity.", p_yes, p_no)
+        logger.warning("Books exist but one side empty; skipping (yes_mid=%s no_mid=%s)", p_yes, p_no)
         return
 
     logger.info(
-        "prices yes_mid=%.6f no_mid=%.6f sum=%.6f | yes(bid=%s ask=%s) no(bid=%s ask=%s)",
+        "book_mid yes=%.6f no=%.6f sum=%.6f | yes(bid=%s ask=%s) no(bid=%s ask=%s)",
         p_yes, p_no, (p_yes + p_no),
         f"{yes_bid:.6f}" if yes_bid is not None else None,
         f"{yes_ask:.6f}" if yes_ask is not None else None,
@@ -417,30 +463,19 @@ def run_once(slug: str, client: Optional[ClobClient]) -> None:
     signal = compute_signal(p_yes, p_no)
     logger.info("signal=%s", signal)
 
-    # Gate trading
     if not LIVE_MODE or RUN_MODE != "LIVE" or not LIVE_ARMED:
         logger.info("Not armed (live_mode=%s run_mode=%s live_armed=%s). No orders will be placed.", LIVE_MODE, RUN_MODE, LIVE_ARMED)
         return
 
     if client is None:
-        raise RuntimeError("LIVE_ARMED=true but trading client is not initialized.")
-
-    # Choose an executable limit price using the book:
-    # - BUY: cross to best ask if available (more likely to fill)
-    # - Otherwise: use midpoint rounded to tick
-    def round_to_tick(px: float) -> float:
-        try:
-            t = float(TICK_SIZE)
-            return round(px / t) * t
-        except Exception:
-            return px
+        raise RuntimeError("LIVE_ARMED=true but trading client not initialized.")
 
     if signal == "BUY_YES":
         px = yes_ask if yes_ask is not None else p_yes
         px = round_to_tick(px)
         order = OrderArgs(token_id=rm.yes_token, price=px, size=ORDER_SIZE_SHARES, side=BUY)
         signed = client.create_order(order)
-        resp = client.post_order(signed, OrderType.GTC)  # stable interface :contentReference[oaicite:10]{index=10}
+        resp = client.post_order(signed, OrderType.GTC)
         logger.info("ORDER BUY_YES posted price=%.6f size=%.4f resp=%s", px, ORDER_SIZE_SHARES, resp)
 
     elif signal == "BUY_NO":
@@ -466,8 +501,9 @@ def main() -> None:
         RUN_MODE, LIVE_MODE, LIVE_ARMED, RUN_LOOP, POLY_SLUG, POLY_PREFIX
     )
 
-    # Only initialize trading client if we might trade
+    prefix = POLY_PREFIX or "btc-updown-5m"
     client: Optional[ClobClient] = None
+
     if LIVE_MODE and RUN_MODE == "LIVE" and LIVE_ARMED:
         client = build_clob_client()
         logger.info("Trading client initialized (direct).")
@@ -475,21 +511,18 @@ def main() -> None:
     def get_slug() -> str:
         if POLY_SLUG:
             return POLY_SLUG
-        if POLY_PREFIX:
-            return compute_current_5m_slug(POLY_PREFIX)
-        raise RuntimeError("No POLY_SLUG provided and POLY_PREFIX is empty. Provide one.")
+        return compute_current_5m_slug(prefix)
 
     if not RUN_LOOP:
         slug = sys.argv[1].strip() if len(sys.argv) >= 2 and sys.argv[1].strip() else get_slug()
-        run_once(slug, client)
+        run_once(slug, prefix, client)
         logger.info("BOOT: bot.py finished cleanly")
         return
 
-    # Hands-free loop mode
     while True:
         try:
             slug = get_slug()
-            run_once(slug, client)
+            run_once(slug, prefix, client)
         except Exception as e:
             logger.exception("Cycle error: %s", e)
         time.sleep(LOOP_SLEEP_S)

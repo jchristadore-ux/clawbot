@@ -260,13 +260,15 @@ def gamma_search(query: str) -> Optional[dict]:
 
 def fetch_gamma_market_and_tokens(poly_slug: str):
     """
-    Gamma resolver (no Bun dependency) that finds rolling 5m markets by LISTING markets and matching slugs.
+    Gamma resolver (no Bun dependency) that handles multiple slug shapes.
 
-    Why: /markets?slug=<rolling> is often empty for these rolling windows, so we:
-      - Determine prefix (e.g., btc-updown-5m)
-      - Determine target end_epoch from poly_slug
-      - Page through GET /markets ordered by createdAt desc
-      - Find the market whose slug starts with prefix and ends with our end_epoch
+    Why this patch:
+      - Your bot builds poly_slug as start-end (e.g., btc-updown-5m-<start>-<end>)
+      - Gamma often uses end-only slugs for rolling buckets (e.g., btc-updown-5m-<end>)
+      - So we try candidate slug shapes first, then list+match by prefix + end epoch containment.
+
+    Requires:
+      - extract_yes_no_token_ids(market) -> (yes_id, no_id)
     """
     import os
     import re
@@ -280,8 +282,28 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
     def _prefix(slug: str):
         return re.sub(r"(-\d{9,12}){1,2}$", "", (slug or "").strip())
 
+    def _gamma_get_market_by_slug_exact(slug: str):
+        slug = (slug or "").strip()
+        if not slug:
+            return None
+
+        # /markets?slug= returns list
+        r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, list) and j:
+                return j[0]
+
+        # fallback: /markets/slug/<slug> returns object
+        r2 = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=20)
+        if r2.status_code == 200:
+            j2 = r2.json()
+            if isinstance(j2, dict) and j2:
+                return j2
+
+        return None
+
     def _gamma_list_markets(limit: int = 200, offset: int = 0):
-        # List markets supports pagination + ordering. :contentReference[oaicite:1]{index=1}
         params = {
             "limit": limit,
             "offset": offset,
@@ -293,44 +315,77 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         j = r.json()
         return j if isinstance(j, list) else []
 
-    def _gamma_get_market_by_slug_exact(slug: str):
-        slug = (slug or "").strip()
-        if not slug:
-            return None
-        r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
-        if r.status_code == 200:
-            j = r.json()
-            if isinstance(j, list) and j:
-                return j[0]
-        r2 = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=20)
-        if r2.status_code == 200:
-            j2 = r2.json()
-            if isinstance(j2, dict) and j2:
-                return j2
-        return None
-
     # --- Targets
     env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
     pfx = _prefix(env_base) or _prefix(poly_slug)
-    pe = _epochs(poly_slug)
-    target_end = pe[-1] if len(pe) >= 2 else (pe[-1] if pe else None)
+
+    e = _epochs(poly_slug)
+    start_epoch = e[0] if len(e) >= 1 else None
+    end_epoch = e[-1] if len(e) >= 2 else (e[-1] if e else None)
 
     tried = []
     tried.append(("prefix", pfx))
-    tried.append(("target_end", target_end))
+    tried.append(("start_epoch", start_epoch))
+    tried.append(("end_epoch", end_epoch))
 
-    # 1) Cheap try: exact slug (sometimes works)
-    tried.append(("by_slug", poly_slug))
-    m = _gamma_get_market_by_slug_exact(poly_slug)
-    if m:
-        y, n = extract_yes_no_token_ids(m)
-        if y and n:
-            return m, y, n
+    # 1) Try a set of exact slug candidates (covers start-end vs end-only variants)
+    candidates = []
 
-    # 2) Scan recent markets until we find matching rolling end epoch
+    # the slug you generate
+    if poly_slug:
+        candidates.append(poly_slug)
+
+    # end-only slug (common)
+    if pfx and end_epoch:
+        candidates.append(f"{pfx}-{end_epoch}")
+
+    # env_base might be start-only; try stitching it to end
+    if env_base and end_epoch and env_base.endswith(str(start_epoch or "")):
+        candidates.append(f"{env_base}-{end_epoch}")
+
+    # if env_base already has a start epoch, try start-end explicitly
+    if pfx and start_epoch and end_epoch:
+        candidates.append(f"{pfx}-{start_epoch}-{end_epoch}")
+
+    # de-dupe while preserving order
+    seen = set()
+    candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
+
+    for slug in candidates:
+        tried.append(("by_slug", slug))
+        m = _gamma_get_market_by_slug_exact(slug)
+        if m:
+            y, n = extract_yes_no_token_ids(m)
+            if y and n:
+                return m, y, n
+
+    # 2) List recent markets and match by prefix + end_epoch containment (not strict endswith)
+    # If the market exists, it will be among relatively recent createdAt entries.
     best = None  # (score, market)
-    pages = 10   # 10 * 200 = 2000 markets scanned max (fast enough)
+    pages = 50   # 50 * 200 = 10,000 markets max
     limit = 200
+
+    def _score_slug(mslug: str):
+        if not mslug:
+            return 0
+        if not mslug.startswith(pfx):
+            return 0
+
+        score = 10  # base prefix match
+
+        # prefer slugs containing end epoch anywhere (end-only or windowed)
+        if end_epoch and str(end_epoch) in mslug:
+            score += 80
+
+        # bonus if also contains start epoch (windowed slugs)
+        if start_epoch and str(start_epoch) in mslug:
+            score += 15
+
+        # bonus if looks exactly like end-only format
+        if end_epoch and mslug == f"{pfx}-{end_epoch}":
+            score += 25
+
+        return score
 
     for page in range(pages):
         offset = page * limit
@@ -341,33 +396,14 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
 
         for cand in mkts:
             slug = (cand.get("slug") or "").strip()
-            if not slug or not slug.startswith(pfx):
+            sc = _score_slug(slug)
+            if sc <= 0:
                 continue
+            if best is None or sc > best[0]:
+                best = (sc, cand)
 
-            e = _epochs(slug)
-            if len(e) < 2:
-                continue
-            cand_end = e[-1]
-
-            # scoring: exact end match wins
-            score = 0
-            if target_end and cand_end == target_end:
-                score = 100
-            else:
-                # otherwise prefer “closest” end epoch numerically (fallback)
-                if target_end:
-                    try:
-                        score = 50 - min(50, abs(int(cand_end) - int(target_end)) // 60)
-                    except Exception:
-                        score = 1
-                else:
-                    score = 1
-
-            if best is None or score > best[0]:
-                best = (score, cand)
-
-        # if we found exact end match, stop early
-        if best and best[0] >= 100:
+        # stop early if we have a very strong match
+        if best and best[0] >= 110:
             break
 
     if best:
@@ -378,7 +414,8 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
 
     raise RuntimeError(
         "Gamma market/token resolution failed. "
-        f"poly_slug='{poly_slug}' env_base='{env_base}' prefix='{pfx}' target_end='{target_end}' tried={tried}"
+        f"poly_slug='{poly_slug}' env_base='{env_base}' prefix='{pfx}' "
+        f"start_epoch='{start_epoch}' end_epoch='{end_epoch}' tried={tried}"
     )
 
 def extract_yes_no_token_ids(market: dict):

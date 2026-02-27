@@ -47,19 +47,24 @@ def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
     bucket = int(ts // 300) * 300
     return bucket
 
+import os, re, time
+
+def five_min_bucket_epoch(now: int | None = None) -> int:
+    now = now or int(time.time())
+    return (now // 300) * 300  # start of the current 5-minute window
 
 def make_poly_slug() -> str:
-    base = os.getenv("POLY_MARKET_SLUG", "").strip()
-    event = os.getenv("POLY_EVENT_SLUG", "").strip()
+    base = (os.getenv("POLY_MARKET_SLUG") or "").strip()
+    event = (os.getenv("POLY_EVENT_SLUG") or "").strip()
     if not base and not event:
         raise RuntimeError("Missing POLY_MARKET_SLUG or POLY_EVENT_SLUG")
 
-    # Your “idempotency slug” includes the 5m bucket epoch
-    bucket = five_min_bucket_epoch()
-    if base:
-        return f"{base}-{bucket}"
-    return f"{event}-{bucket}"
+    prefix = base or event
 
+    # Strip 1 or 2 trailing 10-digit epochs if present (fat-finger protection)
+    prefix = re.sub(r"(-\d{10}){1,2}$", "", prefix)
+
+    return f"{prefix}-{five_min_bucket_epoch()}"
 
 def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 20) -> Optional[dict]:
     try:

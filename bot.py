@@ -324,10 +324,10 @@ def record_equity_snapshot(price: float, balance: float, position: Optional[str]
 
     # your DB expects "price" NOT NULL; do not insert "mark"
     #cur.execute("""
-        INSERT INTO equity_snapshots (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        """,
-        (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up),
+        #INSERT INTO equity_snapshots (price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up)
+        #VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        #""",
+        #(price, balance, position, entry_price, stake, unrealized_pnl, equity, fair_up),
     #cur.close()
     #conn.close()
 

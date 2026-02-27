@@ -98,15 +98,15 @@ def db_conn():
 def ensure_tables():
     """
     Fixes:
-      psycopg2.errors.UndefinedColumn: column "as_of_date" of relation "bot_state" does not exist
+      psycopg2.errors.UndefinedColumn: column "stake" does not exist
 
-    Root cause: you're still running an older ensure_tables() that inserts into as_of_date
-    before ensuring that column exists (and/or still uses ON CONFLICT).
+    Root cause: load_state() selects columns that your existing bot_state table
+    doesn't have yet (stake, trades_today, pnl_today_realized, etc).
 
-    This version:
+    This patch:
       - Ensures bot_state exists
-      - Adds missing columns (including as_of_date) using ADD COLUMN IF NOT EXISTS
-      - Inserts id=1 row WITHOUT ON CONFLICT (so no PK/unique requirements)
+      - Adds ALL columns that load_state() expects
+      - Ensures id=1 row exists (no ON CONFLICT required)
     """
     import os
     import psycopg2
@@ -115,28 +115,39 @@ def ensure_tables():
     conn.autocommit = True
     cur = conn.cursor()
 
-    # Ensure table exists
+    # Ensure table exists (empty stub is fine; we'll add columns)
     cur.execute("CREATE TABLE IF NOT EXISTS bot_state ();")
 
-    # Ensure required columns exist (idempotent)
+    # Core identity / timing
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS id INTEGER;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS as_of_date DATE;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;")
+    cur.execute("ALTER TABLE bot_state ALTER COLUMN updated_at SET DEFAULT NOW();")
+
+    # Position state
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS position TEXT;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_price DOUBLE PRECISION;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_ts TIMESTAMPTZ;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_action TEXT;")
-    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;")
 
-    # Backfill updated_at default for new rows (safe if column already existed)
-    cur.execute("""
-        ALTER TABLE bot_state
-        ALTER COLUMN updated_at SET DEFAULT NOW();
-    """)
+    # Fields your load_state() is selecting
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS stake DOUBLE PRECISION;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS trades_today INTEGER;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS pnl_today_realized DOUBLE PRECISION;")
 
-    # Ensure single row exists (NO ON CONFLICT)
+    # Helpful extras (won't hurt if unused)
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_trade_ts TIMESTAMPTZ;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS equity DOUBLE PRECISION;")
+
+    # Ensure single row exists (NO ON CONFLICT to avoid PK/unique assumptions)
     cur.execute("""
-        INSERT INTO bot_state (id, as_of_date, position, entry_price, entry_ts, last_action)
-        SELECT 1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT'
+        INSERT INTO bot_state (
+            id, as_of_date, position, entry_price, entry_ts, last_action,
+            stake, trades_today, pnl_today_realized, updated_at
+        )
+        SELECT
+            1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT',
+            NULL, 0, 0.0, NOW()
         WHERE NOT EXISTS (SELECT 1 FROM bot_state WHERE id = 1);
     """)
 

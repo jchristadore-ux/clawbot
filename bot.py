@@ -408,10 +408,24 @@ def clob_midpoint(token_id: str) -> Tuple[int, Optional[float], str]:
     except Exception:
         return code, None, text
 
+def has_live_book(token_id: str) -> Tuple[bool, int]:
+    """
+    Returns (has_book, http_status)
+    200 => endpoint exists for token (book exists / tradable)
+    404 => no orderbook exists for token
+    """
+    url = f"{POLY_CLOB_HOST}/book"
+    code, j, text = http_get_json(url, params={"token_id": token_id}, timeout=10)
 
-def has_live_book(token_id: str) -> bool:
-    code, mp, _ = clob_midpoint(token_id)
-    return code == 200 and mp is not None
+    # /book is the strongest existence check
+    if code == 200:
+        return True, code
+
+    # Log unusual cases for debugging (rate limit, etc.)
+    if code not in (404, 400):
+        log.warning("CLOB /book unexpected status=%s token_id=%s body=%s", code, token_id, text[:200])
+
+    return False, code
 
 def resolve_tradable_rolling_market(
     base_slug: str,
@@ -426,6 +440,14 @@ def resolve_tradable_rolling_market(
         log.info("Checking slug=%s", slug)
 
         m = fetch_gamma_market_by_slug(slug)
+        log.info(
+            "Gamma market: slug=%s enableOrderBook=%s active=%s closed=%s",
+            slug,
+            m.get("enableOrderBook"),
+            m.get("active"),
+            m.get("closed"),
+        )
+        
         if not m:
             log.info("Gamma miss for slug=%s", slug)
             continue
@@ -442,16 +464,16 @@ def resolve_tradable_rolling_market(
             )
             continue
 
-        y_ok = has_live_book(yes_id)
-        n_ok = has_live_book(no_id)
+        y_ok, y_code = has_live_book(yes_id)
+        n_ok, n_code = has_live_book(no_id)
 
         if y_ok and n_ok:
             log.info("Found tradable slug=%s", slug)
             return slug, m, yes_id, no_id
 
         log.info(
-            "No live books for slug=%s (yes_ok=%s no_ok=%s)",
-            slug, y_ok, n_ok
+            "No live books for slug=%s (yes=%s code=%s no=%s code=%s)",
+            slug, yes_id, y_code, no_id, n_code
         )
 
     return None, None, None, None

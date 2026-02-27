@@ -5,7 +5,7 @@ import math
 import logging
 import re
 from datetime import datetime, timezone, date
-from typing import Optional, Dict, Any, Tuple, Union
+from typing import Optional, Dict, Any, Tuple
 
 import requests
 import psycopg2
@@ -69,9 +69,7 @@ def make_poly_slug() -> str:
         raise RuntimeError("Missing POLY_MARKET_SLUG or POLY_EVENT_SLUG")
 
     prefix = base or event
-
-    # Strip 1 or 2 trailing 10-digit epochs if present
-    prefix = re.sub(r"(-\d{10}){1,2}$", "", prefix)
+    prefix = re.sub(r"(-\d{10}){1,2}$", "", prefix)  # strip trailing epoch(s)
 
     return f"{prefix}-{five_min_bucket_epoch()}"
 
@@ -80,7 +78,7 @@ def http_get_json(
     url: str,
     params: Optional[dict] = None,
     headers: Optional[dict] = None,
-    timeout: int = 20
+    timeout: int = 20,
 ) -> Optional[dict]:
     try:
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -95,7 +93,7 @@ def http_post_json(
     url: str,
     payload: dict,
     headers: Optional[dict] = None,
-    timeout: int = 25
+    timeout: int = 25,
 ) -> Tuple[int, Optional[dict], str]:
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -123,16 +121,8 @@ def db_conn():
 
 def ensure_tables():
     """
-    Fixes:
-      psycopg2.errors.UndefinedColumn: column "stake" does not exist
-
-    Root cause: load_state() selects columns that your existing bot_state table
-    doesn't have yet (stake, trades_today, pnl_today_realized, etc).
-
-    This patch:
-      - Ensures bot_state exists
-      - Adds ALL columns that load_state() expects
-      - Ensures id=1 row exists (no ON CONFLICT required)
+    Ensures bot_state exists and has all columns load_state/save_state expect.
+    Also ensures equity_snapshots exists for record_equity_snapshot.
     """
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     conn.autocommit = True
@@ -153,35 +143,28 @@ def ensure_tables():
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_ts TIMESTAMPTZ;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_action TEXT;")
 
-    # Fields your load_state() is selecting
+    # Fields expected by load_state()
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS stake DOUBLE PRECISION;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS trades_today INTEGER;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS pnl_today_realized DOUBLE PRECISION;")
 
-    # Helpful extras (won't hurt if unused)
+    # Helpful extras (safe if unused)
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_trade_ts TIMESTAMPTZ;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS equity DOUBLE PRECISION;")
 
-    # Ensure single row exists (NO ON CONFLICT to avoid PK/unique assumptions)
+    # Ensure single row exists
     cur.execute("""
         INSERT INTO bot_state (
             id, as_of_date, position, entry_price, entry_ts, last_action,
             stake, trades_today, pnl_today_realized, updated_at
         )
         SELECT
-            1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT',
-            NULL, 0, 0.0, NOW()
+            1, CURRENT_DATE, NULL, NULL, NULL, 'BOOT',
+            0.0, 0, 0.0, NOW()
         WHERE NOT EXISTS (SELECT 1 FROM bot_state WHERE id = 1);
     """)
 
-    cur.close()
-    conn.close()
-
-    # equity_snapshots table (required by record_equity_snapshot)
-    # Safe to run even if it already exists.
-    conn = psycopg2.connect(os.environ["DATABASE_URL"])
-    conn.autocommit = True
-    cur = conn.cursor()
+    # equity snapshots table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS equity_snapshots (
             id SERIAL PRIMARY KEY,
@@ -196,6 +179,7 @@ def ensure_tables():
             poly_slug TEXT
         );
     """)
+
     cur.close()
     conn.close()
 
@@ -225,7 +209,10 @@ def _maybe_json_list(x):
 def load_state() -> Dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT as_of_date, position, entry_price, stake, trades_today, pnl_today_realized FROM bot_state WHERE id=1;")
+            cur.execute(
+                "SELECT as_of_date, position, entry_price, stake, trades_today, pnl_today_realized "
+                "FROM bot_state WHERE id=1;"
+            )
             row = cur.fetchone()
             if not row:
                 return {
@@ -252,7 +239,7 @@ def save_state(state: Dict[str, Any]) -> None:
             cur.execute(
                 """
                 UPDATE bot_state
-                SET as_of_date=%s, position=%s, entry_price=%s, stake=%s, trades_today=%s, pnl_today_realized=%s
+                SET as_of_date=%s, position=%s, entry_price=%s, stake=%s, trades_today=%s, pnl_today_realized=%s, updated_at=NOW()
                 WHERE id=1;
                 """,
                 (
@@ -275,7 +262,7 @@ def record_equity_snapshot(
     stake: float,
     unrealized_pnl: float,
     equity: float,
-    poly_slug: str
+    poly_slug: str,
 ) -> None:
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -295,233 +282,11 @@ def record_equity_snapshot(
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
-# Important:
-# - POLY_MARKET_SLUG is your base slug (e.g., btc-updown-5m)
-# - POLY_GAMMA_SLUG should be the *actual* Gamma market slug (often different)
+# Note:
+# - POLY_MARKET_SLUG should be base (btc-updown-5m) WITHOUT epoch.
+# - POLY_GAMMA_SLUG optional; if set, should also be base WITHOUT epoch.
 POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
 POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip() or POLY_MARKET_SLUG
-
-
-def fetch_gamma_market_by_slug(slug: str) -> Optional[dict]:
-    url = f"{POLY_GAMMA_HOST}/markets/slug/{slug}"
-    return http_get_json(url)
-
-
-def gamma_search(query: str) -> Optional[dict]:
-    url = f"{POLY_GAMMA_HOST}/search"
-    return http_get_json(url, params={"query": query})
-
-def fetch_gamma_market_and_tokens(poly_slug: str):
-    """
-    Gamma resolver that supports:
-      - Market-by-slug lookup
-      - Event-by-slug lookup (CRITICAL for 5-minute up/down pages)
-      - Fallback discovery via /events (recommended by Gamma docs)
-
-    Returns dict in the shape main() expects:
-      {
-        "market": <market_obj>,
-        "yes_token_id": "...",
-        "no_token_id": "...",
-        "slug": "<market_slug>"
-      }
-    """
-    GAMMA_BASE = POLY_GAMMA_HOST
-
-    def _epochs(slug: str):
-        return re.findall(r"\d{9,12}", slug or "")
-
-    def _prefix(slug: str):
-        return re.sub(r"(-\d{9,12}){1,2}$", "", (slug or "").strip())
-
-    def _gamma_get_market_by_slug_exact(slug: str):
-        slug = (slug or "").strip()
-        if not slug:
-            return None
-
-        # /markets?slug= returns list
-        r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
-        if r.status_code == 200:
-            j = r.json()
-            if isinstance(j, list) and j:
-                return j[0]
-
-        # fallback: /markets/slug/<slug> returns object
-        r2 = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=20)
-        if r2.status_code == 200:
-            j2 = r2.json()
-            if isinstance(j2, dict) and j2:
-                return j2
-
-        return None
-
-    def _gamma_get_event_by_slug_exact(slug: str):
-        slug = (slug or "").strip()
-        if not slug:
-            return None
-
-        # /events?slug= returns list
-        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=20)
-        if r.status_code == 200:
-            j = r.json()
-            if isinstance(j, list) and j:
-                return j[0]
-
-        # fallback: /events/slug/<slug> returns object
-        r2 = requests.get(f"{GAMMA_BASE}/events/slug/{slug}", timeout=20)
-        if r2.status_code == 200:
-            j2 = r2.json()
-            if isinstance(j2, dict) and j2:
-                return j2
-
-        return None
-
-    def _event_pick_market(ev: dict) -> Optional[dict]:
-        """
-        Gamma event objects typically include markets. Handle a couple shapes.
-        """
-        if not ev or not isinstance(ev, dict):
-            return None
-
-        markets = ev.get("markets")
-
-        # Sometimes markets is JSON string or list
-        markets = _maybe_json_list(markets) if not isinstance(markets, list) else markets
-
-        if isinstance(markets, list) and markets:
-            # Choose the first market; for a 2-outcome event this is usually correct.
-            # If you later want to be picky: pick the one with outcomes containing Up/Down or Yes/No.
-            return markets[0]
-
-        return None
-
-    def _gamma_list_events(limit: int = 200, offset: int = 0):
-        # Per Gamma docs: prefer events endpoint for broad discovery
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": offset,
-            "order": "start_date",
-            "ascending": "false",
-        }
-        r = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=25)
-        r.raise_for_status()
-        j = r.json()
-        return j if isinstance(j, list) else []
-
-    # --- Targets
-    env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
-    pfx = _prefix(env_base) or _prefix(poly_slug)
-
-    e = _epochs(poly_slug)
-    start_epoch = e[0] if len(e) >= 1 else None
-    end_epoch = e[-1] if len(e) >= 2 else (e[-1] if e else None)
-
-    tried = []
-    tried.append(("prefix", pfx))
-    tried.append(("start_epoch", start_epoch))
-    tried.append(("end_epoch", end_epoch))
-
-    # Candidate slugs to try directly
-    candidates = []
-    if pfx and start_epoch:
-        candidates.append(f"{pfx}-{start_epoch}")
-    if pfx and end_epoch:
-        candidates.append(f"{pfx}-{end_epoch}")
-    if poly_slug:
-        candidates.append(poly_slug)
-
-    # de-dupe preserve order
-    seen = set()
-    candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
-
-    # 1) Try MARKET by slug, then EVENT by slug
-    for slug in candidates:
-        tried.append(("market_by_slug", slug))
-        m = _gamma_get_market_by_slug_exact(slug)
-        if m:
-            y, n = extract_yes_no_token_ids(m)
-            if y and n:
-                return {"market": m, "yes_token_id": y, "no_token_id": n, "slug": m.get("slug") or slug}
-
-        tried.append(("event_by_slug", slug))
-        ev = _gamma_get_event_by_slug_exact(slug)
-        if ev:
-            m2 = _event_pick_market(ev)
-            if m2:
-                y, n = extract_yes_no_token_ids(m2)
-                if y and n:
-                    return {"market": m2, "yes_token_id": y, "no_token_id": n, "slug": m2.get("slug") or ""}
-
-    # 2) Fallback: scan recent EVENTS and score by prefix + near-epoch match
-    best = None  # (score, market_obj, event_slug)
-    pages = 50
-    limit = 200
-
-    def _extract_last_epoch(s: str) -> Optional[int]:
-        nums = re.findall(r"\d{9,12}", s or "")
-        if not nums:
-            return None
-        try:
-            return int(nums[-1])
-        except Exception:
-            return None
-
-    def _score_event(ev: dict) -> int:
-        if not ev or not isinstance(ev, dict):
-            return 0
-        eslug = (ev.get("slug") or "").strip()
-        if not eslug or not pfx or not eslug.startswith(pfx):
-            return 0
-
-        score = 10
-        ep = _extract_last_epoch(eslug)
-
-        # Strong match if exact epoch matches
-        if ep is not None and start_epoch is not None and ep == int(start_epoch):
-            score += 100
-
-        # Also accept +/- 300s tolerance (sometimes your cron and their creation tick differ)
-        if ep is not None and start_epoch is not None:
-            if abs(ep - int(start_epoch)) == 300:
-                score += 70
-            elif abs(ep - int(start_epoch)) == 600:
-                score += 40
-
-        return score
-
-    for page in range(pages):
-        offset = page * limit
-        tried.append(("list_events_offset", offset))
-        evs = _gamma_list_events(limit=limit, offset=offset)
-        if not evs:
-            break
-
-        for ev in evs:
-            sc = _score_event(ev)
-            if sc <= 0:
-                continue
-            m = _event_pick_market(ev)
-            if not m:
-                continue
-            if best is None or sc > best[0]:
-                best = (sc, m, (ev.get("slug") or "").strip())
-
-        if best and best[0] >= 110:
-            break
-
-    if best:
-        m3 = best[1]
-        y, n = extract_yes_no_token_ids(m3)
-        if y and n:
-            return {"market": m3, "yes_token_id": y, "no_token_id": n, "slug": m3.get("slug") or ""}
-
-    raise RuntimeError(
-        "Gamma market/token resolution failed. "
-        f"poly_slug='{poly_slug}' env_base='{env_base}' prefix='{pfx}' "
-        f"start_epoch='{start_epoch}' end_epoch='{end_epoch}' tried={tried}"
-    )
 
 
 def extract_yes_no_token_ids(market: dict):
@@ -564,6 +329,226 @@ def extract_yes_no_token_ids(market: dict):
         return (str(token_ids[0]), str(token_ids[1]))
 
     return (None, None)
+
+
+def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
+    """
+    Gamma resolver for rolling 5-minute BTC up/down markets.
+
+    Key behaviors:
+      - Tries MARKET by slug first.
+      - If not found, tries EVENT by slug (5m slugs are often event slugs).
+      - If event doesn't embed markets, fetches markets by event_id.
+      - Fallback scan uses /events with MINIMAL params (limit/offset only) to avoid 422.
+
+    Returns dict for main():
+      {
+        "market": <market_obj>,
+        "yes_token_id": "...",
+        "no_token_id": "...",
+        "slug": "<market_slug or event-derived slug>"
+      }
+    """
+    GAMMA_BASE = POLY_GAMMA_HOST
+
+    def _epochs(slug: str):
+        return re.findall(r"\d{9,12}", slug or "")
+
+    def _prefix(slug: str):
+        return re.sub(r"(-\d{9,12}){1,2}$", "", (slug or "").strip())
+
+    def _gamma_get_market_by_slug_exact(slug: str):
+        slug = (slug or "").strip()
+        if not slug:
+            return None
+
+        r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, list) and j:
+                return j[0]
+
+        r2 = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=20)
+        if r2.status_code == 200:
+            j2 = r2.json()
+            if isinstance(j2, dict) and j2:
+                return j2
+
+        return None
+
+    def _gamma_get_event_by_slug_exact(slug: str):
+        slug = (slug or "").strip()
+        if not slug:
+            return None
+
+        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, list) and j:
+                return j[0]
+
+        r2 = requests.get(f"{GAMMA_BASE}/events/slug/{slug}", timeout=20)
+        if r2.status_code == 200:
+            j2 = r2.json()
+            if isinstance(j2, dict) and j2:
+                return j2
+
+        return None
+
+    def _gamma_get_markets_by_event_id(event_id: Any):
+        if event_id is None:
+            return []
+        r = requests.get(f"{GAMMA_BASE}/markets", params={"event_id": str(event_id)}, timeout=20)
+        if r.status_code != 200:
+            return []
+        j = r.json()
+        return j if isinstance(j, list) else []
+
+    def _event_pick_market(ev: dict) -> Optional[dict]:
+        if not ev or not isinstance(ev, dict):
+            return None
+
+        markets = ev.get("markets")
+        markets = markets if isinstance(markets, list) else _maybe_json_list(markets)
+
+        if isinstance(markets, list) and markets:
+            return markets[0]
+
+        # If event doesn't embed markets, try event_id -> markets
+        eid = ev.get("id") or ev.get("event_id") or ev.get("eventId")
+        if eid:
+            mkts = _gamma_get_markets_by_event_id(eid)
+            if mkts:
+                return mkts[0]
+
+        return None
+
+    # This is the 422-safe events pager: ONLY limit/offset.
+    def _gamma_list_events(limit: int = 200, offset: int = 0):
+        params = {"limit": int(limit), "offset": int(offset)}
+        r = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=25)
+        if r.status_code != 200:
+            return []
+        j = r.json()
+        return j if isinstance(j, list) else []
+
+    # --- Targets
+    env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
+    pfx = _prefix(env_base) or _prefix(poly_slug)
+
+    e = _epochs(poly_slug)
+    start_epoch = e[0] if len(e) >= 1 else None
+    end_epoch = e[-1] if len(e) >= 2 else (e[-1] if e else None)
+
+    tried = []
+    tried.append(("prefix", pfx))
+    tried.append(("start_epoch", start_epoch))
+    tried.append(("end_epoch", end_epoch))
+
+    # Candidate slugs:
+    #  - canonical one-epoch: <prefix>-<epoch>
+    #  - the provided poly_slug (already one-epoch in your current logs)
+    candidates = []
+    if pfx and start_epoch:
+        candidates.append(f"{pfx}-{start_epoch}")
+    if pfx and end_epoch:
+        candidates.append(f"{pfx}-{end_epoch}")
+    if poly_slug:
+        candidates.append(poly_slug)
+
+    # de-dupe preserve order
+    seen = set()
+    candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
+
+    # 1) Direct lookup: MARKET then EVENT
+    for slug in candidates:
+        tried.append(("market_by_slug", slug))
+        m = _gamma_get_market_by_slug_exact(slug)
+        if m:
+            y, n = extract_yes_no_token_ids(m)
+            if y and n:
+                return {"market": m, "yes_token_id": y, "no_token_id": n, "slug": (m.get("slug") or slug)}
+
+        tried.append(("event_by_slug", slug))
+        ev = _gamma_get_event_by_slug_exact(slug)
+        if ev:
+            m2 = _event_pick_market(ev)
+            if m2:
+                y, n = extract_yes_no_token_ids(m2)
+                if y and n:
+                    return {"market": m2, "yes_token_id": y, "no_token_id": n, "slug": (m2.get("slug") or "")}
+
+    # 2) Fallback: scan events (minimal params to avoid 422)
+    def _extract_last_epoch(s: str) -> Optional[int]:
+        nums = re.findall(r"\d{9,12}", s or "")
+        if not nums:
+            return None
+        try:
+            return int(nums[-1])
+        except Exception:
+            return None
+
+    def _score_event(ev: dict) -> int:
+        if not ev or not isinstance(ev, dict):
+            return 0
+        eslug = (ev.get("slug") or "").strip()
+        if not eslug or not pfx or not eslug.startswith(pfx):
+            return 0
+
+        score = 10
+        ep = _extract_last_epoch(eslug)
+
+        if ep is not None and start_epoch is not None:
+            try:
+                se = int(start_epoch)
+                if ep == se:
+                    score += 100
+                elif abs(ep - se) == 300:
+                    score += 70
+                elif abs(ep - se) == 600:
+                    score += 40
+            except Exception:
+                pass
+
+        return score
+
+    best = None  # (score, market_obj, event_slug)
+    pages = 50
+    limit = 200
+
+    for page in range(pages):
+        offset = page * limit
+        tried.append(("list_events_offset", offset))
+        evs = _gamma_list_events(limit=limit, offset=offset)
+        if not evs:
+            break
+
+        for ev in evs:
+            sc = _score_event(ev)
+            if sc <= 0:
+                continue
+
+            m3 = _event_pick_market(ev)
+            if not m3:
+                continue
+
+            if best is None or sc > best[0]:
+                best = (sc, m3, (ev.get("slug") or "").strip())
+
+        if best and best[0] >= 110:
+            break
+
+    if best:
+        m4 = best[1]
+        y, n = extract_yes_no_token_ids(m4)
+        if y and n:
+            return {"market": m4, "yes_token_id": y, "no_token_id": n, "slug": (m4.get("slug") or "")}
+
+    raise RuntimeError(
+        "Gamma market/token resolution failed. "
+        f"poly_slug='{poly_slug}' env_base='{env_base}' prefix='{pfx}' "
+        f"start_epoch='{start_epoch}' end_epoch='{end_epoch}' tried={tried}"
+    )
 
 
 def clob_midpoint(token_id: str) -> Optional[float]:
@@ -676,10 +661,6 @@ def main() -> None:
 
     # Pull Gamma market + token IDs
     gamma = fetch_gamma_market_and_tokens(poly_slug)
-    if not gamma:
-        log.warning("Gamma market not found for slug=%s (poly_slug=%s)", POLY_GAMMA_SLUG or POLY_MARKET_SLUG, poly_slug)
-        log.info("BOOT: bot.py finished cleanly")
-        return
 
     yes_token = gamma["yes_token_id"]
     no_token = gamma["no_token_id"]

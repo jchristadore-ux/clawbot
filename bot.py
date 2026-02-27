@@ -260,37 +260,28 @@ def gamma_search(query: str) -> Optional[dict]:
 
 def fetch_gamma_market_and_tokens(poly_slug: str):
     """
-    Robust Gamma resolver for rolling 5m markets.
-
-    Tries, in order:
-      1) rolling poly_slug directly
-      2) env base -> stitched into full rolling slug using poly_slug's end epoch
-      3) Gamma /markets?search=... with progressively broader queries:
-         - full rolling slug
-         - stitched
-         - env base
-         - prefix 'btc-updown-5m' (strip epochs)
-      4) selects best candidate and extracts YES/NO tokenIds
-
-    Requires:
-      - fetch_gamma_market_by_slug(slug) -> dict|None
-      - extract_yes_no_token_ids(market) -> (yes_id, no_id)
-      - BUN_BASE_URL env var pointing to your bun relay
+    Robust Gamma resolver with automatic BUN_BASE_URL normalization.
     """
+
     import os
     import re
     import requests
 
-    BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").rstrip("/")
-    if not BUN_BASE_URL:
-        raise RuntimeError("BUN_BASE_URL is not set (needed for Gamma search relay).")
+    raw_base = (os.getenv("BUN_BASE_URL") or "").strip()
+    if not raw_base:
+        raise RuntimeError("BUN_BASE_URL is not set.")
+
+    # Auto-fix missing https://
+    if not raw_base.startswith("http"):
+        raw_base = "https://" + raw_base
+
+    BUN_BASE_URL = raw_base.rstrip("/")
 
     def _parse_epochs(slug: str):
         return re.findall(r"\b\d{9,12}\b", slug or "")
 
     def _strip_to_prefix(slug: str):
-        s = (slug or "").strip()
-        return re.sub(r"(-\d{9,12}){1,2}$", "", s)
+        return re.sub(r"(-\d{9,12}){1,2}$", "", slug or "")
 
     def _stitch_base_to_rolling(base: str, rolling: str):
         base = (base or "").strip()
@@ -301,25 +292,17 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         if len(b_epochs) >= 2:
             return base
         if len(b_epochs) == 1 and len(r_epochs) >= 2:
-            end_epoch = r_epochs[-1]
-            if base.endswith(b_epochs[0]):
-                return f"{base}-{end_epoch}"
+            return f"{base}-{r_epochs[-1]}"
         return base
 
     def _gamma_search(query: str):
-        """
-        Calls bun relay endpoint to search Gamma markets.
-        Expected response: {"ok": true, "data": [...]}
-        """
-        q = (query or "").strip()
-        if not q:
+        if not query:
             return []
         url = f"{BUN_BASE_URL}/gamma/markets"
-        r = requests.get(url, params={"search": q, "limit": 25}, timeout=20)
+        r = requests.get(url, params={"search": query, "limit": 25}, timeout=20)
         r.raise_for_status()
         j = r.json()
-        data = j.get("data") if isinstance(j, dict) else None
-        return data if isinstance(data, list) else []
+        return j.get("data", []) if isinstance(j, dict) else []
 
     tried = []
 
@@ -331,9 +314,10 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         if y and n:
             return m, y, n
 
-    # 2) Try env base stitched into full rolling slug
+    # 2) Stitch env base
     env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
     stitched = _stitch_base_to_rolling(env_base, poly_slug)
+
     if stitched and stitched != poly_slug:
         tried.append(("by_slug", stitched))
         m2 = fetch_gamma_market_by_slug(stitched)
@@ -342,10 +326,8 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
             if y and n:
                 return m2, y, n
 
-    # 3) Search with broader queries
-    queries = []
-    if poly_slug:
-        queries.append(poly_slug)
+    # 3) Search fallback
+    queries = [poly_slug]
     if stitched and stitched not in queries:
         queries.append(stitched)
     if env_base and env_base not in queries:
@@ -361,19 +343,13 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         if not results:
             continue
 
-        # Choose best: exact rolling match > stitched match > first
         chosen = None
         for r in results:
             if (r.get("slug") or "").strip() == poly_slug:
                 chosen = r
                 break
-        if not chosen and stitched:
-            for r in results:
-                if (r.get("slug") or "").strip() == stitched:
-                    chosen = r
-                    break
-        chosen = chosen or results[0]
 
+        chosen = chosen or results[0]
         slug = (chosen.get("slug") or "").strip()
         if not slug:
             continue
@@ -388,8 +364,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
             return m3, y, n
 
     raise RuntimeError(
-        "Gamma market/token resolution failed. "
-        f"poly_slug='{poly_slug}' env_base='{env_base}' stitched='{stitched}' tried={tried}"
+        f"Gamma resolution failed. poly_slug={poly_slug} env_base={env_base} tried={tried}"
     )
 
 def extract_yes_no_token_ids(market: dict):

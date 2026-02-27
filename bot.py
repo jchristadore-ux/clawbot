@@ -98,14 +98,14 @@ def db_conn():
 def ensure_tables():
     """
     Fixes:
-      psycopg2.errors.InvalidTableDefinition: multiple primary keys for table "bot_state" are not allowed
+      psycopg2.errors.UndefinedColumn: column "as_of_date" of relation "bot_state" does not exist
 
-    We:
-      - Create bot_state if missing
-      - Add id column if missing
-      - If a PK already exists, DO NOT try to add another.
-      - If id exists but isn't the PK, we still keep single-row behavior via upsert on id=1
-        (and we add a UNIQUE constraint on id if needed so ON CONFLICT works).
+    Your bot_state table already exists but its schema is older/different.
+    This patch:
+      - Creates bot_state if missing
+      - Adds missing columns (id, as_of_date, position, entry_price, entry_ts, last_action, updated_at)
+      - Ensures a single state row exists using a safe INSERT ... WHERE NOT EXISTS
+        (no ON CONFLICT needed, since id may not be unique/PK in your existing schema)
     """
     import os
     import psycopg2
@@ -114,66 +114,23 @@ def ensure_tables():
     conn.autocommit = True
     cur = conn.cursor()
 
-    # Create table (fresh installs)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_state (
-            id INTEGER,
-            as_of_date DATE,
-            position TEXT,
-            entry_price DOUBLE PRECISION,
-            entry_ts TIMESTAMPTZ,
-            last_action TEXT,
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-    """)
+    # 1) Ensure table exists (minimal stub)
+    cur.execute("CREATE TABLE IF NOT EXISTS bot_state ();")
 
-    # Ensure id column exists
-    cur.execute("""
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_name='bot_state' AND column_name='id';
-    """)
-    has_id = cur.fetchone() is not None
-    if not has_id:
-        cur.execute("ALTER TABLE bot_state ADD COLUMN id INTEGER;")
-        cur.execute("UPDATE bot_state SET id = 1 WHERE id IS NULL;")
+    # 2) Add columns if missing (idempotent)
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS id INTEGER;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS as_of_date DATE;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS position TEXT;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_price DOUBLE PRECISION;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_ts TIMESTAMPTZ;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_action TEXT;")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();")
 
-    # Does table already have a primary key?
-    cur.execute("""
-        SELECT 1
-        FROM pg_constraint
-        WHERE conrelid = 'bot_state'::regclass
-          AND contype = 'p';
-    """)
-    has_pk = cur.fetchone() is not None
-
-    # If no PK exists, make id the PK (safe)
-    if not has_pk:
-        cur.execute("UPDATE bot_state SET id = 1 WHERE id IS NULL;")
-        cur.execute("ALTER TABLE bot_state ALTER COLUMN id SET NOT NULL;")
-        cur.execute("ALTER TABLE bot_state ADD PRIMARY KEY (id);")
-    else:
-        # PK exists (maybe on another column). Ensure we can still upsert on id=1.
-        # Add UNIQUE(id) if it doesn't already exist.
-        cur.execute("""
-            SELECT 1
-            FROM pg_constraint
-            WHERE conrelid = 'bot_state'::regclass
-              AND contype IN ('u','p')
-              AND conkey = ARRAY[
-                  (SELECT attnum FROM pg_attribute
-                   WHERE attrelid='bot_state'::regclass AND attname='id')
-              ];
-        """)
-        id_is_unique_or_pk = cur.fetchone() is not None
-        if not id_is_unique_or_pk:
-            cur.execute("ALTER TABLE bot_state ADD CONSTRAINT bot_state_id_key UNIQUE (id);")
-
-    # Ensure the single-row state at id=1 exists
+    # 3) Ensure the single-row state record exists (no PK/unique assumptions)
     cur.execute("""
         INSERT INTO bot_state (id, as_of_date, position, entry_price, entry_ts, last_action)
-        VALUES (1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT')
-        ON CONFLICT (id) DO NOTHING;
+        SELECT 1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT'
+        WHERE NOT EXISTS (SELECT 1 FROM bot_state WHERE id = 1);
     """)
 
     cur.close()

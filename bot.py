@@ -3,8 +3,9 @@ import json
 import time
 import math
 import logging
+import re
 from datetime import datetime, timezone, date
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Union
 
 import requests
 import psycopg2
@@ -42,18 +43,26 @@ def utc_now() -> datetime:
 
 
 def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
+    """
+    Returns the start epoch (UTC seconds) of the current 5-minute window.
+    """
     if ts is None:
         ts = time.time()
-    bucket = int(ts // 300) * 300
-    return bucket
+    return int(ts // 300) * 300
 
-import os, re, time
-
-def five_min_bucket_epoch(now: int | None = None) -> int:
-    now = now or int(time.time())
-    return (now // 300) * 300  # start of the current 5-minute window
 
 def make_poly_slug() -> str:
+    """
+    Builds the rolling 5-minute Polymarket slug.
+
+    Expected env:
+      - POLY_MARKET_SLUG = btc-updown-5m     (no epoch suffix)
+      - POLY_EVENT_SLUG  optional fallback
+
+    Hardening:
+      - If someone mistakenly sets POLY_MARKET_SLUG=btc-updown-5m-<epoch>
+        or btc-updown-5m-<start>-<end>, we strip the trailing epoch(s).
+    """
     base = (os.getenv("POLY_MARKET_SLUG") or "").strip()
     event = (os.getenv("POLY_EVENT_SLUG") or "").strip()
     if not base and not event:
@@ -61,12 +70,18 @@ def make_poly_slug() -> str:
 
     prefix = base or event
 
-    # Strip 1 or 2 trailing 10-digit epochs if present (fat-finger protection)
+    # Strip 1 or 2 trailing 10-digit epochs if present
     prefix = re.sub(r"(-\d{10}){1,2}$", "", prefix)
 
     return f"{prefix}-{five_min_bucket_epoch()}"
 
-def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 20) -> Optional[dict]:
+
+def http_get_json(
+    url: str,
+    params: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    timeout: int = 20
+) -> Optional[dict]:
     try:
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code != 200:
@@ -76,7 +91,12 @@ def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dic
         return None
 
 
-def http_post_json(url: str, payload: dict, headers: Optional[dict] = None, timeout: int = 25) -> Tuple[int, Optional[dict], str]:
+def http_post_json(
+    url: str,
+    payload: dict,
+    headers: Optional[dict] = None,
+    timeout: int = 25
+) -> Tuple[int, Optional[dict], str]:
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=timeout)
         text = r.text[:5000] if r.text else ""
@@ -100,6 +120,7 @@ def db_conn():
         raise RuntimeError("Missing DATABASE_URL")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
+
 def ensure_tables():
     """
     Fixes:
@@ -113,9 +134,6 @@ def ensure_tables():
       - Adds ALL columns that load_state() expects
       - Ensures id=1 row exists (no ON CONFLICT required)
     """
-    import os
-    import psycopg2
-
     conn = psycopg2.connect(os.environ["DATABASE_URL"])
     conn.autocommit = True
     cur = conn.cursor()
@@ -159,6 +177,29 @@ def ensure_tables():
     cur.close()
     conn.close()
 
+    # equity_snapshots table (required by record_equity_snapshot)
+    # Safe to run even if it already exists.
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS equity_snapshots (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            price DOUBLE PRECISION,
+            balance DOUBLE PRECISION,
+            position TEXT,
+            entry_price DOUBLE PRECISION,
+            stake DOUBLE PRECISION,
+            unrealized_pnl DOUBLE PRECISION,
+            equity DOUBLE PRECISION,
+            poly_slug TEXT
+        );
+    """)
+    cur.close()
+    conn.close()
+
+
 def _maybe_json_list(x):
     """
     Gamma sometimes returns list-y fields as JSON-encoded strings.
@@ -179,6 +220,7 @@ def _maybe_json_list(x):
             except Exception:
                 return None
     return None
+
 
 def load_state() -> Dict[str, Any]:
     with db_conn() as conn:
@@ -225,8 +267,16 @@ def save_state(state: Dict[str, Any]) -> None:
         conn.commit()
 
 
-def record_equity_snapshot(price: float, balance: float, position: Optional[str], entry_price: Optional[float],
-                          stake: float, unrealized_pnl: float, equity: float, poly_slug: str) -> None:
+def record_equity_snapshot(
+    price: float,
+    balance: float,
+    position: Optional[str],
+    entry_price: Optional[float],
+    stake: float,
+    unrealized_pnl: float,
+    equity: float,
+    poly_slug: str
+) -> None:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -253,33 +303,32 @@ POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip() or POLY_MARKET_SLUG
 
 
 def fetch_gamma_market_by_slug(slug: str) -> Optional[dict]:
-    # Docs: “Get market by slug” exists in the API reference. :contentReference[oaicite:3]{index=3}
     url = f"{POLY_GAMMA_HOST}/markets/slug/{slug}"
     return http_get_json(url)
 
 
 def gamma_search(query: str) -> Optional[dict]:
-    # Docs: “Search markets, events, and profiles”. :contentReference[oaicite:4]{index=4}
     url = f"{POLY_GAMMA_HOST}/search"
     return http_get_json(url, params={"query": query})
 
+
 def fetch_gamma_market_and_tokens(poly_slug: str):
     """
-    Gamma resolver (no Bun dependency) that handles multiple slug shapes.
+    Gamma resolver that handles multiple slug shapes, with a priority order that
+    fixes the exact bug you hit:
 
-    Why this patch:
-      - Your bot builds poly_slug as start-end (e.g., btc-updown-5m-<start>-<end>)
-      - Gamma often uses end-only slugs for rolling buckets (e.g., btc-updown-5m-<end>)
-      - So we try candidate slug shapes first, then list+match by prefix + end epoch containment.
+      - If your env accidentally includes an epoch (btc-updown-5m-<epoch>),
+        you can end up generating a start-end poly_slug that doesn't exist on Gamma.
+      - Gamma rolling markets for 5m are typically one-epoch slugs:
+            <prefix>-<epoch>
 
-    Requires:
-      - extract_yes_no_token_ids(market) -> (yes_id, no_id)
+    This resolver tries:
+      1) exact rolling slug: <prefix>-<start_epoch>   (critical)
+      2) exact rolling slug: <prefix>-<end_epoch>
+      3) provided poly_slug (in case it is already correct)
+      4) list+score recent markets as fallback
     """
-    import os
-    import re
-    import requests
-
-    GAMMA_BASE = "https://gamma-api.polymarket.com"
+    GAMMA_BASE = POLY_GAMMA_HOST
 
     def _epochs(slug: str):
         return re.findall(r"\d{9,12}", slug or "")
@@ -292,7 +341,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         if not slug:
             return None
 
-        # /markets?slug= returns list
+        # /markets?slug= returns list (more reliable sometimes)
         r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
         if r.status_code == 200:
             j = r.json()
@@ -333,26 +382,21 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
     tried.append(("start_epoch", start_epoch))
     tried.append(("end_epoch", end_epoch))
 
-    # 1) Try a set of exact slug candidates (covers start-end vs end-only variants)
+    # 1) Try the canonical one-epoch forms FIRST (this fixes your crash)
     candidates = []
-
-    # the slug you generate
-    if poly_slug:
-        candidates.append(poly_slug)
-
-    # end-only slug (common)
+    if pfx and start_epoch:
+        candidates.append(f"{pfx}-{start_epoch}")
     if pfx and end_epoch:
         candidates.append(f"{pfx}-{end_epoch}")
 
-    # env_base might be start-only; try stitching it to end
-    if env_base and end_epoch and env_base.endswith(str(start_epoch or "")):
-        candidates.append(f"{env_base}-{end_epoch}")
+    # 2) Then try whatever we were given/generated
+    if poly_slug:
+        candidates.append(poly_slug)
 
-    # if env_base already has a start epoch, try start-end explicitly
-    if pfx and start_epoch and end_epoch:
-        candidates.append(f"{pfx}-{start_epoch}-{end_epoch}")
+    # 3) Also try if poly_slug contains two epochs: <pfx>-<start>-<end>, try both single-epoch variants
+    # (already covered above), but keep as explicit for clarity.
 
-    # de-dupe while preserving order
+    # De-dupe while preserving order
     seen = set()
     candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
 
@@ -362,10 +406,15 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         if m:
             y, n = extract_yes_no_token_ids(m)
             if y and n:
-                return m, y, n
+                # Return in the exact dict shape main() expects
+                return {
+                    "market": m,
+                    "yes_token_id": y,
+                    "no_token_id": n,
+                    "slug": m.get("slug") or slug,
+                }
 
-    # 2) List recent markets and match by prefix + end_epoch containment (not strict endswith)
-    # If the market exists, it will be among relatively recent createdAt entries.
+    # 4) List recent markets and match by prefix + epoch containment
     best = None  # (score, market)
     pages = 50   # 50 * 200 = 10,000 markets max
     limit = 200
@@ -373,7 +422,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
     def _score_slug(mslug: str):
         if not mslug:
             return 0
-        if not mslug.startswith(pfx):
+        if not pfx or not mslug.startswith(pfx):
             return 0
 
         score = 10  # base prefix match
@@ -382,12 +431,16 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         if end_epoch and str(end_epoch) in mslug:
             score += 80
 
-        # bonus if also contains start epoch (windowed slugs)
+        # bonus if also contains start epoch
         if start_epoch and str(start_epoch) in mslug:
             score += 15
 
         # bonus if looks exactly like end-only format
         if end_epoch and mslug == f"{pfx}-{end_epoch}":
+            score += 25
+
+        # bonus if looks exactly like start-only format
+        if start_epoch and mslug == f"{pfx}-{start_epoch}":
             score += 25
 
         return score
@@ -415,13 +468,19 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         m2 = best[1]
         y, n = extract_yes_no_token_ids(m2)
         if y and n:
-            return m2, y, n
+            return {
+                "market": m2,
+                "yes_token_id": y,
+                "no_token_id": n,
+                "slug": m2.get("slug") or "",
+            }
 
     raise RuntimeError(
         "Gamma market/token resolution failed. "
         f"poly_slug='{poly_slug}' env_base='{env_base}' prefix='{pfx}' "
         f"start_epoch='{start_epoch}' end_epoch='{end_epoch}' tried={tried}"
     )
+
 
 def extract_yes_no_token_ids(market: dict):
     """
@@ -437,7 +496,6 @@ def extract_yes_no_token_ids(market: dict):
     if not outcomes or not token_ids or len(outcomes) != len(token_ids):
         return (None, None)
 
-    # Normalize labels
     labels = []
     for o in outcomes:
         if isinstance(o, str):
@@ -466,9 +524,7 @@ def extract_yes_no_token_ids(market: dict):
     return (None, None)
 
 
-
 def clob_midpoint(token_id: str) -> Optional[float]:
-    # Docs show midpoint endpoints under “Orderbook & Pricing”. :contentReference[oaicite:5]{index=5}
     url = f"{POLY_CLOB_HOST}/midpoint"
     j = http_get_json(url, params={"token_id": token_id})
     if not j:
@@ -611,9 +667,6 @@ def main() -> None:
     action = "NO_TRADE"
     reason = ""
     balance = float(os.getenv("PAPER_BALANCE", "0").strip() or 0.0)
-
-    # For live mode, you can optionally pass a balance from elsewhere.
-    # We’ll keep balance as 0 unless you set PAPER_BALANCE (paper) or later wire builder balance.
 
     # Trade limit
     if trades_today >= MAX_TRADES_PER_DAY:

@@ -260,16 +260,13 @@ def gamma_search(query: str) -> Optional[dict]:
 
 def fetch_gamma_market_and_tokens(poly_slug: str):
     """
-    Gamma resolver (no Bun dependency) using official Gamma API.
+    Gamma resolver (no Bun dependency) that finds rolling 5m markets by LISTING markets and matching slugs.
 
-    Key fix:
-      - /public-search returns EVENTS, and each event contains a `markets` array.
-        We must search through event["markets"] to find the market slug we want. :contentReference[oaicite:2]{index=2}
-
-    Tries:
-      1) /markets?slug=<rolling>
-      2) /markets?slug=<stitched>
-      3) /public-search?q=<full-ish query> and scan events[*].markets[*] for matching slug
+    Why: /markets?slug=<rolling> is often empty for these rolling windows, so we:
+      - Determine prefix (e.g., btc-updown-5m)
+      - Determine target end_epoch from poly_slug
+      - Page through GET /markets ordered by createdAt desc
+      - Find the market whose slug starts with prefix and ends with our end_epoch
     """
     import os
     import re
@@ -277,138 +274,111 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
 
     GAMMA_BASE = "https://gamma-api.polymarket.com"
 
-    def _parse_epochs(slug: str):
-        return re.findall(r"\b\d{9,12}\b", slug or "")
+    def _epochs(slug: str):
+        return re.findall(r"\d{9,12}", slug or "")
 
-    def _strip_to_prefix(slug: str):
+    def _prefix(slug: str):
         return re.sub(r"(-\d{9,12}){1,2}$", "", (slug or "").strip())
 
-    def _stitch_base_to_rolling(base: str, rolling: str):
-        base = (base or "").strip()
-        if not base:
-            return ""
-        b_epochs = _parse_epochs(base)
-        r_epochs = _parse_epochs(rolling)
-        if len(b_epochs) >= 2:
-            return base
-        if len(b_epochs) == 1 and len(r_epochs) >= 2:
-            return f"{base}-{r_epochs[-1]}"
-        return base
+    def _gamma_list_markets(limit: int = 200, offset: int = 0):
+        # List markets supports pagination + ordering. :contentReference[oaicite:1]{index=1}
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "order": "createdAt",
+            "ascending": "false",
+        }
+        r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=25)
+        r.raise_for_status()
+        j = r.json()
+        return j if isinstance(j, list) else []
 
-    def _gamma_get_market_by_slug(slug: str):
+    def _gamma_get_market_by_slug_exact(slug: str):
         slug = (slug or "").strip()
         if not slug:
             return None
-
         r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
         if r.status_code == 200:
             j = r.json()
             if isinstance(j, list) and j:
                 return j[0]
-
         r2 = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=20)
         if r2.status_code == 200:
             j2 = r2.json()
             if isinstance(j2, dict) and j2:
                 return j2
-
         return None
 
-    def _gamma_public_search_events(q: str):
-        """
-        /public-search requires query param 'q' and returns events/tags/profiles. :contentReference[oaicite:3]{index=3}
-        """
-        q = (q or "").strip()
-        if not q:
-            return []
-
-        # keep_closed_markets=1 helps if a just-rolled window briefly flips state
-        params = {"q": q, "limit_per_type": 25, "keep_closed_markets": 1}
-        r = requests.get(f"{GAMMA_BASE}/public-search", params=params, timeout=20)
-        if r.status_code != 200:
-            return []
-        j = r.json()
-        evts = j.get("events") if isinstance(j, dict) else None
-        return evts if isinstance(evts, list) else []
+    # --- Targets
+    env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
+    pfx = _prefix(env_base) or _prefix(poly_slug)
+    pe = _epochs(poly_slug)
+    target_end = pe[-1] if len(pe) >= 2 else (pe[-1] if pe else None)
 
     tried = []
+    tried.append(("prefix", pfx))
+    tried.append(("target_end", target_end))
 
-    env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
-    stitched = _stitch_base_to_rolling(env_base, poly_slug)
-    prefix = _strip_to_prefix(env_base) or _strip_to_prefix(poly_slug)
-
-    # 1) Try rolling slug directly
+    # 1) Cheap try: exact slug (sometimes works)
     tried.append(("by_slug", poly_slug))
-    m = _gamma_get_market_by_slug(poly_slug)
+    m = _gamma_get_market_by_slug_exact(poly_slug)
     if m:
         y, n = extract_yes_no_token_ids(m)
         if y and n:
             return m, y, n
 
-    # 2) Try stitched slug (base+end)
-    if stitched and stitched != poly_slug:
-        tried.append(("by_slug", stitched))
-        m2 = _gamma_get_market_by_slug(stitched)
-        if m2:
-            y, n = extract_yes_no_token_ids(m2)
-            if y and n:
-                return m2, y, n
+    # 2) Scan recent markets until we find matching rolling end epoch
+    best = None  # (score, market)
+    pages = 10   # 10 * 200 = 2000 markets scanned max (fast enough)
+    limit = 200
 
-    # 3) Public search (EVENTS -> MARKETS)
-    # Search with most specific first
-    search_terms = []
-    if stitched:
-        search_terms.append(stitched)
-    if env_base and env_base not in search_terms:
-        search_terms.append(env_base)
-    if poly_slug and poly_slug not in search_terms:
-        search_terms.append(poly_slug)
-    if prefix and prefix not in search_terms:
-        search_terms.append(prefix)
+    for page in range(pages):
+        offset = page * limit
+        tried.append(("list_markets_offset", offset))
+        mkts = _gamma_list_markets(limit=limit, offset=offset)
+        if not mkts:
+            break
 
-    for term in search_terms:
-        tried.append(("public_search", term))
-        events = _gamma_public_search_events(term)
-        if not events:
-            continue
-
-        # Scan event markets for our target slug
-        best = None
-
-        def _score_market(mslug: str):
-            if mslug == poly_slug:
-                return 100
-            if stitched and mslug == stitched:
-                return 95
-            if env_base and mslug.startswith(env_base):
-                return 80
-            if prefix and mslug.startswith(prefix):
-                return 60
-            return 0
-
-        for ev in events:
-            mkts = ev.get("markets")
-            if not isinstance(mkts, list):
+        for cand in mkts:
+            slug = (cand.get("slug") or "").strip()
+            if not slug or not slug.startswith(pfx):
                 continue
-            for cand in mkts:
-                cslug = (cand.get("slug") or "").strip()
-                if not cslug:
-                    continue
-                sc = _score_market(cslug)
-                if sc <= 0:
-                    continue
-                if (best is None) or (sc > best[0]):
-                    best = (sc, cand)
 
-        if best:
-            market = best[1]
-            y, n = extract_yes_no_token_ids(market)
-            if y and n:
-                return market, y, n
+            e = _epochs(slug)
+            if len(e) < 2:
+                continue
+            cand_end = e[-1]
+
+            # scoring: exact end match wins
+            score = 0
+            if target_end and cand_end == target_end:
+                score = 100
+            else:
+                # otherwise prefer “closest” end epoch numerically (fallback)
+                if target_end:
+                    try:
+                        score = 50 - min(50, abs(int(cand_end) - int(target_end)) // 60)
+                    except Exception:
+                        score = 1
+                else:
+                    score = 1
+
+            if best is None or score > best[0]:
+                best = (score, cand)
+
+        # if we found exact end match, stop early
+        if best and best[0] >= 100:
+            break
+
+    if best:
+        m2 = best[1]
+        y, n = extract_yes_no_token_ids(m2)
+        if y and n:
+            return m2, y, n
 
     raise RuntimeError(
-        f"Gamma market/token resolution failed. poly_slug='{poly_slug}' env_base='{env_base}' "
-        f"stitched='{stitched}' tried={tried}"
+        "Gamma market/token resolution failed. "
+        f"poly_slug='{poly_slug}' env_base='{env_base}' prefix='{pfx}' target_end='{target_end}' tried={tried}"
     )
 
 def extract_yes_no_token_ids(market: dict):

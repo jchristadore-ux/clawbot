@@ -277,66 +277,86 @@ def midpoint_from_best(best_bid: Optional[float], best_ask: Optional[float]) -> 
 
 def gamma_search_markets_by_prefix(prefix: str, limit: int) -> List[dict]:
     """
-    Gamma doesn't have a guaranteed "contains" endpoint, so we do a broad call:
-    - GET /markets?limit=...
-    and then filter slugs client-side.
-
-    This is not perfect, but it's hands-free and works without extra tooling.
+    Better discovery:
+    - Search EVENTS using a keyword query derived from prefix
+    - Extract markets from returned events
+    - Filter markets whose slug contains prefix
     """
-    # Pull a page of markets and filter by slug substring.
-    j = http_get_json(f"{GAMMA_HOST}/markets", params={"limit": limit})
-    if not isinstance(j, list):
-        return []
-    out = []
-    for m in j:
-        if not isinstance(m, dict):
-            continue
+    # Turn "btc-updown-5m" into "btc updown 5m"
+    q = prefix.replace("-", " ").strip()
+
+    # Try events search first
+    ej = http_get_json(f"{GAMMA_HOST}/events", params={"query": q, "limit": limit})
+    markets: List[dict] = []
+
+    if isinstance(ej, list):
+        for ev in ej:
+            if not isinstance(ev, dict):
+                continue
+            ms = ev.get("markets")
+            if isinstance(ms, list):
+                for m in ms:
+                    if isinstance(m, dict):
+                        markets.append(m)
+
+    # Fallback: if events search yields nothing, try markets with a query param too
+    # (Gamma implementations vary; harmless if ignored)
+    if not markets:
+        mj = http_get_json(f"{GAMMA_HOST}/markets", params={"query": q, "limit": limit})
+        if isinstance(mj, list):
+            markets = [m for m in mj if isinstance(m, dict)]
+
+    # Filter by prefix substring in slug
+    out: List[dict] = []
+    for m in markets:
         s = str(m.get("slug", "")).strip()
         if prefix in s:
             out.append(m)
-    # Prefer most recently updated/created if field exists
-    def _score(mk: dict) -> float:
-        for k in ("updatedAt", "updated_at", "createdAt", "created_at"):
-            v = mk.get(k)
-            if isinstance(v, (int, float)):
-                return float(v)
-            if isinstance(v, str):
-                # best effort: if ISO, lex sort works for score-ish
-                return float(len(v))
-        return 0.0
 
-    out.sort(key=_score, reverse=True)
-    return out
+    # Deduplicate by slug
+    seen = set()
+    deduped = []
+    for m in out:
+        s = str(m.get("slug", "")).strip()
+        if s and s not in seen:
+            seen.add(s)
+            deduped.append(m)
 
+    return deduped
 
 def market_has_books(yes_token: str, no_token: str) -> bool:
     _, _, yes_has = clob_book_best(yes_token)
     _, _, no_has = clob_book_best(no_token)
     return yes_has and no_has
 
-
 def resolve_tradable_market(slug: str, prefix: str) -> ResolvedMarket:
     """
     1) Resolve exact slug
-    2) If tokens have no books, hunt within prefix family
+    2) If tokens have no books, hunt using Gamma events search
     """
     rm = resolve_market(slug)
+
     if rm.yes_token and rm.no_token:
         if market_has_books(rm.yes_token, rm.no_token):
             logger.info("Market is tradable as-is (books exist).")
             return rm
-        logger.warning("Resolved slug but tokens have no orderbooks; hunting tradable market in prefix=%s", prefix)
+        logger.warning(
+            "Resolved slug but tokens have no orderbooks; hunting tradable market in prefix=%s",
+            prefix
+        )
 
-    # Hunt
-    candidates = gamma_search_markets_by_prefix(prefix, GAMMA_SCAN_LIMIT)
-    logger.info("Gamma candidate count for prefix=%s: %s", prefix, len(candidates))
+    # Hunt using better search
+    # Try increasing limits progressively
+    for scan_limit in (50, 200, 500):
+        candidates = gamma_search_markets_by_prefix(prefix, scan_limit)
+        logger.info("Gamma candidate count for prefix=%s (limit=%s): %s", prefix, scan_limit, len(candidates))
 
-    for idx, m in enumerate(candidates, start=1):
-        s = str(m.get("slug", "")).strip()
-        try:
+        for idx, m in enumerate(candidates, start=1):
+            s = str(m.get("slug", "")).strip()
             yes_token, no_token, outcomes, token_ids = extract_yes_no_token_ids(m)
             if not yes_token or not no_token:
                 continue
+
             if not market_has_books(yes_token, no_token):
                 continue
 
@@ -354,12 +374,15 @@ def resolve_tradable_market(slug: str, prefix: str) -> ResolvedMarket:
                 yes_token=yes_token,
                 no_token=no_token,
             )
-            logger.info("Selected tradable market #%s slug=%s market_id=%s", idx, chosen.slug, chosen.market_id)
+            logger.info("Selected tradable market slug=%s market_id=%s", chosen.slug, chosen.market_id)
             return chosen
-        except Exception:
-            continue
 
-    raise RuntimeError(f"No tradable market found for prefix='{prefix}' within last {GAMMA_SCAN_LIMIT} Gamma markets.")
+    raise RuntimeError(
+        f"No tradable market found for prefix='{prefix}' via Gamma search. "
+        f"This likely means the rolling 5m markets are not exposed as tradable CLOB books, "
+        f"or Gamma query params differ in your environment."
+    )
+
 
 
 # -----------------------------

@@ -273,54 +273,45 @@ POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").stri
 POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
 POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip() or POLY_MARKET_SLUG
 
-
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Robust YES/NO token mapping.
+    def maybe_json(x):
+        :contentReference[oaicite:6]{index=6}urn None
+        if isinstance(x, (list, dict)):
+            return x
+        if isinstance(x, str):
+            s :contentReference[oaicite:7]{index=7}s:
+                return None
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
+        return None
 
-    IMPORTANT PATCH:
-      - Gamma often uses 'clobTokenIds' (JSON-encoded string) rather than 'tokenIds'.
+    outcomes = maybe_json(market.get("outcomes"))
+    token_ids = maybe_json(market.get("clobTokenIds"))
 
-    Supports:
-      - YES/NO markets
-      - UP/DOWN markets (Up=YES, Down=NO)
-      - generic 2-outcome markets (index 0=YES, index 1=NO)
-    """
-    outcomes = _maybe_json_list(market.get("outcomes"))
+    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
+        return None, None
+    if len(outcomes) != len(token_ids) or len(outcomes) < 2:
+        return None, None
 
-    # token ids may appear in multiple places; prefer clobTokenIds when present
-    token_ids = (
-        _maybe_json_list(market.get("clobTokenIds"))
-        or _maybe_json_list(market.get("clobTokenIDs"))
-        or _maybe_json_list(market.get("tokenIds"))
-        or _maybe_json_list(market.get("tokenIDs"))
-    )
+    # Common cases:
+    # - ["Yes","No"] => [yes_token, no_token]
+    # - ["Up","Down"] => treat Up as YES side, Down as NO side for our strategy conventions
+    norm = [str(o).strip().upper() for o in outcomes]
 
-    if not outcomes or not token_ids or len(outcomes) != len(token_ids):
-        return (None, None)
+    if norm[0] in ("YES", "UP") and norm[1] in ("NO", "DOWN"):
+        return str(token_ids[0]), str(token_ids[1])
 
-    labels = [str(o).strip().upper() for o in outcomes]
+    # fallback: try explicit scan
+    yes_id = no_id = None
+    for o, tid in zip(norm, token_ids):
+        if o in ("YES", "UP"):
+            yes_id = str(tid)
+        elif o in ("NO", "DOWN"):
+            no_id = str(tid)
 
-    # Direct YES/NO
-    try:
-        yes_i = labels.index("YES")
-        no_i = labels.index("NO")
-        return (str(token_ids[yes_i]), str(token_ids[no_i]))
-    except ValueError:
-        pass
-
-    # UP/DOWN
-    if "UP" in labels and "DOWN" in labels:
-        up_i = labels.index("UP")
-        down_i = labels.index("DOWN")
-        return (str(token_ids[up_i]), str(token_ids[down_i]))
-
-    # Fallback: exactly 2 outcomes
-    if len(labels) == 2:
-        return (str(token_ids[0]), str(token_ids[1]))
-
-    return (None, None)
-
+    return yes_id, no_id
 
 def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
     """
@@ -521,20 +512,21 @@ def fetch_gamma_market_and_tokens(poly_slug: str) -> Dict[str, Any]:
         f"start_epoch='{start_epoch}' end_epoch='{end_epoch}' tried={tried}"
     )
 
+def clob_midpoints(token_ids: list[str]) -> Dict[str, Optional[float]]:
+    url = f"{POLY_CLOB_HOST}/midpoints"
+    # docs: query params for multiple ids; most implementations use repeated token_ids=
+    j = http_get_json(url, params=[("token_ids", tid) for tid in token_ids])
+    if not j or not isinstance(j, dict):
+        return {tid: None for tid in token_ids}
 
-def clob_midpoint(token_id: str) -> Optional[float]:
-    url = f"{POLY_CLOB_HOST}/midpoint"
-    j = http_get_json(url, params={"token_id": token_id})
-    if not j:
-        return None
-    mp = j.get("midpoint")
-    if mp is None:
-        return None
-    try:
-        return float(mp)
-    except Exception:
-        return None
-
+    out: Dict[str, Optional[float]] = {}
+    for tid in token_ids:
+        v = j.get(tid)
+        try:
+            out[tid] = float(v) if v is not None else None
+        except Exception:
+            out[tid] = None
+    return out
 
 # ----------------------------
 # Bun live order gateway

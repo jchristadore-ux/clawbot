@@ -11,7 +11,11 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 import psycopg2
+import re
 
+def normalize_base_slug(s: str) -> str:
+    s = (s or "").strip()
+    return re.sub(r"-\d{10}$", "", s)
 
 # ----------------------------
 # Logging

@@ -117,37 +117,19 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 def ensure_tables() -> None:
     """
-    Compatible with existing schemas where bot_state has a NOT NULL 'key' column.
-    We'll store the bot's state under key='main'.
+    Compatible with an existing bot_state table that has:
+      - id NOT NULL (often PK) without a default
+      - key column used to identify the row (we use key='main')
+
+    We will:
+      1) Create equity_snapshots if missing (safe)
+      2) Ensure bot_state has a row with key='main' by:
+         - UPDATE first
+         - if no rows updated, INSERT with id = MAX(id)+1
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # Create bot_state if it doesn't exist (keyed schema)
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    as_of_date DATE,
-                    position TEXT,
-                    entry_price DOUBLE PRECISION,
-                    stake DOUBLE PRECISION,
-                    trades_today INTEGER,
-                    pnl_today_realized DOUBLE PRECISION,
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-                """
-            )
-
-            # Ensure row exists for key='main'
-            cur.execute(
-                """
-                INSERT INTO bot_state (key, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized)
-                VALUES ('main', CURRENT_DATE, NULL, NULL, 0, 0, 0)
-                ON CONFLICT (key) DO NOTHING;
-                """
-            )
-
-            # Equity snapshots table (safe)
+            # Safe: create equity snapshots table if missing
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -165,8 +147,36 @@ def ensure_tables() -> None:
                 """
             )
 
-        conn.commit()
+            # 1) Try to "touch" the row if it already exists
+            cur.execute(
+                """
+                UPDATE bot_state
+                SET as_of_date = COALESCE(as_of_date, CURRENT_DATE)
+                WHERE key = 'main';
+                """
+            )
 
+            # 2) If no row exists, insert one with a non-null id
+            if cur.rowcount == 0:
+                cur.execute(
+                    """
+                    INSERT INTO bot_state (
+                        id, key, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized
+                    )
+                    SELECT
+                        COALESCE(MAX(id), 0) + 1,
+                        'main',
+                        CURRENT_DATE,
+                        NULL,
+                        NULL,
+                        0,
+                        0,
+                        0
+                    FROM bot_state;
+                    """
+                )
+
+        conn.commit()
 
 def load_state() -> Dict[str, Any]:
     with db_conn() as conn:

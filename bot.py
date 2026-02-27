@@ -413,19 +413,17 @@ def has_live_book(token_id: str) -> bool:
     code, mp, _ = clob_midpoint(token_id)
     return code == 200 and mp is not None
 
-
 def resolve_tradable_rolling_market(
     base_slug: str,
     bucket_epoch: int,
     lookback_buckets: int,
 ) -> Tuple[Optional[str], Optional[dict], Optional[str], Optional[str]]:
-    """
-    Scan current bucket and step backwards in 5m increments until both YES/NO tokens
-    have live CLOB midpoints.
-    """
+
     for i in range(lookback_buckets + 1):
         b = bucket_epoch - (i * 300)
         slug = f"{base_slug}-{b}"
+
+        log.info("Checking slug=%s", slug)
 
         m = fetch_gamma_market_by_slug(slug)
         if not m:
@@ -433,29 +431,30 @@ def resolve_tradable_rolling_market(
             continue
 
         yes_id, no_id = extract_yes_no_token_ids(m)
+
         if not yes_id or not no_id:
             log.warning(
                 "Token extraction failed for slug=%s keys=%s outcomes=%s clobTokenIds=%s",
                 slug,
-                sorted(list(m.keys()))[:40],
+                sorted(list(m.keys()))[:20],
                 str(m.get("outcomes"))[:200],
                 str(m.get("clobTokenIds"))[:200],
-    )
-    continue
+            )
+            continue
 
         y_ok = has_live_book(yes_id)
         n_ok = has_live_book(no_id)
 
         if y_ok and n_ok:
+            log.info("Found tradable slug=%s", slug)
             return slug, m, yes_id, no_id
 
         log.info(
-            "No live books for slug=%s (yes_ok=%s no_ok=%s) -> scanning back",
+            "No live books for slug=%s (yes_ok=%s no_ok=%s)",
             slug, y_ok, n_ok
         )
 
     return None, None, None, None
-
 
 # ----------------------------
 # Bun live order gateway

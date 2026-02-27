@@ -265,59 +265,61 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
     Tries, in order:
       1) rolling poly_slug directly
       2) env base -> stitched into full rolling slug using poly_slug's end epoch
-      3) Gamma /search using progressively broader queries:
+      3) Gamma /markets?search=... with progressively broader queries:
          - full rolling slug
-         - base slug (env)
+         - stitched
+         - env base
          - prefix 'btc-updown-5m' (strip epochs)
-      4) selects the best candidate market and extracts YES/NO tokenIds
-         (supports UP/DOWN via extract_yes_no_token_ids)
+      4) selects best candidate and extracts YES/NO tokenIds
 
-    Returns: (market_dict, yes_token_id, no_token_id)
-    Raises: RuntimeError if unresolved
+    Requires:
+      - fetch_gamma_market_by_slug(slug) -> dict|None
+      - extract_yes_no_token_ids(market) -> (yes_id, no_id)
+      - BUN_BASE_URL env var pointing to your bun relay
     """
     import os
     import re
+    import requests
+
+    BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").rstrip("/")
+    if not BUN_BASE_URL:
+        raise RuntimeError("BUN_BASE_URL is not set (needed for Gamma search relay).")
 
     def _parse_epochs(slug: str):
-        # returns list of epoch-like chunks (strings of digits)
         return re.findall(r"\b\d{9,12}\b", slug or "")
 
     def _strip_to_prefix(slug: str):
-        # btc-updown-5m-1772165400-1772197800 -> btc-updown-5m
         s = (slug or "").strip()
-        s = re.sub(r"(-\d{9,12}){1,2}$", "", s)
-        return s
+        return re.sub(r"(-\d{9,12}){1,2}$", "", s)
 
     def _stitch_base_to_rolling(base: str, rolling: str):
-        """
-        If base looks like 'btc-updown-5m-<start>' and rolling has '<start>-<end>',
-        return 'btc-updown-5m-<start>-<end>'.
-        If base already has 2 epochs, return as-is.
-        """
         base = (base or "").strip()
         if not base:
             return ""
-
         b_epochs = _parse_epochs(base)
         r_epochs = _parse_epochs(rolling)
-
-        # Already full
         if len(b_epochs) >= 2:
             return base
-
-        # Base has start only, rolling has start+end -> append end
         if len(b_epochs) == 1 and len(r_epochs) >= 2:
             end_epoch = r_epochs[-1]
             if base.endswith(b_epochs[0]):
                 return f"{base}-{end_epoch}"
-
-        # Otherwise just return base
         return base
 
-    # You already have these helpers elsewhere in your file:
-    # - fetch_gamma_market_by_slug(slug) -> dict|None
-    # - fetch_gamma_search(query) -> list[dict]|None
-    # - extract_yes_no_token_ids(market) -> (yes_id, no_id)
+    def _gamma_search(query: str):
+        """
+        Calls bun relay endpoint to search Gamma markets.
+        Expected response: {"ok": true, "data": [...]}
+        """
+        q = (query or "").strip()
+        if not q:
+            return []
+        url = f"{BUN_BASE_URL}/gamma/markets"
+        r = requests.get(url, params={"search": q, "limit": 25}, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        data = j.get("data") if isinstance(j, dict) else None
+        return data if isinstance(data, list) else []
 
     tried = []
 
@@ -340,9 +342,8 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
             if y and n:
                 return m2, y, n
 
-    # 3) Search with broader queries (Gamma search often matches better on prefix)
+    # 3) Search with broader queries
     queries = []
-    # best-first ordering
     if poly_slug:
         queries.append(poly_slug)
     if stitched and stitched not in queries:
@@ -356,14 +357,11 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
 
     for q in queries:
         tried.append(("search", q))
-        results = fetch_gamma_search(q) or []
+        results = _gamma_search(q)
         if not results:
             continue
 
-        # Pick best candidate:
-        #  - exact slug match to rolling
-        #  - else exact slug match to stitched
-        #  - else first result
+        # Choose best: exact rolling match > stitched match > first
         chosen = None
         for r in results:
             if (r.get("slug") or "").strip() == poly_slug:
@@ -391,8 +389,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
 
     raise RuntimeError(
         "Gamma market/token resolution failed. "
-        f"poly_slug='{poly_slug}' env_base='{env_base}' stitched='{stitched}' "
-        f"tried={tried}"
+        f"poly_slug='{poly_slug}' env_base='{env_base}' stitched='{stitched}' tried={tried}"
     )
 
 def extract_yes_no_token_ids(market: dict):

@@ -96,49 +96,77 @@ def db_conn():
         raise RuntimeError("Missing DATABASE_URL")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
+def ensure_tables():
+    """
+    Fixes the Railway error:
+      psycopg2.errors.UndefinedColumn: column "id" of relation "bot_state" does not exist
 
-def ensure_tables() -> None:
-    # Keep migrations simple + safe: create tables if missing; add columns if missing.
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    as_of_date DATE,
-                    position TEXT,
-                    entry_price DOUBLE PRECISION,
-                    stake DOUBLE PRECISION,
-                    trades_today INTEGER,
-                    pnl_today_realized DOUBLE PRECISION
-                );
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO bot_state (id, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized)
-                VALUES (1, CURRENT_DATE, NULL, NULL, 0, 0, 0)
-                ON CONFLICT (id) DO NOTHING;
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS equity_snapshots (
-                    id BIGSERIAL PRIMARY KEY,
-                    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    price DOUBLE PRECISION NOT NULL,
-                    balance DOUBLE PRECISION NOT NULL,
-                    position TEXT,
-                    entry_price DOUBLE PRECISION,
-                    stake DOUBLE PRECISION,
-                    unrealized_pnl DOUBLE PRECISION NOT NULL,
-                    equity DOUBLE PRECISION NOT NULL,
-                    poly_slug TEXT
-                );
-                """
-            )
-        conn.commit()
+    We:
+      1) Create bot_state with an id column if it doesn't exist
+      2) If bot_state exists but is missing id, we ALTER TABLE to add it
+      3) Keep a single-row state via id=1 (or you can move to a unique as_of_date later)
+    """
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
+    conn.autocommit = True
+    cur = conn.cursor()
 
+    # Create table (fresh installs)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            id INTEGER PRIMARY KEY,
+            as_of_date DATE,
+            position TEXT,
+            entry_price DOUBLE PRECISION,
+            entry_ts TIMESTAMPTZ,
+            last_action TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+    """)
+
+    # Migrate older table missing id
+    cur.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name='bot_state' AND column_name='id';
+    """)
+    has_id = cur.fetchone() is not None
+    if not has_id:
+        # Add id + backfill to 1 for existing rows (if any)
+        cur.execute("ALTER TABLE bot_state ADD COLUMN id INTEGER;")
+        cur.execute("UPDATE bot_state SET id = 1 WHERE id IS NULL;")
+        cur.execute("ALTER TABLE bot_state ALTER COLUMN id SET NOT NULL;")
+        cur.execute("ALTER TABLE bot_state ADD PRIMARY KEY (id);")
+
+    # Ensure we always have the single state row at id=1
+    cur.execute("""
+        INSERT INTO bot_state (id, as_of_date, position, entry_price, entry_ts, last_action)
+        VALUES (1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT')
+        ON CONFLICT (id) DO NOTHING;
+    """)
+
+    cur.close()
+    conn.close()
+
+def _maybe_json_list(x):
+    """
+    Gamma sometimes returns list-y fields as JSON-encoded strings.
+    Converts:
+      - '["Up","Down"]' -> ["Up","Down"]
+      - ["Up","Down"] -> ["Up","Down"]
+      - None -> None
+    """
+    if x is None:
+        return None
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
+    return None
 
 def load_state() -> Dict[str, Any]:
     with db_conn() as conn:
@@ -223,92 +251,102 @@ def gamma_search(query: str) -> Optional[dict]:
     url = f"{POLY_GAMMA_HOST}/search"
     return http_get_json(url, params={"query": query})
 
-
-def fetch_gamma_market_and_tokens(poly_slug: str) -> Optional[Dict[str, Any]]:
+def fetch_gamma_market_and_tokens(poly_slug: str):
     """
-    Returns:
-      {
-        "market": <gamma market json>,
-        "yes_token_id": "...",
-        "no_token_id": "..."
-      }
+    Patch: Always try Gamma by the *rolling* poly_slug first.
+    Then fallback to /search using the base slug (env) if needed.
+
+    Returns: (market_dict, yes_token_id, no_token_id)
     """
-    base = POLY_MARKET_SLUG
-    gamma_slug = POLY_GAMMA_SLUG
+    # You should already have these in your file:
+    # - fetch_gamma_market_by_slug(slug) -> market dict or None
+    # - fetch_gamma_search(slug_base) -> list[market] or None
+    # - make_poly_slug() -> rolling slug (you already pass poly_slug in)
 
-    # 1) try configured gamma slug
-    m = fetch_gamma_market_by_slug(gamma_slug) if gamma_slug else None
+    # 1) First try: exact rolling slug
+    m = fetch_gamma_market_by_slug(poly_slug)
+    if m:
+        y, n = extract_yes_no_token_ids(m)
+        if y and n:
+            return m, y, n
 
-    # 2) fallback: search Gamma if not found
-    if not m:
-        # search with base slug first; if empty, use poly_slug
-        q = base or poly_slug
-        res = gamma_search(q)
-        if res and isinstance(res.get("markets"), list) and res["markets"]:
-            # pick first market that looks like our base slug if possible
-            chosen = None
-            for mm in res["markets"]:
-                s = (mm.get("slug") or "").lower()
-                if base and base.lower() in s:
-                    chosen = mm
-                    break
-            chosen = chosen or res["markets"][0]
-            # sometimes search returns partial objects; try slug fetch again:
-            cslug = chosen.get("slug")
-            if cslug:
-                m = fetch_gamma_market_by_slug(cslug)
+    # 2) If env override exists, treat it as base OR full, then try that
+    base_or_full = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
+    if base_or_full:
+        # If they gave a full rolling slug, try it directly
+        if "-updown-5m-" in base_or_full and base_or_full.rstrip().split("-")[-1].isdigit():
+            m2 = fetch_gamma_market_by_slug(base_or_full)
+            if m2:
+                y, n = extract_yes_no_token_ids(m2)
+                if y and n:
+                    return m2, y, n
+        else:
+            # Otherwise, try searching by base slug to find the current rolling market
+            results = fetch_gamma_search(base_or_full)
+            if results:
+                # Prefer exact match; otherwise first result
+                chosen = None
+                for r in results:
+                    if (r.get("slug") or "").strip() == poly_slug:
+                        chosen = r
+                        break
+                chosen = chosen or results[0]
+                slug = (chosen.get("slug") or "").strip()
+                if slug:
+                    m3 = fetch_gamma_market_by_slug(slug)
+                    if m3:
+                        y, n = extract_yes_no_token_ids(m3)
+                        if y and n:
+                            return m3, y, n
 
-    if not m or not isinstance(m, dict):
-        return None
-
-    yes_id, no_id = extract_yes_no_token_ids(m)
-    if not yes_id or not no_id:
-        return None
-
-    return {"market": m, "yes_token_id": yes_id, "no_token_id": no_id}
+    raise RuntimeError(
+        f"Gamma market/token resolution failed. Tried rolling slug='{poly_slug}' "
+        f"and base search slug='{base_or_full or '<none>'}'."
+    )
 
 
-def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
+def extract_yes_no_token_ids(market: dict):
     """
-    Gamma markets often include:
-      - outcomes (JSON string or list)
-      - clobTokenIds (JSON string or list)
-    We'll map YES/NO to token IDs.
+    Robustly maps tokenIds to YES/NO for:
+      - YES/NO markets
+      - UP/DOWN markets (Up=YES, Down=NO)
+      - generic 2-outcome markets (index 0=YES, index 1=NO)
+
+    Returns: (yes_token_id, no_token_id) as strings, or (None, None)
     """
-    def maybe_json(x):
-        if x is None:
-            return None
-        if isinstance(x, (list, dict)):
-            return x
-        if isinstance(x, str):
-            s = x.strip()
-            if not s:
-                return None
-            # try parse JSON array/object
-            try:
-                return json.loads(s)
-            except Exception:
-                return None
-        return None
+    outcomes = _maybe_json_list(market.get("outcomes"))
+    token_ids = _maybe_json_list(market.get("tokenIds")) or _maybe_json_list(market.get("tokenIDs"))
+    if not outcomes or not token_ids or len(outcomes) != len(token_ids):
+        return (None, None)
 
-    outcomes = maybe_json(market.get("outcomes"))
-    token_ids = maybe_json(market.get("clobTokenIds"))
+    # Normalize labels
+    labels = []
+    for o in outcomes:
+        if isinstance(o, str):
+            labels.append(o.strip().upper())
+        else:
+            labels.append(str(o).strip().upper())
 
-    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
-        return None, None
-    if len(outcomes) != len(token_ids):
-        return None, None
+    # Direct YES/NO
+    try:
+        yes_i = labels.index("YES")
+        no_i = labels.index("NO")
+        return (str(token_ids[yes_i]), str(token_ids[no_i]))
+    except ValueError:
+        pass
 
-    yes_id = None
-    no_id = None
-    for o, tid in zip(outcomes, token_ids):
-        if not isinstance(o, str):
-            continue
-        if o.strip().upper() == "YES":
-            yes_id = str(tid)
-        if o.strip().upper() == "NO":
-            no_id = str(tid)
-    return yes_id, no_id
+    # UP/DOWN -> YES/NO
+    if "UP" in labels and "DOWN" in labels:
+        up_i = labels.index("UP")
+        down_i = labels.index("DOWN")
+        return (str(token_ids[up_i]), str(token_ids[down_i]))
+
+    # Fallback: exactly 2 outcomes
+    if len(labels) == 2:
+        return (str(token_ids[0]), str(token_ids[1]))
+
+    return (None, None)
+
 
 
 def clob_midpoint(token_id: str) -> Optional[float]:

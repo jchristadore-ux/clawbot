@@ -100,12 +100,13 @@ def ensure_tables():
     Fixes:
       psycopg2.errors.UndefinedColumn: column "as_of_date" of relation "bot_state" does not exist
 
-    Your bot_state table already exists but its schema is older/different.
-    This patch:
-      - Creates bot_state if missing
-      - Adds missing columns (id, as_of_date, position, entry_price, entry_ts, last_action, updated_at)
-      - Ensures a single state row exists using a safe INSERT ... WHERE NOT EXISTS
-        (no ON CONFLICT needed, since id may not be unique/PK in your existing schema)
+    Root cause: you're still running an older ensure_tables() that inserts into as_of_date
+    before ensuring that column exists (and/or still uses ON CONFLICT).
+
+    This version:
+      - Ensures bot_state exists
+      - Adds missing columns (including as_of_date) using ADD COLUMN IF NOT EXISTS
+      - Inserts id=1 row WITHOUT ON CONFLICT (so no PK/unique requirements)
     """
     import os
     import psycopg2
@@ -114,19 +115,25 @@ def ensure_tables():
     conn.autocommit = True
     cur = conn.cursor()
 
-    # 1) Ensure table exists (minimal stub)
+    # Ensure table exists
     cur.execute("CREATE TABLE IF NOT EXISTS bot_state ();")
 
-    # 2) Add columns if missing (idempotent)
+    # Ensure required columns exist (idempotent)
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS id INTEGER;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS as_of_date DATE;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS position TEXT;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_price DOUBLE PRECISION;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS entry_ts TIMESTAMPTZ;")
     cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_action TEXT;")
-    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();")
+    cur.execute("ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;")
 
-    # 3) Ensure the single-row state record exists (no PK/unique assumptions)
+    # Backfill updated_at default for new rows (safe if column already existed)
+    cur.execute("""
+        ALTER TABLE bot_state
+        ALTER COLUMN updated_at SET DEFAULT NOW();
+    """)
+
+    # Ensure single row exists (NO ON CONFLICT)
     cur.execute("""
         INSERT INTO bot_state (id, as_of_date, position, entry_price, entry_ts, last_action)
         SELECT 1, CURRENT_DATE, 'NO', NULL, NULL, 'BOOT'

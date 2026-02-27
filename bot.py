@@ -8,7 +8,6 @@ from typing import Optional, Dict, Any, Tuple
 
 import requests
 import psycopg2
-F
 
 # ----------------------------
 # Logging

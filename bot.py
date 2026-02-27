@@ -260,29 +260,32 @@ def gamma_search(query: str) -> Optional[dict]:
 
 def fetch_gamma_market_and_tokens(poly_slug: str):
     """
-    Gamma resolver that is resilient to Bun route differences.
+    Gamma resolver that does NOT depend on Bun.
+
+    Uses official Gamma API directly (public):
+      - GET /markets?slug=...
+      - GET /markets/slug/...
+
+    Tries:
+      1) poly_slug (rolling)
+      2) stitched env_base -> rolling
+      3) prefix search via /public-search (markets) as last resort
 
     Requires:
-      - fetch_gamma_market_by_slug(slug) -> dict|None
       - extract_yes_no_token_ids(market) -> (yes_id, no_id)
-      - BUN_BASE_URL env var
     """
     import os
     import re
     import requests
 
-    raw_base = (os.getenv("BUN_BASE_URL") or "").strip()
-    if not raw_base:
-        raise RuntimeError("BUN_BASE_URL is not set.")
-    if not raw_base.startswith("http"):
-        raw_base = "https://" + raw_base
-    BUN_BASE_URL = raw_base.rstrip("/")
+    GAMMA_BASE = "https://gamma-api.polymarket.com"
 
     def _parse_epochs(slug: str):
         return re.findall(r"\b\d{9,12}\b", slug or "")
 
     def _strip_to_prefix(slug: str):
-        return re.sub(r"(-\d{9,12}){1,2}$", "", slug or "")
+        # btc-updown-5m-1772165400-1772200200 -> btc-updown-5m
+        return re.sub(r"(-\d{9,12}){1,2}$", "", (slug or "").strip())
 
     def _stitch_base_to_rolling(base: str, rolling: str):
         base = (base or "").strip()
@@ -296,112 +299,84 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
             return f"{base}-{r_epochs[-1]}"
         return base
 
-    def _try_get(url: str, params: dict):
-        r = requests.get(url, params=params, timeout=20)
-        # Return tuple: (status_code, json_or_none)
-        try:
-            return r.status_code, (r.json() if r.headers.get("content-type","").startswith("application/json") else None)
-        except Exception:
-            return r.status_code, None
+    def _gamma_get_market_by_slug(slug: str):
+        slug = (slug or "").strip()
+        if not slug:
+            return None
 
-    def _gamma_search(query: str):
-        """
-        Try several known route shapes so we don't 404-crash on mismatched Bun endpoints.
-        Expected JSON shapes supported:
-          - {"ok": true, "data": [...]}
-          - {"data": [...]}
-          - [...] (raw list)
-        """
-        q = (query or "").strip()
+        # Option A: query param
+        r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            # /markets returns a list
+            if isinstance(j, list) and j:
+                return j[0]
+
+        # Option B: path endpoint
+        r2 = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=20)
+        if r2.status_code == 200:
+            j2 = r2.json()
+            if isinstance(j2, dict) and j2:
+                return j2
+
+        return None
+
+    def _gamma_public_search(q: str):
+        # broad search fallback; returns dict with "markets" list
+        q = (q or "").strip()
         if not q:
             return []
-
-        candidates = [
-            (f"{BUN_BASE_URL}/gamma/markets", {"search": q, "limit": 25}),
-            (f"{BUN_BASE_URL}/gamma/markets/search", {"q": q, "limit": 25}),
-            (f"{BUN_BASE_URL}/gamma/search", {"q": q, "limit": 25}),
-            (f"{BUN_BASE_URL}/gamma/market-search", {"q": q, "limit": 25}),
-            (f"{BUN_BASE_URL}/gamma", {"search": q, "limit": 25}),
-        ]
-
-        errors = []
-        for url, params in candidates:
-            status, payload = _try_get(url, params)
-            if status == 200 and payload is not None:
-                if isinstance(payload, list):
-                    return payload
-                if isinstance(payload, dict):
-                    data = payload.get("data")
-                    if isinstance(data, list):
-                        return data
-            errors.append((url, status))
-
-        raise RuntimeError(f"Bun Gamma search endpoint not found/usable. Tried: {errors}")
+        r = requests.get(f"{GAMMA_BASE}/public-search", params={"query": q}, timeout=20)
+        r.raise_for_status()
+        j = r.json()
+        mkts = j.get("markets") if isinstance(j, dict) else None
+        return mkts if isinstance(mkts, list) else []
 
     tried = []
 
-    # 1) Try rolling slug directly (Gamma by slug)
+    # 1) Try rolling slug directly
     tried.append(("by_slug", poly_slug))
-    m = fetch_gamma_market_by_slug(poly_slug)
+    m = _gamma_get_market_by_slug(poly_slug)
     if m:
         y, n = extract_yes_no_token_ids(m)
         if y and n:
             return m, y, n
 
-    # 2) Stitch env base -> rolling
+    # 2) Try stitched env base -> rolling
     env_base = (os.getenv("POLY_GAMMA_SLUG") or os.getenv("POLY_MARKET_SLUG") or "").strip()
     stitched = _stitch_base_to_rolling(env_base, poly_slug)
-
     if stitched and stitched != poly_slug:
         tried.append(("by_slug", stitched))
-        m2 = fetch_gamma_market_by_slug(stitched)
+        m2 = _gamma_get_market_by_slug(stitched)
         if m2:
             y, n = extract_yes_no_token_ids(m2)
             if y and n:
                 return m2, y, n
 
-    # 3) Search fallback (broadening terms)
-    queries = []
-    if poly_slug:
-        queries.append(poly_slug)
-    if stitched and stitched not in queries:
-        queries.append(stitched)
-    if env_base and env_base not in queries:
-        queries.append(env_base)
-
+    # 3) Last resort: search by prefix (Gamma often indexes better on prefix than full epoch slug)
     prefix = _strip_to_prefix(env_base) or _strip_to_prefix(poly_slug)
-    if prefix and prefix not in queries:
-        queries.append(prefix)
+    tried.append(("public_search", prefix))
+    results = _gamma_public_search(prefix)
 
-    for q in queries:
-        tried.append(("search", q))
-        results = _gamma_search(q) or []
-        if not results:
-            continue
-
-        # Prefer exact rolling match, else first
+    if results:
+        # Prefer exact slug match to rolling, else take first market
         chosen = None
         for r in results:
             if (r.get("slug") or "").strip() == poly_slug:
                 chosen = r
                 break
         chosen = chosen or results[0]
-
         slug = (chosen.get("slug") or "").strip()
-        if not slug:
-            continue
-
-        tried.append(("by_slug", slug))
-        m3 = fetch_gamma_market_by_slug(slug)
-        if not m3:
-            continue
-
-        y, n = extract_yes_no_token_ids(m3)
-        if y and n:
-            return m3, y, n
+        if slug:
+            tried.append(("by_slug", slug))
+            m3 = _gamma_get_market_by_slug(slug)
+            if m3:
+                y, n = extract_yes_no_token_ids(m3)
+                if y and n:
+                    return m3, y, n
 
     raise RuntimeError(
-        f"Gamma resolution failed. poly_slug={poly_slug} env_base={env_base} tried={tried}"
+        f"Gamma market/token resolution failed. poly_slug='{poly_slug}' env_base='{env_base}' stitched='{stitched}' tried={tried}"
     )
 
 def extract_yes_no_token_ids(market: dict):

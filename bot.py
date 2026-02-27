@@ -115,37 +115,39 @@ def http_post_json(
 # ----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("Missing DATABASE_URL")
-    # Railway often requires sslmode=require
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-
 def ensure_tables() -> None:
+    """
+    Compatible with existing schemas where bot_state has a NOT NULL 'key' column.
+    We'll store the bot's state under key='main'.
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # Create bot_state if it doesn't exist (keyed schema)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bot_state (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    key TEXT PRIMARY KEY,
                     as_of_date DATE,
                     position TEXT,
                     entry_price DOUBLE PRECISION,
                     stake DOUBLE PRECISION,
                     trades_today INTEGER,
-                    pnl_today_realized DOUBLE PRECISION
+                    pnl_today_realized DOUBLE PRECISION,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
                 """
             )
+
+            # Ensure row exists for key='main'
             cur.execute(
                 """
-                INSERT INTO bot_state (id, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized)
-                VALUES (1, CURRENT_DATE, NULL, NULL, 0, 0, 0)
-                ON CONFLICT (id) DO NOTHING;
+                INSERT INTO bot_state (key, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized)
+                VALUES ('main', CURRENT_DATE, NULL, NULL, 0, 0, 0)
+                ON CONFLICT (key) DO NOTHING;
                 """
             )
+
+            # Equity snapshots table (safe)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -162,6 +164,7 @@ def ensure_tables() -> None:
                 );
                 """
             )
+
         conn.commit()
 
 
@@ -172,12 +175,13 @@ def load_state() -> Dict[str, Any]:
                 """
                 SELECT as_of_date, position, entry_price, stake, trades_today, pnl_today_realized
                 FROM bot_state
-                WHERE id=1;
+                WHERE key='main';
                 """
             )
             row = cur.fetchone()
 
     if not row:
+        # Shouldn't happen because ensure_tables inserts it, but safe fallback
         return {
             "as_of_date": date.today(),
             "position": None,
@@ -203,8 +207,14 @@ def save_state(state: Dict[str, Any]) -> None:
             cur.execute(
                 """
                 UPDATE bot_state
-                SET as_of_date=%s, position=%s, entry_price=%s, stake=%s, trades_today=%s, pnl_today_realized=%s
-                WHERE id=1;
+                SET as_of_date=%s,
+                    position=%s,
+                    entry_price=%s,
+                    stake=%s,
+                    trades_today=%s,
+                    pnl_today_realized=%s,
+                    updated_at=NOW()
+                WHERE key='main';
                 """,
                 (
                     state["as_of_date"],
@@ -216,6 +226,12 @@ def save_state(state: Dict[str, Any]) -> None:
                 ),
             )
         conn.commit()
+        
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL")
+    # Railway often requires sslmode=require
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def record_equity_snapshot(

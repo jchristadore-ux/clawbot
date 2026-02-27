@@ -311,22 +311,20 @@ def gamma_search(query: str) -> Optional[dict]:
     url = f"{POLY_GAMMA_HOST}/search"
     return http_get_json(url, params={"query": query})
 
-
 def fetch_gamma_market_and_tokens(poly_slug: str):
     """
-    Gamma resolver that handles multiple slug shapes, with a priority order that
-    fixes the exact bug you hit:
+    Gamma resolver that supports:
+      - Market-by-slug lookup
+      - Event-by-slug lookup (CRITICAL for 5-minute up/down pages)
+      - Fallback discovery via /events (recommended by Gamma docs)
 
-      - If your env accidentally includes an epoch (btc-updown-5m-<epoch>),
-        you can end up generating a start-end poly_slug that doesn't exist on Gamma.
-      - Gamma rolling markets for 5m are typically one-epoch slugs:
-            <prefix>-<epoch>
-
-    This resolver tries:
-      1) exact rolling slug: <prefix>-<start_epoch>   (critical)
-      2) exact rolling slug: <prefix>-<end_epoch>
-      3) provided poly_slug (in case it is already correct)
-      4) list+score recent markets as fallback
+    Returns dict in the shape main() expects:
+      {
+        "market": <market_obj>,
+        "yes_token_id": "...",
+        "no_token_id": "...",
+        "slug": "<market_slug>"
+      }
     """
     GAMMA_BASE = POLY_GAMMA_HOST
 
@@ -341,7 +339,7 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
         if not slug:
             return None
 
-        # /markets?slug= returns list (more reliable sometimes)
+        # /markets?slug= returns list
         r = requests.get(f"{GAMMA_BASE}/markets", params={"slug": slug}, timeout=20)
         if r.status_code == 200:
             j = r.json()
@@ -357,14 +355,57 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
 
         return None
 
-    def _gamma_list_markets(limit: int = 200, offset: int = 0):
+    def _gamma_get_event_by_slug_exact(slug: str):
+        slug = (slug or "").strip()
+        if not slug:
+            return None
+
+        # /events?slug= returns list
+        r = requests.get(f"{GAMMA_BASE}/events", params={"slug": slug}, timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, list) and j:
+                return j[0]
+
+        # fallback: /events/slug/<slug> returns object
+        r2 = requests.get(f"{GAMMA_BASE}/events/slug/{slug}", timeout=20)
+        if r2.status_code == 200:
+            j2 = r2.json()
+            if isinstance(j2, dict) and j2:
+                return j2
+
+        return None
+
+    def _event_pick_market(ev: dict) -> Optional[dict]:
+        """
+        Gamma event objects typically include markets. Handle a couple shapes.
+        """
+        if not ev or not isinstance(ev, dict):
+            return None
+
+        markets = ev.get("markets")
+
+        # Sometimes markets is JSON string or list
+        markets = _maybe_json_list(markets) if not isinstance(markets, list) else markets
+
+        if isinstance(markets, list) and markets:
+            # Choose the first market; for a 2-outcome event this is usually correct.
+            # If you later want to be picky: pick the one with outcomes containing Up/Down or Yes/No.
+            return markets[0]
+
+        return None
+
+    def _gamma_list_events(limit: int = 200, offset: int = 0):
+        # Per Gamma docs: prefer events endpoint for broad discovery
         params = {
+            "active": "true",
+            "closed": "false",
             "limit": limit,
             "offset": offset,
-            "order": "createdAt",
+            "order": "start_date",
             "ascending": "false",
         }
-        r = requests.get(f"{GAMMA_BASE}/markets", params=params, timeout=25)
+        r = requests.get(f"{GAMMA_BASE}/events", params=params, timeout=25)
         r.raise_for_status()
         j = r.json()
         return j if isinstance(j, list) else []
@@ -382,98 +423,99 @@ def fetch_gamma_market_and_tokens(poly_slug: str):
     tried.append(("start_epoch", start_epoch))
     tried.append(("end_epoch", end_epoch))
 
-    # 1) Try the canonical one-epoch forms FIRST (this fixes your crash)
+    # Candidate slugs to try directly
     candidates = []
     if pfx and start_epoch:
         candidates.append(f"{pfx}-{start_epoch}")
     if pfx and end_epoch:
         candidates.append(f"{pfx}-{end_epoch}")
-
-    # 2) Then try whatever we were given/generated
     if poly_slug:
         candidates.append(poly_slug)
 
-    # 3) Also try if poly_slug contains two epochs: <pfx>-<start>-<end>, try both single-epoch variants
-    # (already covered above), but keep as explicit for clarity.
-
-    # De-dupe while preserving order
+    # de-dupe preserve order
     seen = set()
     candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
 
+    # 1) Try MARKET by slug, then EVENT by slug
     for slug in candidates:
-        tried.append(("by_slug", slug))
+        tried.append(("market_by_slug", slug))
         m = _gamma_get_market_by_slug_exact(slug)
         if m:
             y, n = extract_yes_no_token_ids(m)
             if y and n:
-                # Return in the exact dict shape main() expects
-                return {
-                    "market": m,
-                    "yes_token_id": y,
-                    "no_token_id": n,
-                    "slug": m.get("slug") or slug,
-                }
+                return {"market": m, "yes_token_id": y, "no_token_id": n, "slug": m.get("slug") or slug}
 
-    # 4) List recent markets and match by prefix + epoch containment
-    best = None  # (score, market)
-    pages = 50   # 50 * 200 = 10,000 markets max
+        tried.append(("event_by_slug", slug))
+        ev = _gamma_get_event_by_slug_exact(slug)
+        if ev:
+            m2 = _event_pick_market(ev)
+            if m2:
+                y, n = extract_yes_no_token_ids(m2)
+                if y and n:
+                    return {"market": m2, "yes_token_id": y, "no_token_id": n, "slug": m2.get("slug") or ""}
+
+    # 2) Fallback: scan recent EVENTS and score by prefix + near-epoch match
+    best = None  # (score, market_obj, event_slug)
+    pages = 50
     limit = 200
 
-    def _score_slug(mslug: str):
-        if not mslug:
+    def _extract_last_epoch(s: str) -> Optional[int]:
+        nums = re.findall(r"\d{9,12}", s or "")
+        if not nums:
+            return None
+        try:
+            return int(nums[-1])
+        except Exception:
+            return None
+
+    def _score_event(ev: dict) -> int:
+        if not ev or not isinstance(ev, dict):
             return 0
-        if not pfx or not mslug.startswith(pfx):
+        eslug = (ev.get("slug") or "").strip()
+        if not eslug or not pfx or not eslug.startswith(pfx):
             return 0
 
-        score = 10  # base prefix match
+        score = 10
+        ep = _extract_last_epoch(eslug)
 
-        # prefer slugs containing end epoch anywhere (end-only or windowed)
-        if end_epoch and str(end_epoch) in mslug:
-            score += 80
+        # Strong match if exact epoch matches
+        if ep is not None and start_epoch is not None and ep == int(start_epoch):
+            score += 100
 
-        # bonus if also contains start epoch
-        if start_epoch and str(start_epoch) in mslug:
-            score += 15
-
-        # bonus if looks exactly like end-only format
-        if end_epoch and mslug == f"{pfx}-{end_epoch}":
-            score += 25
-
-        # bonus if looks exactly like start-only format
-        if start_epoch and mslug == f"{pfx}-{start_epoch}":
-            score += 25
+        # Also accept +/- 300s tolerance (sometimes your cron and their creation tick differ)
+        if ep is not None and start_epoch is not None:
+            if abs(ep - int(start_epoch)) == 300:
+                score += 70
+            elif abs(ep - int(start_epoch)) == 600:
+                score += 40
 
         return score
 
     for page in range(pages):
         offset = page * limit
-        tried.append(("list_markets_offset", offset))
-        mkts = _gamma_list_markets(limit=limit, offset=offset)
-        if not mkts:
+        tried.append(("list_events_offset", offset))
+        evs = _gamma_list_events(limit=limit, offset=offset)
+        if not evs:
             break
 
-        for cand in mkts:
-            slug = (cand.get("slug") or "").strip()
-            sc = _score_slug(slug)
+        for ev in evs:
+            sc = _score_event(ev)
             if sc <= 0:
                 continue
+            m = _event_pick_market(ev)
+            if not m:
+                continue
             if best is None or sc > best[0]:
-                best = (sc, cand)
+                best = (sc, m, (ev.get("slug") or "").strip())
 
-        # stop early if we have a very strong match
         if best and best[0] >= 110:
             break
 
     if best:
-        m2 = best[1]
-        y, n = extract_yes_no_token_ids(m2)
+        m3 = best[1]
+        y, n = extract_yes_no_token_ids(m3)
         if y and n:
-            return {
-                "market": m2,
-                "yes_token_id": y,
-                "no_token_id": n,
-                "slug": m2.get("slug") or "",
-            }
+            return {"market": m3, "yes_token_id": y, "no_token_id": n, "slug": m3.get("slug") or ""}
 
     raise RuntimeError(
         "Gamma market/token resolution failed. "

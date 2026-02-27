@@ -275,10 +275,13 @@ POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip() or POLY_MARKET_SLUG
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
     def maybe_json(x):
-        return None
+        if x is None:
+            return None
         if isinstance(x, (list, dict)):
             return x
         if isinstance(x, str):
+            s = x.strip()
+            if not s:
                 return None
             try:
                 return json.loads(s)
@@ -291,19 +294,16 @@ def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]
 
     if not isinstance(outcomes, list) or not isinstance(token_ids, list):
         return None, None
+
     if len(outcomes) != len(token_ids) or len(outcomes) < 2:
         return None, None
 
-    # Common cases:
-    # - ["Yes","No"] => [yes_token, no_token]
-    # - ["Up","Down"] => treat Up as YES side, Down as NO side for our strategy conventions
+    # Normalize
     norm = [str(o).strip().upper() for o in outcomes]
 
-    if norm[0] in ("YES", "UP") and norm[1] in ("NO", "DOWN"):
-        return str(token_ids[0]), str(token_ids[1])
+    yes_id = None
+    no_id = None
 
-    # fallback: try explicit scan
-    yes_id = no_id = None
     for o, tid in zip(norm, token_ids):
         if o in ("YES", "UP"):
             yes_id = str(tid)

@@ -1,36 +1,44 @@
 # bot.py — Johnny 5 (Polymarket rolling 5m markets)
 #
-# Key behavior:
-# - POLY_MARKET_SLUG must be your BASE rolling slug prefix, e.g. "btc-updown-5m"
-# - We compute the current 5-minute bucket epoch, then scan backwards until we find
-#   a bucket whose YES/NO tokens BOTH have a live CLOB midpoint (i.e., a real orderbook).
-# - This avoids crashes like: {"error":"No orderbook exists for the requested token id"}
+# What this version fixes (based on your logs):
+# 1) Works with your EXISTING bot_state table that has NOT NULL columns (id, key).
+#    - We never insert NULL id/key.
+#    - We store state under key='main'.
+# 2) Resolves rolling 5m slugs by scanning recent buckets until we find tokens with live CLOB books.
+# 3) Robust token extraction for Yes/No and Up/Down outcome naming + multiple Gamma shapes.
+# 4) CLOB pricing: tries /midpoint; if missing, falls back to /book best bid/ask; handles empty books cleanly.
+# 5) Bun health check no longer hardcodes /__ping; configurable via BUN_HEALTH_PATH (default "/health", fallback "/").
 #
-# Env (most important):
+# Required env:
 #   DATABASE_URL=...
 #   POLY_MARKET_SLUG=btc-updown-5m
+#
+# Recommended env:
 #   POLY_GAMMA_HOST=https://gamma-api.polymarket.com
 #   POLY_CLOB_HOST=https://clob.polymarket.com
-#   POLY_GAMMA_SLUG= (optional; if you know the exact Gamma slug)
+#
+# Live/trading env (optional):
 #   RUN_MODE=DRY_RUN | PAPER | LIVE
 #   LIVE_TRADING_ENABLED=true/false
-#   KILL_SWITCH=true/false   (true = do NOT trade)
-#   BUN_BASE_URL=https://... (your Bun order gateway)
+#   KILL_SWITCH=true/false
+#   BUN_BASE_URL=https://...      (your Bun order gateway)
+#   BUN_HEALTH_PATH=/health       (or whatever your server supports)
 #
-# Optional knobs:
-#   LOOKBACK_BUCKETS=24  (24*5m = 2 hours)
+# Knobs:
+#   LOOKBACK_BUCKETS=24           (24*5m = 2 hours)
+#   LOOP_SECONDS=30
+#   RUN_LOOP=true/false
 #   EDGE_ENTER=0.10
 #   MAX_TRADES_PER_DAY=60
 #   LIVE_TRADE_SIZE=1.0
-#   RUN_LOOP=true/false
-#   LOOP_SECONDS=30
+#   PAPER_BALANCE=0
 
 import os
 import json
 import time
 import logging
 from datetime import datetime, timezone, date
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import requests
 import psycopg2
@@ -115,21 +123,28 @@ def http_post_json(
 # ----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
+
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("Missing DATABASE_URL")
+    # Railway commonly requires SSL
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
 def ensure_tables() -> None:
     """
-    Compatible with an existing bot_state table that has:
-      - id NOT NULL (often PK) without a default
-      - key column used to identify the row (we use key='main')
+    Your existing DB already has a bot_state table with NOT NULL constraints on:
+      - id
+      - key
+    and likely other columns.
+    We DO NOT try to recreate/alter that table. We only ensure a row exists for key='main'
+    without inserting NULL id.
 
-    We will:
-      1) Create equity_snapshots if missing (safe)
-      2) Ensure bot_state has a row with key='main' by:
-         - UPDATE first
-         - if no rows updated, INSERT with id = MAX(id)+1
+    We also create equity_snapshots if missing (safe, new table).
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # Safe: create equity snapshots table if missing
+            # Safe new table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -147,7 +162,7 @@ def ensure_tables() -> None:
                 """
             )
 
-            # 1) Try to "touch" the row if it already exists
+            # Touch existing row if it exists
             cur.execute(
                 """
                 UPDATE bot_state
@@ -156,8 +171,10 @@ def ensure_tables() -> None:
                 """
             )
 
-            # 2) If no row exists, insert one with a non-null id
+            # If absent, insert with id=max(id)+1 (never NULL)
             if cur.rowcount == 0:
+                # NOTE: these column names must exist in your bot_state table.
+                # If your bot_state uses different names, you'll see a "column does not exist" error.
                 cur.execute(
                     """
                     INSERT INTO bot_state (
@@ -178,6 +195,7 @@ def ensure_tables() -> None:
 
         conn.commit()
 
+
 def load_state() -> Dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -191,7 +209,6 @@ def load_state() -> Dict[str, Any]:
             row = cur.fetchone()
 
     if not row:
-        # Shouldn't happen because ensure_tables inserts it, but safe fallback
         return {
             "as_of_date": date.today(),
             "position": None,
@@ -236,12 +253,6 @@ def save_state(state: Dict[str, Any]) -> None:
                 ),
             )
         conn.commit()
-        
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("Missing DATABASE_URL")
-    # Railway often requires sslmode=require
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def record_equity_snapshot(
@@ -267,16 +278,13 @@ def record_equity_snapshot(
 
 
 # ----------------------------
-# Gamma/CLOB
+# Gamma / CLOB
 # ----------------------------
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
 # BASE rolling slug prefix (required): e.g. "btc-updown-5m"
 POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
-
-# Optional exact Gamma slug if you know it
-POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip() or POLY_MARKET_SLUG
 
 
 def _maybe_json(x):
@@ -297,10 +305,11 @@ def _maybe_json(x):
 
 def fetch_gamma_market_by_slug(slug: str) -> Optional[dict]:
     url = f"{POLY_GAMMA_HOST}/markets/slug/{slug}"
-    code, j, _ = http_get_json(url)
+    code, j, _ = http_get_json(url, timeout=20)
     if code != 200 or not isinstance(j, dict):
         return None
     return j
+
 
 def _norm_outcome_name(s: str) -> str:
     s = (s or "").strip().upper()
@@ -308,29 +317,25 @@ def _norm_outcome_name(s: str) -> str:
         return "YES"
     if s in ("NO", "N"):
         return "NO"
+    # Map Up/Down style markets to YES/NO side semantics
     if s in ("UP", "HIGHER", "ABOVE", "INCREASE", "BULL"):
-        return "YES"   # treat UP as YES-side
+        return "YES"
     if s in ("DOWN", "LOWER", "BELOW", "DECREASE", "BEAR"):
-        return "NO"    # treat DOWN as NO-side
+        return "NO"
     return s
 
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
     """
     Robust extraction for rolling markets where outcomes can be Yes/No or Up/Down.
-    Tries multiple Gamma shapes:
-      - outcomes + clobTokenIds
-      - outcomePrices + outcomes + clobTokenIds (strings)
-      - tokens[] objects
-      - outcomeTokens/outcomeTokenIds variants
-    Returns (yes_token_id, no_token_id) where yes = UP/YES side.
+    Tries multiple Gamma shapes and common field variants.
+    Returns (yes_token_id, no_token_id) where "yes" is the UP/YES side.
     """
-
-    # 0) If Gamma wrapped it
+    # If Gamma wrapped it
     if "market" in market and isinstance(market["market"], dict):
         market = market["market"]
 
-    # 1) Classic fields: outcomes + clobTokenIds (often JSON strings)
+    # 1) Classic: outcomes + clobTokenIds (often JSON-encoded strings)
     outcomes = _maybe_json(market.get("outcomes"))
     token_ids = _maybe_json(market.get("clobTokenIds"))
 
@@ -347,7 +352,7 @@ def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]
         if yes_id and no_id:
             return yes_id, no_id
 
-    # 2) Sometimes tokens are embedded
+    # 2) Tokens embedded as objects
     tokens = market.get("tokens") or market.get("outcomeTokens") or market.get("outcome_tokens")
     if isinstance(tokens, str):
         tokens = _maybe_json(tokens)
@@ -368,11 +373,9 @@ def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]
         if yes_id and no_id:
             return yes_id, no_id
 
-    # 3) Fallback: try to find any 2 token ids + map by outcomes heuristics
-    # If we have outcomes but token field name differs
+    # 3) Fallback variants: tokenIds aligned with outcomes
     for key in ("tokenIds", "token_ids", "clob_token_ids", "clobTokenIDs"):
-        maybe = market.get(key)
-        maybe = _maybe_json(maybe)
+        maybe = _maybe_json(market.get(key))
         if isinstance(maybe, list) and isinstance(outcomes, list) and len(maybe) == len(outcomes):
             yes_id, no_id = None, None
             for o, tid in zip(outcomes, maybe):
@@ -389,43 +392,74 @@ def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]
     return None, None
 
 
-def clob_midpoint(token_id: str) -> Tuple[int, Optional[float], str]:
+def clob_book_exists(token_id: str) -> Tuple[bool, int]:
     """
-    Returns (http_status, midpoint_or_none, raw_text_snippet)
-    404 => no orderbook exists for this token_id
-    """
-    url = f"{POLY_CLOB_HOST}/midpoint"
-    code, j, text = http_get_json(url, params={"token_id": token_id}, timeout=10)
-
-    if code != 200 or not isinstance(j, dict):
-        return code, None, text
-
-    mp = j.get("midpoint")
-    if mp is None:
-        mp = j.get("mid_price")
-    try:
-        return code, float(mp), text
-    except Exception:
-        return code, None, text
-
-def has_live_book(token_id: str) -> Tuple[bool, int]:
-    """
-    Returns (has_book, http_status)
-    200 => endpoint exists for token (book exists / tradable)
-    404 => no orderbook exists for token
+    Strong existence check: /book returns 200 if the orderbook exists for token_id.
     """
     url = f"{POLY_CLOB_HOST}/book"
-    code, j, text = http_get_json(url, params={"token_id": token_id}, timeout=10)
-
-    # /book is the strongest existence check
+    code, _, text = http_get_json(url, params={"token_id": token_id}, timeout=10)
     if code == 200:
         return True, code
-
-    # Log unusual cases for debugging (rate limit, etc.)
     if code not in (404, 400):
         log.warning("CLOB /book unexpected status=%s token_id=%s body=%s", code, token_id, text[:200])
-
     return False, code
+
+
+def clob_price(token_id: str) -> Tuple[int, Optional[float], str]:
+    """
+    Returns (http_status, price_or_none, source).
+    Tries /midpoint first; if missing/None, falls back to /book best bid/ask.
+    """
+    # 1) Try midpoint
+    url = f"{POLY_CLOB_HOST}/midpoint"
+    code, j, _ = http_get_json(url, params={"token_id": token_id}, timeout=10)
+
+    if code == 200 and isinstance(j, dict):
+        mp = j.get("midpoint")
+        if mp is None:
+            mp = j.get("mid_price")
+        if mp is not None:
+            try:
+                return 200, float(mp), "midpoint"
+            except Exception:
+                pass  # fallthrough
+
+    # 2) Fallback: orderbook best bid/ask
+    url = f"{POLY_CLOB_HOST}/book"
+    code2, j2, text2 = http_get_json(url, params={"token_id": token_id}, timeout=10)
+    if code2 != 200 or not isinstance(j2, dict):
+        return code2, None, f"book_unavailable:{text2[:120]}"
+
+    bids = j2.get("bids") or []
+    asks = j2.get("asks") or []
+
+    def _best_px(levels: List[dict], want_max: bool) -> Optional[float]:
+        best = None
+        for lvl in levels:
+            if not isinstance(lvl, dict):
+                continue
+            p = lvl.get("price")
+            if p is None:
+                continue
+            try:
+                pf = float(p)
+            except Exception:
+                continue
+            best = pf if best is None else (max(best, pf) if want_max else min(best, pf))
+        return best
+
+    best_bid = _best_px(bids, want_max=True)
+    best_ask = _best_px(asks, want_max=False)
+
+    if best_bid is not None and best_ask is not None:
+        return 200, (best_bid + best_ask) / 2.0, f"book_mid(bid={best_bid},ask={best_ask})"
+    if best_bid is not None:
+        return 200, best_bid, f"book_bid({best_bid})"
+    if best_ask is not None:
+        return 200, best_ask, f"book_ask({best_ask})"
+
+    return 200, None, "book_empty"
+
 
 def resolve_tradable_rolling_market(
     base_slug: str,
@@ -440,17 +474,15 @@ def resolve_tradable_rolling_market(
         log.info("Checking slug=%s", slug)
 
         m = fetch_gamma_market_by_slug(slug)
-        log.info(
-            "Gamma market: slug=%s enableOrderBook=%s active=%s closed=%s",
-            slug,
-            m.get("enableOrderBook"),
-            m.get("active"),
-            m.get("closed"),
-        )
-        
         if not m:
             log.info("Gamma miss for slug=%s", slug)
             continue
+
+        # Helpful one-line sanity check (keep; low noise)
+        log.info(
+            "Gamma market: slug=%s enableOrderBook=%s active=%s closed=%s",
+            slug, m.get("enableOrderBook"), m.get("active"), m.get("closed"),
+        )
 
         yes_id, no_id = extract_yes_no_token_ids(m)
 
@@ -464,8 +496,8 @@ def resolve_tradable_rolling_market(
             )
             continue
 
-        y_ok, y_code = has_live_book(yes_id)
-        n_ok, n_code = has_live_book(no_id)
+        y_ok, y_code = clob_book_exists(yes_id)
+        n_ok, n_code = clob_book_exists(no_id)
 
         if y_ok and n_ok:
             log.info("Found tradable slug=%s", slug)
@@ -478,24 +510,26 @@ def resolve_tradable_rolling_market(
 
     return None, None, None, None
 
+
 # ----------------------------
 # Bun live order gateway
 # ----------------------------
 BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
+BUN_HEALTH_PATH = os.getenv("BUN_HEALTH_PATH", "/health").strip() or "/health"
 
 
 def bun_health() -> Optional[int]:
     if not BUN_BASE_URL:
         return None
-    try:
-        r = requests.get(f"{BUN_BASE_URL}/__ping", timeout=8)
-        return r.status_code
-    except Exception:
+
+    # Try configured path, then fallback to "/"
+    for path in (BUN_HEALTH_PATH, "/"):
         try:
-            r = requests.get(f"{BUN_BASE_URL}/", timeout=8)
+            r = requests.get(f"{BUN_BASE_URL}{path}", timeout=8)
             return r.status_code
         except Exception:
-            return None
+            continue
+    return None
 
 
 def bun_place_order(token_id: str, side: str, price: float, size: float) -> Tuple[bool, str]:
@@ -515,7 +549,7 @@ def bun_place_order(token_id: str, side: str, price: float, size: float) -> Tupl
 
 
 # ----------------------------
-# Strategy / Risk (placeholder baseline)
+# Strategy / Risk (simple baseline)
 # ----------------------------
 EDGE_ENTER = env_float("EDGE_ENTER", 0.10)
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "60"))
@@ -527,8 +561,8 @@ LOOKBACK_BUCKETS = int(os.getenv("LOOKBACK_BUCKETS", "24"))  # 24*5m = 2 hours
 def compute_signal(poly_up: float, fair_up: float) -> Tuple[str, float]:
     """
     edge = fair_up - poly_up
-    If edge >= EDGE_ENTER => buy YES
-    If edge <= -EDGE_ENTER => buy NO
+    If edge >= EDGE_ENTER => buy YES (UP side)
+    If edge <= -EDGE_ENTER => buy NO (DOWN side)
     else HOLD
     """
     edge = fair_up - poly_up
@@ -585,11 +619,16 @@ def run_once() -> None:
             f"Could not find a tradable rolling market with live books in last {LOOKBACK_BUCKETS*5} minutes for base={base}"
         )
 
-    # Prices
-    y_code, poly_up, _ = clob_midpoint(yes_token)
-    n_code, poly_down, _ = clob_midpoint(no_token)
+    # Get prices (midpoint or book fallback)
+    y_code, poly_up, y_src = clob_price(yes_token)
+    n_code, poly_down, n_src = clob_price(no_token)
+
     if poly_up is None or poly_down is None:
-        log.warning("Midpoint missing after resolution (yes_code=%s no_code=%s)", y_code, n_code)
+        log.warning(
+            "Price missing after resolution (yes_code=%s yes_src=%s no_code=%s no_src=%s)",
+            y_code, y_src, n_code, n_src
+        )
+        log.info("BOOT: bot.py finished cleanly")
         return
 
     # Fair value baseline (replace with your model later)
@@ -732,17 +771,17 @@ def run_once() -> None:
     equity = balance + u
 
     log.info(
-        "slug=%s | up=%.3f down=%.3f | fair_up=%.3f | edge=%+.3f | signal=%s | action=%s%s | pos=%s | entry=%s | trades_today=%d | pnl_today(realized)=%.2f",
+        "slug=%s | up=%.4f(%s) down=%.4f(%s) | fair_up=%.3f | edge=%+.4f | signal=%s | action=%s%s | pos=%s | entry=%s | trades_today=%d | pnl_today(realized)=%.2f",
         slug,
-        poly_up,
-        poly_down,
+        poly_up, y_src,
+        poly_down, n_src,
         fair_up,
         edge,
         signal,
         action,
         (f" | reason={reason}" if reason else ""),
         position2,
-        (None if entry2 is None else round(float(entry2), 4)),
+        (None if entry2 is None else round(float(entry2), 6)),
         int(state2["trades_today"] or 0),
         float(state2["pnl_today_realized"] or 0.0),
     )

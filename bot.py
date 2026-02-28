@@ -50,10 +50,6 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
     if ts is None:
         ts = time.time()
@@ -63,33 +59,17 @@ def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
 # ----------------------------
 # HTTP helpers
 # ----------------------------
-def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 20) -> Optional[dict]:
+def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 20) -> Tuple[Optional[dict], Optional[int]]:
     try:
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code != 200:
-            return None
-        return r.json()
+            return None, r.status_code
+        return r.json(), 200
     except Exception:
-        return None
-
-
-def http_post_json(url: str, payload: dict, headers: Optional[dict] = None, timeout: int = 25) -> Tuple[int, Optional[dict], str]:
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
-        text = r.text[:5000] if r.text else ""
-        try:
-            j = r.json()
-        except Exception:
-            j = None
-        return r.status_code, j, text
-    except Exception as e:
-        return 0, None, str(e)
+        return None, None
 
 
 def _maybe_json(x):
-    """
-    Gamma sometimes returns outcomes/clobTokenIds as JSON-encoded strings.
-    """
     if x is None:
         return None
     if isinstance(x, (list, dict)):
@@ -106,29 +86,21 @@ def _maybe_json(x):
 
 
 # ----------------------------
-# DB (IMPORTANT: uses NEW table names to avoid schema conflicts)
+# DB (unique table names)
 # ----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
 STATE_TABLE = os.getenv("J5_STATE_TABLE", "j5_state").strip()
-EQUITY_TABLE = os.getenv("J5_EQUITY_TABLE", "j5_equity_snapshots").strip()
 
 
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("Missing DATABASE_URL")
-    # Railway Postgres typically wants SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def ensure_tables() -> None:
-    """
-    Create our own tables with unique names so we never collide with
-    any existing tables like 'bot_state' that may have different schemas.
-    """
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # State table (simple single-row state)
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
@@ -147,24 +119,6 @@ def ensure_tables() -> None:
                 INSERT INTO {STATE_TABLE} (id, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized)
                 VALUES (1, CURRENT_DATE, NULL, NULL, 0, 0, 0)
                 ON CONFLICT (id) DO NOTHING;
-                """
-            )
-
-            # Equity snapshot table
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {EQUITY_TABLE} (
-                  id BIGSERIAL PRIMARY KEY,
-                  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                  price DOUBLE PRECISION NOT NULL,
-                  balance DOUBLE PRECISION NOT NULL,
-                  position TEXT,
-                  entry_price DOUBLE PRECISION,
-                  stake DOUBLE PRECISION,
-                  unrealized_pnl DOUBLE PRECISION NOT NULL,
-                  equity DOUBLE PRECISION NOT NULL,
-                  poly_slug TEXT
-                );
                 """
             )
         conn.commit()
@@ -222,35 +176,12 @@ def save_state(state: Dict[str, Any]) -> None:
         conn.commit()
 
 
-def record_equity_snapshot(
-    price: float,
-    balance: float,
-    position: Optional[str],
-    entry_price: Optional[float],
-    stake: float,
-    unrealized_pnl: float,
-    equity: float,
-    poly_slug: str,
-) -> None:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                INSERT INTO {EQUITY_TABLE} (price, balance, position, entry_price, stake, unrealized_pnl, equity, poly_slug)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s);
-                """,
-                (price, balance, position, entry_price, stake, unrealized_pnl, equity, poly_slug),
-            )
-        conn.commit()
-
-
 # ----------------------------
 # Gamma / CLOB
 # ----------------------------
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
-# Base slug prefix (NO bucket)
 POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
 POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()
 POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip()
@@ -263,13 +194,82 @@ def slug_prefix() -> str:
     raise RuntimeError("Missing POLY_MARKET_SLUG (recommended) or POLY_GAMMA_SLUG / POLY_EVENT_SLUG")
 
 
-def make_poly_slug_for_bucket(bucket_epoch: int) -> str:
-    return f"{slug_prefix()}-{bucket_epoch}"
-
-
 def fetch_gamma_market_by_slug(full_slug: str) -> Optional[dict]:
     url = f"{POLY_GAMMA_HOST}/markets/slug/{full_slug}"
-    return http_get_json(url)
+    j, code = http_get_json(url)
+    return j if code == 200 and isinstance(j, dict) else None
+
+
+def gamma_search_markets(prefix: str, limit: int = 50) -> List[dict]:
+    """
+    Uses Gamma search endpoint to find markets matching a term.
+    Gamma supports /markets?search=<term> on many deployments.
+    If Gamma changes, this will just return [] and we log it.
+    """
+    url = f"{POLY_GAMMA_HOST}/markets"
+    params = {"search": prefix, "limit": limit}
+    j, code = http_get_json(url, params=params)
+    if code != 200 or not j:
+        return []
+    if isinstance(j, list):
+        return [x for x in j if isinstance(x, dict)]
+    # sometimes it comes back as {"markets":[...]}
+    markets = j.get("markets") if isinstance(j, dict) else None
+    if isinstance(markets, list):
+        return [x for x in markets if isinstance(x, dict)]
+    return []
+
+
+def parse_bucket_from_slug(slug: str) -> Optional[int]:
+    """
+    Many rolling slugs end with '-<epoch>'.
+    """
+    try:
+        tail = slug.split("-")[-1]
+        if tail.isdigit():
+            return int(tail)
+    except Exception:
+        return None
+    return None
+
+
+def seed_from_gamma(prefix: str) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Find a real, currently-listed rolling slug from Gamma, then extract its bucket epoch.
+    """
+    markets = gamma_search_markets(prefix, limit=50)
+    if not markets:
+        return None, None
+
+    # Prefer markets whose slug starts with prefix and end in a numeric bucket
+    candidates = []
+    for m in markets:
+        s = m.get("slug")
+        if not isinstance(s, str):
+            continue
+        if not s.startswith(prefix):
+            continue
+        b = parse_bucket_from_slug(s)
+        if b is not None:
+            candidates.append((b, s))
+
+    if not candidates:
+        # Fall back: any market with numeric suffix, even if prefix mismatch
+        for m in markets:
+            s = m.get("slug")
+            if not isinstance(s, str):
+                continue
+            b = parse_bucket_from_slug(s)
+            if b is not None:
+                candidates.append((b, s))
+
+    if not candidates:
+        return None, None
+
+    # Pick the most recent bucket
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    bucket, slug = candidates[0]
+    return slug, bucket
 
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -322,9 +322,6 @@ class BookTop:
 
 
 def _parse_price_level(level) -> Tuple[Optional[float], Optional[float]]:
-    """
-    CLOB book levels often look like ["0.51","12.3"] or {"price":"0.51","size":"12.3"}.
-    """
     try:
         if isinstance(level, list) and len(level) >= 2:
             return float(level[0]), float(level[1])
@@ -340,9 +337,6 @@ def _parse_price_level(level) -> Tuple[Optional[float], Optional[float]]:
 
 
 def fetch_clob_book_top(token_id: str) -> Tuple[Optional[BookTop], Optional[int]]:
-    """
-    Returns (BookTop|None, http_status|None). If status is 404, means no orderbook exists.
-    """
     url = f"{POLY_CLOB_HOST}/book"
     try:
         r = requests.get(url, params={"token_id": token_id}, timeout=15)
@@ -379,11 +373,8 @@ def fetch_clob_book_top(token_id: str) -> Tuple[Optional[BookTop], Optional[int]
 # ----------------------------
 MIN_BID = env_float("MIN_BID", 0.02)
 MAX_ASK = env_float("MAX_ASK", 0.98)
-MAX_SPREAD = env_float("MAX_SPREAD", 0.10)
-
+MAX_SPREAD = env_float("MAX_SPREAD", 0.08)
 LOOKBACK_BUCKETS = env_int("LOOKBACK_BUCKETS", 96)
-
-# If true, we only do "find real book" + logs and stop
 PHASE4_ONLY = env_bool("PHASE4_ONLY", True)
 
 
@@ -398,7 +389,6 @@ def book_quality_reasons(label: str, top: Optional[BookTop], http_status: Option
     if top.bid is None or top.ask is None:
         reasons.append(f"{label}_MISSING_BID_OR_ASK")
         return reasons
-
     if top.bid < MIN_BID:
         reasons.append(f"{label}_BID_TOO_LOW({top.bid}< {MIN_BID})")
     if top.ask > MAX_ASK:
@@ -419,9 +409,17 @@ class TradableSelection:
     no_top: BookTop
 
 
-def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Dict[str, int]]:
-    now_bucket = five_min_bucket_epoch(time.time())
+def make_slug_from_seed(seed_slug: str, seed_bucket: int, target_bucket: int) -> str:
+    """
+    Preserve the EXACT slug shape Gamma uses:
+    replace the trailing -<bucket> with the target bucket.
+    """
+    # remove trailing "-<seed_bucket>"
+    base = seed_slug[: -(len(str(seed_bucket)) + 1)]
+    return f"{base}-{target_bucket}"
 
+
+def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Dict[str, int]]:
     counters = {
         "tried": 0,
         "gamma_missing": 0,
@@ -432,9 +430,29 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
         "ok": 0,
     }
 
+    prefix = slug_prefix()
+    seed_slug, seed_bucket = seed_from_gamma(prefix)
+
+    log.info("SEED | prefix=%s | seed_slug=%s | seed_bucket=%s", prefix, seed_slug, seed_bucket)
+
+    if not seed_slug or seed_bucket is None:
+        # Fall back to naive method (so we still see TRY_BUCKET logs),
+        # but we already learned naive isn't working for your prefix.
+        now_bucket = five_min_bucket_epoch(time.time())
+        for i in range(LOOKBACK_BUCKETS):
+            bucket = now_bucket - i * 300
+            full_slug = f"{prefix}-{bucket}"
+            counters["tried"] += 1
+            log.info("TRY_BUCKET | i=%d | bucket=%d | utc=%s | slug=%s", i, bucket, datetime.fromtimestamp(bucket, tz=timezone.utc).isoformat(), full_slug)
+            gamma = fetch_gamma_market_and_tokens_for_full_slug(full_slug)
+            if not gamma:
+                counters["gamma_missing"] += 1
+        return None, counters
+
+    # Walk back from the seed bucket (known-good formatting)
     for i in range(LOOKBACK_BUCKETS):
-        bucket = now_bucket - i * 300
-        full_slug = make_poly_slug_for_bucket(bucket)
+        bucket = seed_bucket - i * 300
+        full_slug = make_slug_from_seed(seed_slug, seed_bucket, bucket)
         counters["tried"] += 1
 
         log.info(
@@ -492,19 +510,14 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
             yes_top=yes_top,
             no_top=no_top,
         )
-        log.info(
-            "PHASE4_OK | Selected tradable slug with real book: %s | YES %s | NO %s",
-            sel.slug,
-            sel.yes_top,
-            sel.no_top,
-        )
+        log.info("PHASE4_OK | Selected tradable slug with real book: %s | YES %s | NO %s", sel.slug, sel.yes_top, sel.no_top)
         return sel, counters
 
     return None, counters
 
 
 # ----------------------------
-# Bun gateway (kept for later phases)
+# Bun health (optional)
 # ----------------------------
 BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
 
@@ -525,7 +538,6 @@ def bun_health() -> Optional[int]:
 def main() -> None:
     log.info("BOOT: bot.py starting")
 
-    # Create our own tables (no collision with your existing bot_state)
     ensure_tables()
 
     run_mode = os.getenv("RUN_MODE", "DRY_RUN").strip().upper()
@@ -553,7 +565,6 @@ def main() -> None:
         if hs is not None:
             log.info("bun_health_status=%s", hs)
 
-    # Daily reset for our state table
     state = load_state()
     today = date.today()
     if state["as_of_date"] != today:
@@ -576,7 +587,7 @@ def main() -> None:
     )
 
     if not sel:
-        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND | detail=NO_BUCKET_WITH_REAL_BOOK | lookback=%d", LOOKBACK_BUCKETS)
+        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND | detail=NO_BUCKET_WITH_REAL_BOOK_OR_GAMMA_NOT_FOUND | lookback=%d", LOOKBACK_BUCKETS)
         log.info("BOOT: bot.py finished cleanly")
         return
 

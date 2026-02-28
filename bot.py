@@ -53,12 +53,6 @@ def env_float(name: str, default: float) -> float:
 # ----------------------------
 # Time helpers
 # ----------------------------
-def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
-    if ts is None:
-        ts = time.time()
-    return int(ts // 300) * 300
-
-
 def iso_utc_from_epoch(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
@@ -69,7 +63,7 @@ def iso_utc_from_epoch(epoch: int) -> str:
 def http_get(url: str, params: Optional[dict] = None, timeout: int = 20) -> Tuple[Optional[Any], Optional[int], str]:
     try:
         r = requests.get(url, params=params, timeout=timeout)
-        txt = (r.text or "")[:500]
+        txt = (r.text or "")[:400]
         if r.status_code != 200:
             return None, r.status_code, txt
         try:
@@ -82,7 +76,7 @@ def http_get(url: str, params: Optional[dict] = None, timeout: int = 20) -> Tupl
 
 def _maybe_json(x):
     """
-    Gamma sometimes returns outcomes/clobTokenIds as JSON-encoded strings.
+    Gamma sometimes returns arrays as JSON-encoded strings.
     """
     if x is None:
         return None
@@ -100,7 +94,7 @@ def _maybe_json(x):
 
 
 # ----------------------------
-# DB (unique table names)
+# DB
 # ----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 STATE_TABLE = os.getenv("J5_STATE_TABLE", "j5_state").strip()
@@ -196,16 +190,24 @@ def save_state(state: Dict[str, Any]) -> None:
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
-# IMPORTANT: Use your known good full slug as the seed.
-# You can set it in Railway as POLY_SEED_SLUG. If you don't, we default to the one you pasted.
+# Your known-good rolling slug seed (you can also set this in Railway env vars)
 POLY_SEED_SLUG = os.getenv("POLY_SEED_SLUG", "btc-updown-5m-1772308500").strip()
 
-# For reference/logging only — we derive prefix from seed slug
+# Phase 4 params
+MIN_BID = env_float("MIN_BID", 0.02)
+MAX_ASK = env_float("MAX_ASK", 0.98)
+MAX_SPREAD = env_float("MAX_SPREAD", 0.08)
+LOOKBACK_BUCKETS = env_int("LOOKBACK_BUCKETS", 96)
+PHASE4_ONLY = env_bool("PHASE4_ONLY", True)
+
+# Debug controls
+TOKEN_DEBUG_SAMPLES = env_int("TOKEN_DEBUG_SAMPLES", 5)
+
+
 def seed_prefix_from_slug(seed_slug: str) -> str:
     parts = seed_slug.split("-")
     if len(parts) < 2:
         raise RuntimeError(f"Bad POLY_SEED_SLUG: {seed_slug}")
-    # prefix is everything except the last segment (bucket)
     return "-".join(parts[:-1])
 
 
@@ -214,7 +216,6 @@ def seed_bucket_from_slug(seed_slug: str) -> int:
     if not tail.isdigit():
         raise RuntimeError(f"Seed slug does not end with numeric bucket: {seed_slug}")
     b = int(tail)
-    # sanity check: rolling buckets should look like unix epoch seconds (~10 digits in 2026)
     if b < 1_600_000_000 or b > 2_000_000_000:
         raise RuntimeError(f"Seed bucket looks wrong (not epoch seconds): {b} from {seed_slug}")
     return b
@@ -222,22 +223,20 @@ def seed_bucket_from_slug(seed_slug: str) -> int:
 
 def gamma_get_market_by_slug(full_slug: str) -> Tuple[Optional[dict], str]:
     """
-    Gamma endpoints vary. We try multiple patterns and keep debug info.
-
-    Returns: (market_dict_or_none, debug_string)
+    Try multiple Gamma patterns; return (market, debug_string).
     """
     attempts: List[str] = []
 
     # 1) /markets/slug/<slug>
     url1 = f"{POLY_GAMMA_HOST}/markets/slug/{full_slug}"
-    j, code, txt = http_get(url1, timeout=20)
+    j, code, _ = http_get(url1, timeout=20)
     attempts.append(f"slug_endpoint code={code}")
     if isinstance(j, dict):
         return j, " | ".join(attempts)
 
     # 2) /markets?slug=<slug>
     url2 = f"{POLY_GAMMA_HOST}/markets"
-    j, code, txt = http_get(url2, params={"slug": full_slug, "limit": 1}, timeout=20)
+    j, code, _ = http_get(url2, params={"slug": full_slug, "limit": 1}, timeout=20)
     attempts.append(f"markets?slug code={code}")
     if isinstance(j, list) and j and isinstance(j[0], dict):
         return j[0], " | ".join(attempts)
@@ -246,9 +245,9 @@ def gamma_get_market_by_slug(full_slug: str) -> Tuple[Optional[dict], str]:
         if isinstance(mkts, list) and mkts and isinstance(mkts[0], dict):
             return mkts[0], " | ".join(attempts)
 
-    # 3) /markets?search=<slug> (exact search string)
-    j, code, txt = http_get(url2, params={"search": full_slug, "limit": 5}, timeout=20)
-    attempts.append(f"markets?search=FULL_SLUG code={code}")
+    # 3) /markets?search=<slug>
+    j, code, _ = http_get(url2, params={"search": full_slug, "limit": 5}, timeout=20)
+    attempts.append(f"markets?search code={code}")
     if isinstance(j, list):
         for m in j:
             if isinstance(m, dict) and m.get("slug") == full_slug:
@@ -263,36 +262,111 @@ def gamma_get_market_by_slug(full_slug: str) -> Tuple[Optional[dict], str]:
     return None, " | ".join(attempts)
 
 
-def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
-    outcomes = _maybe_json(market.get("outcomes"))
-    token_ids = _maybe_json(market.get("clobTokenIds"))
+def _norm_outcome(s: str) -> str:
+    return s.strip().upper()
 
-    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
-        return None, None
-    if len(outcomes) != len(token_ids):
-        return None, None
 
-    yes_id = None
-    no_id = None
-    for o, tid in zip(outcomes, token_ids):
-        if not isinstance(o, str):
-            continue
-        ou = o.strip().upper()
-        if ou == "YES":
-            yes_id = str(tid)
-        elif ou == "NO":
-            no_id = str(tid)
-    return yes_id, no_id
+def extract_yes_no_token_ids_robust(market: dict) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Robust extraction across different Gamma shapes.
+
+    Returns (yes_token_id, no_token_id, method_used_or_reason)
+    """
+
+    # ---- Shape A: outcomes + clobTokenIds (strings or lists)
+    for outcomes_key in ("outcomes", "Outcomes"):
+        for token_key in ("clobTokenIds", "clob_token_ids", "clobTokenIDs", "clob_tokenIds", "tokenIds", "token_ids"):
+            outcomes = _maybe_json(market.get(outcomes_key))
+            token_ids = _maybe_json(market.get(token_key))
+            if isinstance(outcomes, list) and isinstance(token_ids, list) and len(outcomes) == len(token_ids) and len(outcomes) >= 2:
+                yes_id = None
+                no_id = None
+                for o, tid in zip(outcomes, token_ids):
+                    if not isinstance(o, str):
+                        continue
+                    ou = _norm_outcome(o)
+                    if ou == "YES":
+                        yes_id = str(tid)
+                    elif ou == "NO":
+                        no_id = str(tid)
+                if yes_id and no_id:
+                    return yes_id, no_id, f"shapeA({outcomes_key}+{token_key})"
+
+    # ---- Shape B: tokens list with per-outcome token ids
+    # Common patterns: market["tokens"] = [{"outcome":"Yes","token_id":"..."}, ...]
+    # Or: [{"outcome":"YES","clobTokenId":"..."}, ...]
+    tokens = market.get("tokens") or market.get("Tokens")
+    if isinstance(tokens, str):
+        tokens = _maybe_json(tokens)
+    if isinstance(tokens, list):
+        yes_id = None
+        no_id = None
+        for t in tokens:
+            if not isinstance(t, dict):
+                continue
+            outcome = t.get("outcome") or t.get("name") or t.get("label")
+            if isinstance(outcome, str):
+                ou = _norm_outcome(outcome)
+            else:
+                ou = ""
+
+            # token id field variants
+            tid = (
+                t.get("token_id")
+                or t.get("tokenId")
+                or t.get("clobTokenId")
+                or t.get("clob_token_id")
+                or t.get("clobTokenID")
+            )
+
+            if tid is None:
+                continue
+
+            if ou == "YES":
+                yes_id = str(tid)
+            elif ou == "NO":
+                no_id = str(tid)
+
+        if yes_id and no_id:
+            return yes_id, no_id, "shapeB(tokens[])"
+
+    # ---- Shape C: nested market object (sometimes returned as {"market": {...}})
+    nested = market.get("market")
+    if isinstance(nested, dict) and nested is not market:
+        y, n, why = extract_yes_no_token_ids_robust(nested)
+        if y and n:
+            return y, n, f"shapeC(nested_market->{why})"
+
+    return None, None, "token_extract_failed"
+
+
+def market_schema_snapshot(market: dict) -> str:
+    """
+    Small, safe snapshot: keys + types of likely fields (not full payload).
+    """
+    keys = sorted(list(market.keys()))
+    def tname(v): 
+        return type(v).__name__
+
+    fields = {}
+    for k in ("slug", "outcomes", "clobTokenIds", "clob_token_ids", "tokenIds", "tokens"):
+        if k in market:
+            v = market.get(k)
+            fields[k] = tname(v)
+
+    return f"keys={keys[:40]}{'...' if len(keys)>40 else ''} fields={fields}"
 
 
 def fetch_gamma_market_and_tokens_for_slug(full_slug: str) -> Tuple[Optional[Dict[str, Any]], str]:
     market, dbg = gamma_get_market_by_slug(full_slug)
     if not market:
         return None, dbg
-    yes_id, no_id = extract_yes_no_token_ids(market)
+
+    yes_id, no_id, how = extract_yes_no_token_ids_robust(market)
     if not yes_id or not no_id:
-        return None, dbg + " | token_extract_failed"
-    return {"market": market, "yes_token_id": yes_id, "no_token_id": no_id}, dbg
+        return None, dbg + " | " + how
+
+    return {"market": market, "yes_token_id": yes_id, "no_token_id": no_id}, dbg + " | " + how
 
 
 # ----------------------------
@@ -365,13 +439,6 @@ def fetch_clob_book_top(token_id: str) -> Tuple[Optional[BookTop], Optional[int]
 # ----------------------------
 # Phase 4 gates
 # ----------------------------
-MIN_BID = env_float("MIN_BID", 0.02)
-MAX_ASK = env_float("MAX_ASK", 0.98)
-MAX_SPREAD = env_float("MAX_SPREAD", 0.08)
-LOOKBACK_BUCKETS = env_int("LOOKBACK_BUCKETS", 96)
-PHASE4_ONLY = env_bool("PHASE4_ONLY", True)
-
-
 def book_quality_reasons(label: str, top: Optional[BookTop], http_status: Optional[int]) -> List[str]:
     reasons: List[str] = []
     if http_status == 404:
@@ -407,8 +474,8 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
     counters = {
         "tried": 0,
         "gamma_missing": 0,
-        "gamma_debug_samples": 0,
         "token_missing": 0,
+        "token_debug_logged": 0,
         "clob_404": 0,
         "book_missing_side": 0,
         "book_bad": 0,
@@ -419,8 +486,13 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
     prefix = seed_prefix_from_slug(seed_slug)
     seed_bucket = seed_bucket_from_slug(seed_slug)
 
-    log.info("SEED | seed_slug=%s | prefix=%s | seed_bucket=%d | seed_utc=%s",
-             seed_slug, prefix, seed_bucket, iso_utc_from_epoch(seed_bucket))
+    log.info(
+        "SEED | seed_slug=%s | prefix=%s | seed_bucket=%d | seed_utc=%s",
+        seed_slug,
+        prefix,
+        seed_bucket,
+        iso_utc_from_epoch(seed_bucket),
+    )
 
     for i in range(LOOKBACK_BUCKETS):
         bucket = seed_bucket - i * 300
@@ -431,19 +503,26 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
 
         gamma, dbg = fetch_gamma_market_and_tokens_for_slug(full_slug)
         if not gamma:
-            counters["gamma_missing"] += 1
-            # Sample a few debug strings so we can see which endpoint is failing (without spamming 96 lines)
-            if counters["gamma_debug_samples"] < 5:
-                counters["gamma_debug_samples"] += 1
+            # Distinguish between "Gamma didn't find market" and "Token extraction failed"
+            if "token_extract_failed" in dbg:
+                counters["token_missing"] += 1
+                # Log schema snapshot a few times only
+                if counters["token_debug_logged"] < TOKEN_DEBUG_SAMPLES:
+                    counters["token_debug_logged"] += 1
+                    mkt, _ = gamma_get_market_by_slug(full_slug)
+                    if isinstance(mkt, dict):
+                        log.info("TOKEN_DEBUG | slug=%s | %s | %s", full_slug, dbg, market_schema_snapshot(mkt))
+                    else:
+                        log.info("TOKEN_DEBUG | slug=%s | %s | market_unavailable_for_snapshot", full_slug, dbg)
+            else:
+                counters["gamma_missing"] += 1
+            # Also keep a small sample of misses
+            if i < 3:
                 log.info("GAMMA_MISS | slug=%s | %s", full_slug, dbg)
             continue
 
         yes_token = gamma.get("yes_token_id")
         no_token = gamma.get("no_token_id")
-        if not yes_token or not no_token:
-            counters["token_missing"] += 1
-            log.info("GAMMA_TOKEN_MISS | slug=%s | %s", full_slug, dbg)
-            continue
 
         yes_top, yes_status = fetch_clob_book_top(yes_token)
         no_top, no_status = fetch_clob_book_top(no_token)
@@ -481,8 +560,7 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
             yes_top=yes_top,
             no_top=no_top,
         )
-        log.info("PHASE4_OK | Selected tradable slug with real book: %s | YES %s | NO %s",
-                 sel.slug, sel.yes_top, sel.no_top)
+        log.info("PHASE4_OK | Selected tradable slug with real book: %s | YES %s | NO %s", sel.slug, sel.yes_top, sel.no_top)
         return sel, counters
 
     return None, counters
@@ -559,7 +637,7 @@ def main() -> None:
     )
 
     if not sel:
-        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND_OR_GAMMA_MISS | lookback=%d", LOOKBACK_BUCKETS)
+        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND_OR_TOKEN_PARSE_FAIL | lookback=%d", LOOKBACK_BUCKETS)
         log.info("BOOT: bot.py finished cleanly")
         return
 

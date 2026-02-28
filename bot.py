@@ -59,9 +59,9 @@ def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
 # ----------------------------
 # HTTP helpers
 # ----------------------------
-def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 20) -> Tuple[Optional[dict], Optional[int]]:
+def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20) -> Tuple[Optional[Any], Optional[int]]:
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        r = requests.get(url, params=params, timeout=timeout)
         if r.status_code != 200:
             return None, r.status_code
         return r.json(), 200
@@ -200,11 +200,10 @@ def fetch_gamma_market_by_slug(full_slug: str) -> Optional[dict]:
     return j if code == 200 and isinstance(j, dict) else None
 
 
-def gamma_search_markets(prefix: str, limit: int = 50) -> List[dict]:
+def gamma_search_markets(prefix: str, limit: int = 200) -> List[dict]:
     """
-    Uses Gamma search endpoint to find markets matching a term.
-    Gamma supports /markets?search=<term> on many deployments.
-    If Gamma changes, this will just return [] and we log it.
+    Gamma commonly supports /markets?search=<term>.
+    We pull a bigger page then filter locally.
     """
     url = f"{POLY_GAMMA_HOST}/markets"
     params = {"search": prefix, "limit": limit}
@@ -213,63 +212,54 @@ def gamma_search_markets(prefix: str, limit: int = 50) -> List[dict]:
         return []
     if isinstance(j, list):
         return [x for x in j if isinstance(x, dict)]
-    # sometimes it comes back as {"markets":[...]}
     markets = j.get("markets") if isinstance(j, dict) else None
     if isinstance(markets, list):
         return [x for x in markets if isinstance(x, dict)]
     return []
 
 
-def parse_bucket_from_slug(slug: str) -> Optional[int]:
+def parse_bucket_from_slug_strict(prefix: str, slug: str) -> Optional[int]:
     """
-    Many rolling slugs end with '-<epoch>'.
+    STRICT:
+    - slug must start with f"{prefix}-"
+    - suffix must be a 10-digit unix epoch (e.g., 1772307900)
     """
+    want = f"{prefix}-"
+    if not slug.startswith(want):
+        return None
+    suffix = slug[len(want):]
+    if not suffix.isdigit():
+        return None
+    if len(suffix) != 10:
+        return None
     try:
-        tail = slug.split("-")[-1]
-        if tail.isdigit():
-            return int(tail)
+        return int(suffix)
     except Exception:
         return None
-    return None
 
 
-def seed_from_gamma(prefix: str) -> Tuple[Optional[str], Optional[int]]:
+def seed_from_gamma_strict(prefix: str) -> Tuple[Optional[str], Optional[int], int]:
     """
-    Find a real, currently-listed rolling slug from Gamma, then extract its bucket epoch.
+    Returns (seed_slug, seed_bucket, total_examined)
     """
-    markets = gamma_search_markets(prefix, limit=50)
-    if not markets:
-        return None, None
-
-    # Prefer markets whose slug starts with prefix and end in a numeric bucket
-    candidates = []
+    markets = gamma_search_markets(prefix, limit=200)
+    examined = 0
+    candidates: List[Tuple[int, str]] = []
     for m in markets:
         s = m.get("slug")
         if not isinstance(s, str):
             continue
-        if not s.startswith(prefix):
-            continue
-        b = parse_bucket_from_slug(s)
+        examined += 1
+        b = parse_bucket_from_slug_strict(prefix, s)
         if b is not None:
             candidates.append((b, s))
 
     if not candidates:
-        # Fall back: any market with numeric suffix, even if prefix mismatch
-        for m in markets:
-            s = m.get("slug")
-            if not isinstance(s, str):
-                continue
-            b = parse_bucket_from_slug(s)
-            if b is not None:
-                candidates.append((b, s))
+        return None, None, examined
 
-    if not candidates:
-        return None, None
-
-    # Pick the most recent bucket
     candidates.sort(key=lambda x: x[0], reverse=True)
     bucket, slug = candidates[0]
-    return slug, bucket
+    return slug, bucket, examined
 
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -409,16 +399,6 @@ class TradableSelection:
     no_top: BookTop
 
 
-def make_slug_from_seed(seed_slug: str, seed_bucket: int, target_bucket: int) -> str:
-    """
-    Preserve the EXACT slug shape Gamma uses:
-    replace the trailing -<bucket> with the target bucket.
-    """
-    # remove trailing "-<seed_bucket>"
-    base = seed_slug[: -(len(str(seed_bucket)) + 1)]
-    return f"{base}-{target_bucket}"
-
-
 def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Dict[str, int]]:
     counters = {
         "tried": 0,
@@ -431,28 +411,19 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
     }
 
     prefix = slug_prefix()
-    seed_slug, seed_bucket = seed_from_gamma(prefix)
+    seed_slug, seed_bucket, examined = seed_from_gamma_strict(prefix)
 
-    log.info("SEED | prefix=%s | seed_slug=%s | seed_bucket=%s", prefix, seed_slug, seed_bucket)
+    log.info("SEED | prefix=%s | examined=%d | seed_slug=%s | seed_bucket=%s", prefix, examined, seed_slug, seed_bucket)
 
     if not seed_slug or seed_bucket is None:
-        # Fall back to naive method (so we still see TRY_BUCKET logs),
-        # but we already learned naive isn't working for your prefix.
-        now_bucket = five_min_bucket_epoch(time.time())
-        for i in range(LOOKBACK_BUCKETS):
-            bucket = now_bucket - i * 300
-            full_slug = f"{prefix}-{bucket}"
-            counters["tried"] += 1
-            log.info("TRY_BUCKET | i=%d | bucket=%d | utc=%s | slug=%s", i, bucket, datetime.fromtimestamp(bucket, tz=timezone.utc).isoformat(), full_slug)
-            gamma = fetch_gamma_market_and_tokens_for_full_slug(full_slug)
-            if not gamma:
-                counters["gamma_missing"] += 1
+        # At this point, Gamma search didn't yield any rolling slugs that match prefix-<10digit_epoch>.
+        # That means the prefix is wrong OR Gamma uses a different slug family name.
         return None, counters
 
-    # Walk back from the seed bucket (known-good formatting)
+    # Walk back from seed_bucket using the simple rule prefix-bucket
     for i in range(LOOKBACK_BUCKETS):
         bucket = seed_bucket - i * 300
-        full_slug = make_slug_from_seed(seed_slug, seed_bucket, bucket)
+        full_slug = f"{prefix}-{bucket}"
         counters["tried"] += 1
 
         log.info(
@@ -537,7 +508,6 @@ def bun_health() -> Optional[int]:
 # ----------------------------
 def main() -> None:
     log.info("BOOT: bot.py starting")
-
     ensure_tables()
 
     run_mode = os.getenv("RUN_MODE", "DRY_RUN").strip().upper()
@@ -587,7 +557,7 @@ def main() -> None:
     )
 
     if not sel:
-        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND | detail=NO_BUCKET_WITH_REAL_BOOK_OR_GAMMA_NOT_FOUND | lookback=%d", LOOKBACK_BUCKETS)
+        log.info("SEED_FAIL_OR_NO_TRADE | reason=NO_VALID_SEED_SLUG_FOUND_OR_NO_REAL_BOOK | hint=prefix_may_be_wrong_or_gamma_search_endpoint_differs")
         log.info("BOOT: bot.py finished cleanly")
         return
 

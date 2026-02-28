@@ -1,5 +1,4 @@
 import os
-import time
 import json
 import logging
 from dataclasses import dataclass
@@ -77,6 +76,9 @@ def http_get(url: str, params: Optional[dict] = None, timeout: int = 20) -> Tupl
 def _maybe_json(x):
     """
     Gamma sometimes returns arrays as JSON-encoded strings.
+    Converts:
+      - '["Up","Down"]' -> ["Up","Down"]
+      - ["Up","Down"] -> ["Up","Down"]
     """
     if x is None:
         return None
@@ -190,17 +192,14 @@ def save_state(state: Dict[str, Any]) -> None:
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
-# Your known-good rolling slug seed (you can also set this in Railway env vars)
 POLY_SEED_SLUG = os.getenv("POLY_SEED_SLUG", "btc-updown-5m-1772308500").strip()
 
-# Phase 4 params
 MIN_BID = env_float("MIN_BID", 0.02)
 MAX_ASK = env_float("MAX_ASK", 0.98)
 MAX_SPREAD = env_float("MAX_SPREAD", 0.08)
 LOOKBACK_BUCKETS = env_int("LOOKBACK_BUCKETS", 96)
 PHASE4_ONLY = env_bool("PHASE4_ONLY", True)
 
-# Debug controls
 TOKEN_DEBUG_SAMPLES = env_int("TOKEN_DEBUG_SAMPLES", 5)
 
 
@@ -222,19 +221,14 @@ def seed_bucket_from_slug(seed_slug: str) -> int:
 
 
 def gamma_get_market_by_slug(full_slug: str) -> Tuple[Optional[dict], str]:
-    """
-    Try multiple Gamma patterns; return (market, debug_string).
-    """
     attempts: List[str] = []
 
-    # 1) /markets/slug/<slug>
     url1 = f"{POLY_GAMMA_HOST}/markets/slug/{full_slug}"
     j, code, _ = http_get(url1, timeout=20)
     attempts.append(f"slug_endpoint code={code}")
     if isinstance(j, dict):
         return j, " | ".join(attempts)
 
-    # 2) /markets?slug=<slug>
     url2 = f"{POLY_GAMMA_HOST}/markets"
     j, code, _ = http_get(url2, params={"slug": full_slug, "limit": 1}, timeout=20)
     attempts.append(f"markets?slug code={code}")
@@ -245,7 +239,6 @@ def gamma_get_market_by_slug(full_slug: str) -> Tuple[Optional[dict], str]:
         if isinstance(mkts, list) and mkts and isinstance(mkts[0], dict):
             return mkts[0], " | ".join(attempts)
 
-    # 3) /markets?search=<slug>
     j, code, _ = http_get(url2, params={"search": full_slug, "limit": 5}, timeout=20)
     attempts.append(f"markets?search code={code}")
     if isinstance(j, list):
@@ -262,55 +255,31 @@ def gamma_get_market_by_slug(full_slug: str) -> Tuple[Optional[dict], str]:
     return None, " | ".join(attempts)
 
 
-def _norm_outcome(s: str) -> str:
-    return s.strip().upper()
-
-
-def extract_yes_no_token_ids_robust(market: dict) -> Tuple[Optional[str], Optional[str], str]:
+def extract_two_outcomes_and_token_ids(market: dict) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], str]:
     """
-    Robust extraction across different Gamma shapes.
-
-    Returns (yes_token_id, no_token_id, method_used_or_reason)
+    We do NOT assume 'YES/NO'. We assume a 2-outcome market and take outcome/token by index.
+    Returns: (token_a, token_b, outcome_a, outcome_b, method_or_reason)
     """
 
-    # ---- Shape A: outcomes + clobTokenIds (strings or lists)
+    # Shape A: outcomes + clobTokenIds (often JSON strings)
     for outcomes_key in ("outcomes", "Outcomes"):
         for token_key in ("clobTokenIds", "clob_token_ids", "clobTokenIDs", "clob_tokenIds", "tokenIds", "token_ids"):
             outcomes = _maybe_json(market.get(outcomes_key))
             token_ids = _maybe_json(market.get(token_key))
-            if isinstance(outcomes, list) and isinstance(token_ids, list) and len(outcomes) == len(token_ids) and len(outcomes) >= 2:
-                yes_id = None
-                no_id = None
-                for o, tid in zip(outcomes, token_ids):
-                    if not isinstance(o, str):
-                        continue
-                    ou = _norm_outcome(o)
-                    if ou == "YES":
-                        yes_id = str(tid)
-                    elif ou == "NO":
-                        no_id = str(tid)
-                if yes_id and no_id:
-                    return yes_id, no_id, f"shapeA({outcomes_key}+{token_key})"
+            if isinstance(outcomes, list) and isinstance(token_ids, list) and len(outcomes) >= 2 and len(token_ids) >= 2:
+                # Align by index (Gamma commonly keeps them aligned)
+                o0 = outcomes[0] if isinstance(outcomes[0], str) else str(outcomes[0])
+                o1 = outcomes[1] if isinstance(outcomes[1], str) else str(outcomes[1])
+                t0 = str(token_ids[0])
+                t1 = str(token_ids[1])
+                return t0, t1, o0, o1, f"shapeA({outcomes_key}+{token_key})"
 
-    # ---- Shape B: tokens list with per-outcome token ids
-    # Common patterns: market["tokens"] = [{"outcome":"Yes","token_id":"..."}, ...]
-    # Or: [{"outcome":"YES","clobTokenId":"..."}, ...]
+    # Shape B: tokens array
     tokens = market.get("tokens") or market.get("Tokens")
     if isinstance(tokens, str):
         tokens = _maybe_json(tokens)
-    if isinstance(tokens, list):
-        yes_id = None
-        no_id = None
-        for t in tokens:
-            if not isinstance(t, dict):
-                continue
-            outcome = t.get("outcome") or t.get("name") or t.get("label")
-            if isinstance(outcome, str):
-                ou = _norm_outcome(outcome)
-            else:
-                ou = ""
-
-            # token id field variants
+    if isinstance(tokens, list) and len(tokens) >= 2:
+        def get_tid(t: dict) -> Optional[str]:
             tid = (
                 t.get("token_id")
                 or t.get("tokenId")
@@ -318,43 +287,55 @@ def extract_yes_no_token_ids_robust(market: dict) -> Tuple[Optional[str], Option
                 or t.get("clob_token_id")
                 or t.get("clobTokenID")
             )
+            return str(tid) if tid is not None else None
 
-            if tid is None:
-                continue
+        def get_outcome(t: dict) -> str:
+            outcome = t.get("outcome") or t.get("name") or t.get("label")
+            return outcome if isinstance(outcome, str) else str(outcome)
 
-            if ou == "YES":
-                yes_id = str(tid)
-            elif ou == "NO":
-                no_id = str(tid)
+        if isinstance(tokens[0], dict) and isinstance(tokens[1], dict):
+            t0 = get_tid(tokens[0])
+            t1 = get_tid(tokens[1])
+            if t0 and t1:
+                o0 = get_outcome(tokens[0])
+                o1 = get_outcome(tokens[1])
+                return t0, t1, o0, o1, "shapeB(tokens[])"
 
-        if yes_id and no_id:
-            return yes_id, no_id, "shapeB(tokens[])"
-
-    # ---- Shape C: nested market object (sometimes returned as {"market": {...}})
+    # Shape C: nested {"market": {...}}
     nested = market.get("market")
     if isinstance(nested, dict) and nested is not market:
-        y, n, why = extract_yes_no_token_ids_robust(nested)
-        if y and n:
-            return y, n, f"shapeC(nested_market->{why})"
+        t0, t1, o0, o1, why = extract_two_outcomes_and_token_ids(nested)
+        if t0 and t1:
+            return t0, t1, o0, o1, f"shapeC(nested_market->{why})"
 
-    return None, None, "token_extract_failed"
+    return None, None, None, None, "token_extract_failed"
 
 
 def market_schema_snapshot(market: dict) -> str:
-    """
-    Small, safe snapshot: keys + types of likely fields (not full payload).
-    """
     keys = sorted(list(market.keys()))
-    def tname(v): 
+
+    def tname(v):
         return type(v).__name__
 
     fields = {}
     for k in ("slug", "outcomes", "clobTokenIds", "clob_token_ids", "tokenIds", "tokens"):
         if k in market:
-            v = market.get(k)
-            fields[k] = tname(v)
+            fields[k] = tname(market.get(k))
 
-    return f"keys={keys[:40]}{'...' if len(keys)>40 else ''} fields={fields}"
+    # Also include small preview if possible (not full payload)
+    out_preview = None
+    tok_preview = None
+    try:
+        outs = _maybe_json(market.get("outcomes"))
+        toks = _maybe_json(market.get("clobTokenIds"))
+        if isinstance(outs, list):
+            out_preview = outs[:4]
+        if isinstance(toks, list):
+            tok_preview = toks[:4]
+    except Exception:
+        pass
+
+    return f"keys={keys[:40]}{'...' if len(keys)>40 else ''} fields={fields} outcomes_preview={out_preview} clobTokenIds_preview={tok_preview}"
 
 
 def fetch_gamma_market_and_tokens_for_slug(full_slug: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -362,11 +343,17 @@ def fetch_gamma_market_and_tokens_for_slug(full_slug: str) -> Tuple[Optional[Dic
     if not market:
         return None, dbg
 
-    yes_id, no_id, how = extract_yes_no_token_ids_robust(market)
-    if not yes_id or not no_id:
+    t0, t1, o0, o1, how = extract_two_outcomes_and_token_ids(market)
+    if not t0 or not t1:
         return None, dbg + " | " + how
 
-    return {"market": market, "yes_token_id": yes_id, "no_token_id": no_id}, dbg + " | " + how
+    return {
+        "market": market,
+        "token_a": t0,
+        "token_b": t1,
+        "outcome_a": o0 or "A",
+        "outcome_b": o1 or "B",
+    }, dbg + " | " + how
 
 
 # ----------------------------
@@ -464,10 +451,12 @@ def book_quality_reasons(label: str, top: Optional[BookTop], http_status: Option
 class TradableSelection:
     slug: str
     bucket: int
-    yes_token: str
-    no_token: str
-    yes_top: BookTop
-    no_top: BookTop
+    token_a: str
+    token_b: str
+    outcome_a: str
+    outcome_b: str
+    top_a: BookTop
+    top_b: BookTop
 
 
 def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Dict[str, int]]:
@@ -503,10 +492,8 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
 
         gamma, dbg = fetch_gamma_market_and_tokens_for_slug(full_slug)
         if not gamma:
-            # Distinguish between "Gamma didn't find market" and "Token extraction failed"
             if "token_extract_failed" in dbg:
                 counters["token_missing"] += 1
-                # Log schema snapshot a few times only
                 if counters["token_debug_logged"] < TOKEN_DEBUG_SAMPLES:
                     counters["token_debug_logged"] += 1
                     mkt, _ = gamma_get_market_by_slug(full_slug)
@@ -516,23 +503,25 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
                         log.info("TOKEN_DEBUG | slug=%s | %s | market_unavailable_for_snapshot", full_slug, dbg)
             else:
                 counters["gamma_missing"] += 1
-            # Also keep a small sample of misses
+
             if i < 3:
                 log.info("GAMMA_MISS | slug=%s | %s", full_slug, dbg)
             continue
 
-        yes_token = gamma.get("yes_token_id")
-        no_token = gamma.get("no_token_id")
+        token_a = gamma["token_a"]
+        token_b = gamma["token_b"]
+        outcome_a = gamma.get("outcome_a") or "A"
+        outcome_b = gamma.get("outcome_b") or "B"
 
-        yes_top, yes_status = fetch_clob_book_top(yes_token)
-        no_top, no_status = fetch_clob_book_top(no_token)
+        top_a, status_a = fetch_clob_book_top(token_a)
+        top_b, status_b = fetch_clob_book_top(token_b)
 
-        if yes_status == 404 or no_status == 404:
+        if status_a == 404 or status_b == 404:
             counters["clob_404"] += 1
 
         reasons = []
-        reasons += book_quality_reasons("YES", yes_top, yes_status)
-        reasons += book_quality_reasons("NO", no_top, no_status)
+        reasons += book_quality_reasons("A", top_a, status_a)
+        reasons += book_quality_reasons("B", top_b, status_b)
 
         if reasons:
             if any("MISSING_BID_OR_ASK" in r for r in reasons):
@@ -540,14 +529,16 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
             else:
                 counters["book_bad"] += 1
 
-            yes_desc = f"{yes_top}" if yes_top else f"no_book(code={yes_status})"
-            no_desc = f"{no_top}" if no_top else f"no_book(code={no_status})"
+            a_desc = f"{top_a}" if top_a else f"no_book(code={status_a})"
+            b_desc = f"{top_b}" if top_b else f"no_book(code={status_b})"
             log.info(
-                "Skipping slug=%s due to book quality: BOOK_BAD(%s) | YES %s | NO %s",
+                "Skipping slug=%s (%s vs %s) due to book quality: BOOK_BAD(%s) | A %s | B %s",
                 full_slug,
+                outcome_a,
+                outcome_b,
                 ",".join(reasons),
-                yes_desc,
-                no_desc,
+                a_desc,
+                b_desc,
             )
             continue
 
@@ -555,12 +546,21 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
         sel = TradableSelection(
             slug=full_slug,
             bucket=bucket,
-            yes_token=str(yes_token),
-            no_token=str(no_token),
-            yes_top=yes_top,
-            no_top=no_top,
+            token_a=str(token_a),
+            token_b=str(token_b),
+            outcome_a=str(outcome_a),
+            outcome_b=str(outcome_b),
+            top_a=top_a,
+            top_b=top_b,
         )
-        log.info("PHASE4_OK | Selected tradable slug with real book: %s | YES %s | NO %s", sel.slug, sel.yes_top, sel.no_top)
+        log.info(
+            "PHASE4_OK | Selected tradable slug with real book: %s | outcomes=(%s,%s) | A %s | B %s",
+            sel.slug,
+            sel.outcome_a,
+            sel.outcome_b,
+            sel.top_a,
+            sel.top_b,
+        )
         return sel, counters
 
     return None, counters
@@ -642,7 +642,12 @@ def main() -> None:
         return
 
     if PHASE4_ONLY:
-        log.info("PHASE4_ONLY | slug=%s | next_step=RE_ENABLE_PAPER_TRADING_LOGIC_WHEN_READY", sel.slug)
+        log.info(
+            "PHASE4_ONLY | slug=%s | outcomes=(%s,%s) | next_step=RE_ENABLE_PAPER_TRADING_LOGIC_WHEN_READY",
+            sel.slug,
+            sel.outcome_a,
+            sel.outcome_b,
+        )
         log.info("BOOT: bot.py finished cleanly")
         return
 

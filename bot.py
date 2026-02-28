@@ -21,7 +21,7 @@ log = logging.getLogger("johnny5")
 
 
 # ----------------------------
-# Helpers
+# Env helpers
 # ----------------------------
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -60,6 +60,9 @@ def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
     return int(ts // 300) * 300
 
 
+# ----------------------------
+# HTTP helpers
+# ----------------------------
 def http_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 20) -> Optional[dict]:
     try:
         r = requests.get(url, params=params, headers=headers, timeout=timeout)
@@ -103,23 +106,32 @@ def _maybe_json(x):
 
 
 # ----------------------------
-# DB
+# DB (IMPORTANT: uses NEW table names to avoid schema conflicts)
 # ----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+STATE_TABLE = os.getenv("J5_STATE_TABLE", "j5_state").strip()
+EQUITY_TABLE = os.getenv("J5_EQUITY_TABLE", "j5_equity_snapshots").strip()
 
 
 def db_conn():
     if not DATABASE_URL:
         raise RuntimeError("Missing DATABASE_URL")
+    # Railway Postgres typically wants SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def ensure_tables() -> None:
+    """
+    Create our own tables with unique names so we never collide with
+    any existing tables like 'bot_state' that may have different schemas.
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # State table (simple single-row state)
             cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bot_state (
+                f"""
+                CREATE TABLE IF NOT EXISTS {STATE_TABLE} (
                   id INTEGER PRIMARY KEY DEFAULT 1,
                   as_of_date DATE,
                   position TEXT,
@@ -131,15 +143,17 @@ def ensure_tables() -> None:
                 """
             )
             cur.execute(
-                """
-                INSERT INTO bot_state (id, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized)
+                f"""
+                INSERT INTO {STATE_TABLE} (id, as_of_date, position, entry_price, stake, trades_today, pnl_today_realized)
                 VALUES (1, CURRENT_DATE, NULL, NULL, 0, 0, 0)
                 ON CONFLICT (id) DO NOTHING;
                 """
             )
+
+            # Equity snapshot table
             cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS equity_snapshots (
+                f"""
+                CREATE TABLE IF NOT EXISTS {EQUITY_TABLE} (
                   id BIGSERIAL PRIMARY KEY,
                   ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                   price DOUBLE PRECISION NOT NULL,
@@ -160,7 +174,7 @@ def load_state() -> Dict[str, Any]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT as_of_date, position, entry_price, stake, trades_today, pnl_today_realized FROM bot_state WHERE id=1;"
+                f"SELECT as_of_date, position, entry_price, stake, trades_today, pnl_today_realized FROM {STATE_TABLE} WHERE id=1;"
             )
             row = cur.fetchone()
             if not row:
@@ -186,8 +200,8 @@ def save_state(state: Dict[str, Any]) -> None:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                UPDATE bot_state
+                f"""
+                UPDATE {STATE_TABLE}
                    SET as_of_date=%s,
                        position=%s,
                        entry_price=%s,
@@ -221,8 +235,8 @@ def record_equity_snapshot(
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO equity_snapshots (price, balance, position, entry_price, stake, unrealized_pnl, equity, poly_slug)
+                f"""
+                INSERT INTO {EQUITY_TABLE} (price, balance, position, entry_price, stake, unrealized_pnl, equity, poly_slug)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s);
                 """,
                 (price, balance, position, entry_price, stake, unrealized_pnl, equity, poly_slug),
@@ -236,22 +250,13 @@ def record_equity_snapshot(
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
-# Base slug prefix you want to trade (no bucket)
-# Example: btc-updown-5m
+# Base slug prefix (NO bucket)
 POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
-
-# Some setups used POLY_EVENT_SLUG historically; keep compatible.
 POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()
-
-# If you set POLY_GAMMA_SLUG, we treat it as the base prefix too (optional)
 POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip()
 
 
 def slug_prefix() -> str:
-    """
-    Determine the base prefix used to construct full rolling slugs:
-      <prefix>-<bucketEpoch>
-    """
     for v in (POLY_MARKET_SLUG, POLY_GAMMA_SLUG, POLY_EVENT_SLUG):
         if v and v.strip():
             return v.strip()
@@ -369,22 +374,8 @@ def fetch_clob_book_top(token_id: str) -> Tuple[Optional[BookTop], Optional[int]
     return BookTop(bid=best_bid, ask=best_ask, bid_size=best_bid_size, ask_size=best_ask_size), 200
 
 
-def clob_midpoint(token_id: str) -> Optional[float]:
-    url = f"{POLY_CLOB_HOST}/midpoint"
-    j = http_get_json(url, params={"token_id": token_id})
-    if not j:
-        return None
-    mp = j.get("midpoint")
-    if mp is None:
-        return None
-    try:
-        return float(mp)
-    except Exception:
-        return None
-
-
 # ----------------------------
-# Book Quality Gates (Phase 4)
+# Phase 4 Book Quality Gates
 # ----------------------------
 MIN_BID = env_float("MIN_BID", 0.02)
 MAX_ASK = env_float("MAX_ASK", 0.98)
@@ -392,7 +383,7 @@ MAX_SPREAD = env_float("MAX_SPREAD", 0.10)
 
 LOOKBACK_BUCKETS = env_int("LOOKBACK_BUCKETS", 96)
 
-# If true, we only run Phase 4 "find real book" + logging, and exit (no trading).
+# If true, we only do "find real book" + logs and stop
 PHASE4_ONLY = env_bool("PHASE4_ONLY", True)
 
 
@@ -429,10 +420,6 @@ class TradableSelection:
 
 
 def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Dict[str, int]]:
-    """
-    Sweep backward across buckets and find the first bucket where BOTH YES and NO
-    books pass quality gates.
-    """
     now_bucket = five_min_bucket_epoch(time.time())
 
     counters = {
@@ -450,7 +437,6 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
         full_slug = make_poly_slug_for_bucket(bucket)
         counters["tried"] += 1
 
-        # PROVE we are iterating buckets
         log.info(
             "TRY_BUCKET | i=%d | bucket=%d | utc=%s | slug=%s",
             i,
@@ -473,23 +459,19 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
         yes_top, yes_status = fetch_clob_book_top(yes_token)
         no_top, no_status = fetch_clob_book_top(no_token)
 
-        # Track 404s
         if yes_status == 404 or no_status == 404:
             counters["clob_404"] += 1
 
-        # Apply gates
         reasons = []
         reasons += book_quality_reasons("YES", yes_top, yes_status)
         reasons += book_quality_reasons("NO", no_top, no_status)
 
         if reasons:
-            # Specific counters for quick diagnosis
             if any("MISSING_BID_OR_ASK" in r for r in reasons):
                 counters["book_missing_side"] += 1
             else:
                 counters["book_bad"] += 1
 
-            # Preserve your existing style of "Skipping slug=..."
             yes_desc = f"{yes_top}" if yes_top else f"no_book(code={yes_status})"
             no_desc = f"{no_top}" if no_top else f"no_book(code={no_status})"
             log.info(
@@ -522,7 +504,7 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
 
 
 # ----------------------------
-# Bun live order gateway (kept for later phases)
+# Bun gateway (kept for later phases)
 # ----------------------------
 BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
 
@@ -530,30 +512,11 @@ BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
 def bun_health() -> Optional[int]:
     if not BUN_BASE_URL:
         return None
-    code, _, _ = http_post_json(f"{BUN_BASE_URL}/__ping", payload={}, timeout=8)
-    if code == 0 or code >= 400:
-        try:
-            r = requests.get(f"{BUN_BASE_URL}/", timeout=8)
-            return r.status_code
-        except Exception:
-            return None
-    return code
-
-
-def bun_place_order(token_id: str, side: str, price: float, size: float) -> Tuple[bool, str]:
-    if not BUN_BASE_URL:
-        return False, "missing BUN_BASE_URL"
-    payload = {
-        "token_id": token_id,
-        "side": side,
-        "price": float(price),
-        "size": float(size),
-        "order_type": "GTC",
-    }
-    code, j, text = http_post_json(f"{BUN_BASE_URL}/order", payload=payload, timeout=20)
-    if code != 200 or not j or not j.get("ok"):
-        return False, f"bun order failed code={code} body={text[:300]}"
-    return True, "ok"
+    try:
+        r = requests.get(f"{BUN_BASE_URL}/", timeout=8)
+        return r.status_code
+    except Exception:
+        return None
 
 
 # ----------------------------
@@ -562,6 +525,7 @@ def bun_place_order(token_id: str, side: str, price: float, size: float) -> Tupl
 def main() -> None:
     log.info("BOOT: bot.py starting")
 
+    # Create our own tables (no collision with your existing bot_state)
     ensure_tables()
 
     run_mode = os.getenv("RUN_MODE", "DRY_RUN").strip().upper()
@@ -571,7 +535,7 @@ def main() -> None:
     live_armed = live_mode and live_trading_enabled and (not kill_switch)
 
     log.info(
-        "run_mode=%s live_mode=%s live_armed=%s prefix=%s lookback=%d MIN_BID=%.3f MAX_ASK=%.3f MAX_SPREAD=%.3f PHASE4_ONLY=%s",
+        "run_mode=%s live_mode=%s live_armed=%s prefix=%s lookback=%d MIN_BID=%.3f MAX_ASK=%.3f MAX_SPREAD=%.3f PHASE4_ONLY=%s db_state_table=%s",
         run_mode,
         live_mode,
         live_armed,
@@ -581,6 +545,7 @@ def main() -> None:
         MAX_ASK,
         MAX_SPREAD,
         PHASE4_ONLY,
+        STATE_TABLE,
     )
 
     if BUN_BASE_URL:
@@ -588,7 +553,7 @@ def main() -> None:
         if hs is not None:
             log.info("bun_health_status=%s", hs)
 
-    # Daily reset
+    # Daily reset for our state table
     state = load_state()
     today = date.today()
     if state["as_of_date"] != today:
@@ -597,7 +562,6 @@ def main() -> None:
         state["pnl_today_realized"] = 0.0
         save_state(state)
 
-    # Phase 4: find real tradable bucket
     sel, counters = find_tradable_slug_with_real_book()
 
     log.info(
@@ -616,15 +580,12 @@ def main() -> None:
         log.info("BOOT: bot.py finished cleanly")
         return
 
-    # If Phase4-only, stop here (no trading logic yet).
     if PHASE4_ONLY:
         log.info("PHASE4_ONLY | slug=%s | next_step=RE_ENABLE_PAPER_TRADING_LOGIC_WHEN_READY", sel.slug)
         log.info("BOOT: bot.py finished cleanly")
         return
 
-    # --- Later phases would continue from here using sel.slug/sel.tokens ---
-    # Keeping placeholder for now so you can flip PHASE4_ONLY=false when ready.
-    log.info("PHASE4_DONE | slug=%s | (trading logic currently disabled in this phase)", sel.slug)
+    log.info("PHASE4_DONE | slug=%s | (trading logic disabled in this phase)", sel.slug)
     log.info("BOOT: bot.py finished cleanly")
 
 

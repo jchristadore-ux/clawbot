@@ -8,16 +8,10 @@ from typing import Optional, Dict, Any, Tuple
 import requests
 import psycopg2
 
-# ----------------------------
-# Logging
-# ----------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("johnny5")
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -86,10 +80,6 @@ def db_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def ensure_tables() -> None:
-    """
-    Uses bot_state with key='main' and equity_snapshots.
-    Adds columns safely if missing.
-    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -136,7 +126,6 @@ def ensure_tables() -> None:
                 );
                 """
             )
-
         conn.commit()
 
 def load_state() -> Dict[str, Any]:
@@ -317,7 +306,7 @@ def find_tradable_slug(base: str) -> Optional[str]:
     return None
 
 # ----------------------------
-# Bun gateway (LIVE only)
+# Bun (LIVE only)
 # ----------------------------
 BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
 BUN_HEALTH_PATH = os.getenv("BUN_HEALTH_PATH", "/health").strip() or "/health"
@@ -329,50 +318,33 @@ def bun_health() -> Optional[int]:
         r = requests.get(f"{BUN_BASE_URL}{BUN_HEALTH_PATH}", timeout=8)
         return r.status_code
     except Exception:
-        pass
-    try:
-        r = requests.get(f"{BUN_BASE_URL}/", timeout=8)
-        return r.status_code
-    except Exception:
-        return None
+        try:
+            r = requests.get(f"{BUN_BASE_URL}/", timeout=8)
+            return r.status_code
+        except Exception:
+            return None
 
 def bun_place_order(token_id: str, side: str, price: float, size: float) -> Tuple[bool, str]:
     if not BUN_BASE_URL:
         return False, "missing BUN_BASE_URL"
-    payload = {
-        "token_id": token_id,
-        "side": side,   # BUY or SELL
-        "price": float(price),
-        "size": float(size),
-        "order_type": "GTC",
-    }
+    payload = {"token_id": token_id, "side": side, "price": float(price), "size": float(size), "order_type": "GTC"}
     code, j, text = http_post_json(f"{BUN_BASE_URL}/order", payload=payload, timeout=20)
     if code != 200 or not j or not j.get("ok"):
         return False, f"bun order failed code={code} body={text[:300]}"
     return True, "ok"
 
 # ----------------------------
-# Strategy / Risk (A: single-position flip)
+# Strategy / Risk
 # ----------------------------
-EDGE_ENTER = env_float("EDGE_ENTER", 0.10)
-EDGE_EXIT  = env_float("EDGE_EXIT", 0.02)
-
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "60"))
+EDGE_ENTER = env_float("EDGE_ENTER", 0.12)
+EDGE_EXIT  = env_float("EDGE_EXIT", 0.04)
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "200"))
 COOLDOWN_SECONDS   = int(os.getenv("COOLDOWN_SECONDS", "60"))
 LIVE_TRADE_SIZE    = env_float("LIVE_TRADE_SIZE", 1.0)
 
-# Book quality gates
 MAX_SPREAD = env_float("MAX_SPREAD", 0.08)
 MIN_BID    = env_float("MIN_BID", 0.02)
 MAX_ASK    = env_float("MAX_ASK", 0.98)
-
-def compute_signal(poly_up_mid: float, fair_up: float = 0.50) -> Tuple[str, float]:
-    edge = fair_up - poly_up_mid
-    if edge >= EDGE_ENTER:
-        return "YES", edge
-    if edge <= -EDGE_ENTER:
-        return "NO", edge
-    return "HOLD", edge
 
 def is_book_ok(bid: Optional[float], ask: Optional[float]) -> Tuple[bool, str]:
     if bid is None or ask is None:
@@ -388,6 +360,14 @@ def is_book_ok(bid: Optional[float], ask: Optional[float]) -> Tuple[bool, str]:
         return False, "CROSSED_BOOK"
     return True, "OK"
 
+def compute_signal(poly_up_mid: float, fair_up: float = 0.50) -> Tuple[str, float]:
+    edge = fair_up - poly_up_mid
+    if edge >= EDGE_ENTER:
+        return "YES", edge
+    if edge <= -EDGE_ENTER:
+        return "NO", edge
+    return "HOLD", edge
+
 def seconds_since(ts) -> Optional[int]:
     if ts is None:
         return None
@@ -396,42 +376,34 @@ def seconds_since(ts) -> Optional[int]:
     except Exception:
         return None
 
-# ----------------------------
-# Main
-# ----------------------------
 def run_once() -> None:
     ensure_tables()
 
-    run_mode = os.getenv("RUN_MODE", "DRY_RUN").strip().upper()
+    run_mode = os.getenv("RUN_MODE", "PAPER").strip().upper()
     live_mode = run_mode == "LIVE"
     live_trading_enabled = env_bool("LIVE_TRADING_ENABLED", False)
     kill_switch = env_bool("KILL_SWITCH", True)
     live_armed = live_mode and live_trading_enabled and (not kill_switch)
 
     if not POLY_MARKET_SLUG:
-        raise RuntimeError("Missing POLY_MARKET_SLUG (e.g. btc-updown-5m)")
+        raise RuntimeError("Missing POLY_MARKET_SLUG")
 
-    bucket = five_min_bucket_epoch()
-    log.info("run_mode=%s live_mode=%s live_armed=%s base=%s bucket=%s", run_mode, live_mode, live_armed, POLY_MARKET_SLUG, bucket)
+    log.info("run_mode=%s live_mode=%s live_armed=%s base=%s bucket=%s",
+             run_mode, live_mode, live_armed, POLY_MARKET_SLUG, five_min_bucket_epoch())
 
     if BUN_BASE_URL:
         hs = bun_health()
         if hs is not None:
             log.info("bun_health_status=%s", hs)
 
-    # Manual reset toggle
     if env_bool("RESET_STATE", False):
         mode = os.getenv("RESET_STATE_MODE", "FULL")
         log.warning("RESET_STATE=true detected. Resetting DB state now (mode=%s)...", mode)
         reset_state_db(mode=mode)
-        s = load_state()
-        log.warning("RESET complete. as_of_date=%s position=%s entry=%s stake=%.2f trades_today=%d pnl_today_realized=%.2f",
-                    s["as_of_date"], s["position"], s["entry_price"], s["stake"], s["trades_today"], s["pnl_today_realized"])
 
     state = load_state()
-    today = date.today()
-    if state["as_of_date"] != today:
-        state["as_of_date"] = today
+    if state["as_of_date"] != date.today():
+        state["as_of_date"] = date.today()
         state["trades_today"] = 0
         state["pnl_today_realized"] = 0.0
         save_state(state)
@@ -439,7 +411,7 @@ def run_once() -> None:
 
     slug = find_tradable_slug(POLY_MARKET_SLUG)
     if not slug:
-        log.warning("No tradable slug found in last %d buckets for base=%s", LOOKBACK_BUCKETS, POLY_MARKET_SLUG)
+        log.warning("No tradable slug found")
         return
 
     log.info("Checking slug=%s", slug)
@@ -447,7 +419,7 @@ def run_once() -> None:
 
     m = fetch_gamma_market_by_slug(slug)
     if not m:
-        log.warning("Gamma market not found after resolution for slug=%s", slug)
+        log.warning("Gamma market missing")
         return
 
     yes_token, no_token = extract_yes_no_token_ids(m)
@@ -457,16 +429,27 @@ def run_once() -> None:
     yes_bid, yes_ask, yes_src = clob_best_bid_ask(yes_token)
     no_bid,  no_ask,  no_src  = clob_best_bid_ask(no_token)
 
+    yes_ok, yes_why = is_book_ok(yes_bid, yes_ask)
+    no_ok,  no_why  = is_book_ok(no_bid, no_ask)
+
     yes_mid = mid_from_bid_ask(yes_bid, yes_ask)
     no_mid  = mid_from_bid_ask(no_bid, no_ask)
-    if yes_mid is None or no_mid is None:
-        log.warning("Missing pricing: yes_mid=%s (%s) no_mid=%s (%s)", yes_mid, yes_src, no_mid, no_src)
+
+    # If either book is junk, we SIT OUT and say why (Phase 4 goal)
+    if not yes_ok or not no_ok:
+        reason = f"YES_{yes_why}" if not yes_ok else f"NO_{no_why}"
+        log.info(
+            "slug=%s | YES %s mid=%s | NO %s mid=%s | action=NO_TRADE | reason=%s | pos=%s | trades_today=%d",
+            slug, yes_src, (None if yes_mid is None else f"{yes_mid:.4f}"),
+            no_src,  (None if no_mid is None else f"{no_mid:.4f}"),
+            reason, state["position"], int(state["trades_today"] or 0),
+        )
         return
 
-    fair_up = 0.50
-    signal, edge = compute_signal(yes_mid, fair_up=fair_up)
+    # Now safe to compute signal
+    signal, edge = compute_signal(float(yes_mid), fair_up=0.50)
 
-    position = state["position"]  # None / YES / NO
+    position = state["position"]
     entry = state["entry_price"]
     stake = float(state["stake"] or 0.0)
     trades_today = int(state["trades_today"] or 0)
@@ -474,69 +457,46 @@ def run_once() -> None:
     last_trade_ts = state.get("last_trade_ts")
 
     since = seconds_since(last_trade_ts)
-    in_cooldown = (since is not None and since < COOLDOWN_SECONDS)
-
-    def book_ok(tok_pos: str) -> Tuple[bool, str]:
-        return is_book_ok(yes_bid, yes_ask) if tok_pos == "YES" else is_book_ok(no_bid, no_ask)
-
-    action = "NO_TRADE"
-    reason = ""
-
-    if trades_today >= MAX_TRADES_PER_DAY:
-        reason = "MAX_TRADES_PER_DAY"
-    elif in_cooldown:
-        reason = f"COOLDOWN({since}s<{COOLDOWN_SECONDS}s)"
+    if since is not None and since < COOLDOWN_SECONDS:
+        action, reason = "NO_TRADE", f"COOLDOWN({since}s<{COOLDOWN_SECONDS}s)"
+    elif trades_today >= MAX_TRADES_PER_DAY:
+        action, reason = "NO_TRADE", "MAX_TRADES_PER_DAY"
     else:
-        # A) Single-position flip logic
+        # A: flip logic
+        action, reason = "NO_TRADE", ""
         if position is None:
             if signal == "YES":
-                ok, why = book_ok("YES")
-                action = "ENTER_YES" if ok else "NO_TRADE"
-                reason = "" if ok else why
+                action = "ENTER_YES"
             elif signal == "NO":
-                ok, why = book_ok("NO")
-                action = "ENTER_NO" if ok else "NO_TRADE"
-                reason = "" if ok else why
+                action = "ENTER_NO"
             else:
                 reason = "signal=HOLD"
-
         elif position == "YES":
             if abs(edge) < EDGE_EXIT:
-                ok, why = book_ok("YES")
-                action = "EXIT_YES" if ok else "NO_TRADE"
-                reason = "" if ok else why
+                action = "EXIT_YES"
             elif signal == "NO":
-                ok1, why1 = book_ok("YES")
-                ok2, why2 = book_ok("NO")
-                action = "FLIP_TO_NO" if (ok1 and ok2) else "NO_TRADE"
-                reason = "" if (ok1 and ok2) else (why1 if not ok1 else why2)
+                action = "FLIP_TO_NO"
             else:
                 reason = "HOLD_SAME_SIDE"
-
         elif position == "NO":
             if abs(edge) < EDGE_EXIT:
-                ok, why = book_ok("NO")
-                action = "EXIT_NO" if ok else "NO_TRADE"
-                reason = "" if ok else why
+                action = "EXIT_NO"
             elif signal == "YES":
-                ok1, why1 = book_ok("NO")
-                ok2, why2 = book_ok("YES")
-                action = "FLIP_TO_YES" if (ok1 and ok2) else "NO_TRADE"
-                reason = "" if (ok1 and ok2) else (why1 if not ok1 else why2)
+                action = "FLIP_TO_YES"
             else:
                 reason = "HOLD_SAME_SIDE"
 
-    def buy_price(tok: str) -> float:
+    def buy(tok: str) -> float:
         return float(yes_ask if tok == "YES" else no_ask)
 
-    def sell_price(tok: str) -> float:
+    def sell(tok: str) -> float:
         return float(yes_bid if tok == "YES" else no_bid)
 
     did_trade = False
 
-    if action in ("ENTER_YES", "ENTER_NO", "EXIT_YES", "EXIT_NO", "FLIP_TO_NO", "FLIP_TO_YES") and reason == "":
+    if action != "NO_TRADE" and reason == "":
         if action == "ENTER_YES":
-            fill = buy_price("YES")
+            fill = buy("YES")
             if run_mode == "PAPER":
                 state["position"] = "YES"
                 state["entry_price"] = fill
@@ -555,7 +515,7 @@ def run_once() -> None:
                     action, reason = "NO_TRADE", msg
 
         elif action == "ENTER_NO":
-            fill = buy_price("NO")
+            fill = buy("NO")
             if run_mode == "PAPER":
                 state["position"] = "NO"
                 state["entry_price"] = fill
@@ -582,7 +542,7 @@ def run_once() -> None:
                 state["trades_today"] = trades_today + 1
                 did_trade = True
             else:
-                exit_px = sell_price(tok)
+                exit_px = sell(tok)
                 realized = (exit_px - float(entry)) * float(stake or 0.0)
                 if run_mode == "PAPER":
                     state["position"] = None
@@ -591,133 +551,63 @@ def run_once() -> None:
                     state["trades_today"] = trades_today + 1
                     state["pnl_today_realized"] = pnl_today + realized
                     did_trade = True
-                elif run_mode == "LIVE" and live_armed:
-                    token_id = yes_token if tok == "YES" else no_token
-                    ok, msg = bun_place_order(token_id, "SELL", exit_px, float(stake))
-                    if ok:
-                        state["position"] = None
-                        state["entry_price"] = None
-                        state["stake"] = 0.0
-                        state["trades_today"] = trades_today + 1
-                        state["pnl_today_realized"] = pnl_today + realized
-                        did_trade = True
-                    else:
-                        action, reason = "NO_TRADE", msg
 
         elif action == "FLIP_TO_NO":
-            if entry is None:
-                state["position"] = None
-                state["entry_price"] = None
-                state["stake"] = 0.0
-                state["trades_today"] = trades_today + 1
+            exit_px = sell("YES")
+            enter_px = buy("NO")
+            realized = 0.0 if entry is None else (exit_px - float(entry)) * float(stake or 0.0)
+            if run_mode == "PAPER":
+                state["pnl_today_realized"] = pnl_today + realized
+                state["position"] = "NO"
+                state["entry_price"] = enter_px
+                state["stake"] = LIVE_TRADE_SIZE
+                state["trades_today"] = trades_today + 2
                 did_trade = True
-            else:
-                exit_px = sell_price("YES")
-                realized = (exit_px - float(entry)) * float(stake or 0.0)
-                enter_px = buy_price("NO")
-                if run_mode == "PAPER":
-                    state["pnl_today_realized"] = pnl_today + realized
-                    state["position"] = "NO"
-                    state["entry_price"] = enter_px
-                    state["stake"] = LIVE_TRADE_SIZE
-                    state["trades_today"] = trades_today + 2
-                    did_trade = True
-                elif run_mode == "LIVE" and live_armed:
-                    ok1, msg1 = bun_place_order(yes_token, "SELL", exit_px, float(stake))
-                    if ok1:
-                        ok2, msg2 = bun_place_order(no_token, "BUY", enter_px, LIVE_TRADE_SIZE)
-                        if ok2:
-                            state["pnl_today_realized"] = pnl_today + realized
-                            state["position"] = "NO"
-                            state["entry_price"] = enter_px
-                            state["stake"] = LIVE_TRADE_SIZE
-                            state["trades_today"] = trades_today + 2
-                            did_trade = True
-                        else:
-                            action, reason = "NO_TRADE", msg2
-                    else:
-                        action, reason = "NO_TRADE", msg1
 
         elif action == "FLIP_TO_YES":
-            if entry is None:
-                state["position"] = None
-                state["entry_price"] = None
-                state["stake"] = 0.0
-                state["trades_today"] = trades_today + 1
+            exit_px = sell("NO")
+            enter_px = buy("YES")
+            realized = 0.0 if entry is None else (exit_px - float(entry)) * float(stake or 0.0)
+            if run_mode == "PAPER":
+                state["pnl_today_realized"] = pnl_today + realized
+                state["position"] = "YES"
+                state["entry_price"] = enter_px
+                state["stake"] = LIVE_TRADE_SIZE
+                state["trades_today"] = trades_today + 2
                 did_trade = True
-            else:
-                exit_px = sell_price("NO")
-                realized = (exit_px - float(entry)) * float(stake or 0.0)
-                enter_px = buy_price("YES")
-                if run_mode == "PAPER":
-                    state["pnl_today_realized"] = pnl_today + realized
-                    state["position"] = "YES"
-                    state["entry_price"] = enter_px
-                    state["stake"] = LIVE_TRADE_SIZE
-                    state["trades_today"] = trades_today + 2
-                    did_trade = True
-                elif run_mode == "LIVE" and live_armed:
-                    ok1, msg1 = bun_place_order(no_token, "SELL", exit_px, float(stake))
-                    if ok1:
-                        ok2, msg2 = bun_place_order(yes_token, "BUY", enter_px, LIVE_TRADE_SIZE)
-                        if ok2:
-                            state["pnl_today_realized"] = pnl_today + realized
-                            state["position"] = "YES"
-                            state["entry_price"] = enter_px
-                            state["stake"] = LIVE_TRADE_SIZE
-                            state["trades_today"] = trades_today + 2
-                            did_trade = True
-                        else:
-                            action, reason = "NO_TRADE", msg2
-                    else:
-                        action, reason = "NO_TRADE", msg1
 
     if did_trade:
         state["last_trade_ts"] = datetime.now(timezone.utc)
         save_state(state)
         state = load_state()
 
-    position2 = state["position"]
-    entry2 = state["entry_price"]
-    stake2 = float(state["stake"] or 0.0)
-    trades2 = int(state["trades_today"] or 0)
-    pnl2 = float(state["pnl_today_realized"] or 0.0)
-
-    if position2 == "YES" and entry2 is not None:
-        u = (yes_mid - float(entry2)) * stake2
-        mark_price = yes_mid
-    elif position2 == "NO" and entry2 is not None:
-        u = (no_mid - float(entry2)) * stake2
-        mark_price = no_mid
+    # PnL mark
+    if state["position"] == "YES" and state["entry_price"] is not None:
+        u = (float(yes_mid) - float(state["entry_price"])) * float(state["stake"] or 0.0)
+        mark_price = float(yes_mid)
+    elif state["position"] == "NO" and state["entry_price"] is not None:
+        u = (float(no_mid) - float(state["entry_price"])) * float(state["stake"] or 0.0)
+        mark_price = float(no_mid)
     else:
         u = 0.0
-        mark_price = yes_mid
+        mark_price = float(yes_mid)
 
     balance = float(os.getenv("PAPER_BALANCE", "0").strip() or 0.0)
     equity = balance + u
 
     log.info(
-        "slug=%s | YES %s mid=%.4f | NO %s mid=%.4f | fair_up=%.3f | edge=%+.4f | signal=%s | action=%s%s | pos=%s | entry=%s | trades_today=%d | pnl_today(realized)=%.2f",
-        slug,
-        yes_src, float(yes_mid),
-        no_src, float(no_mid),
-        fair_up,
-        float(edge),
-        signal,
-        action,
-        (f" | reason={reason}" if reason else ""),
-        position2,
-        (None if entry2 is None else round(float(entry2), 6)),
-        trades2,
-        pnl2
+        "slug=%s | YES %s mid=%.4f | NO %s mid=%.4f | edge=%+.4f | signal=%s | action=%s%s | pos=%s | entry=%s | trades_today=%d | pnl_today(realized)=%.2f",
+        slug, yes_src, float(yes_mid), no_src, float(no_mid),
+        float(edge), signal, action, (f" | reason={reason}" if reason else ""),
+        state["position"], state["entry_price"], int(state["trades_today"] or 0), float(state["pnl_today_realized"] or 0.0)
     )
 
     record_equity_snapshot(
         price=float(mark_price),
         balance=float(balance),
-        position=position2,
-        entry_price=(None if entry2 is None else float(entry2)),
-        stake=float(stake2),
+        position=state["position"],
+        entry_price=(None if state["entry_price"] is None else float(state["entry_price"])),
+        stake=float(state["stake"] or 0.0),
         unrealized_pnl=float(u),
         equity=float(equity),
         poly_slug=slug
@@ -727,7 +617,6 @@ def run_once() -> None:
 
 def main() -> None:
     log.info("BOOT: bot.py starting")
-
     run_loop = env_bool("RUN_LOOP", False)
     loop_seconds = int(os.getenv("LOOP_SECONDS", "30"))
 

@@ -50,26 +50,40 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+# ----------------------------
+# Time helpers
+# ----------------------------
 def five_min_bucket_epoch(ts: Optional[float] = None) -> int:
     if ts is None:
         ts = time.time()
     return int(ts // 300) * 300
 
 
+def iso_utc_from_epoch(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
 # ----------------------------
 # HTTP helpers
 # ----------------------------
-def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 20) -> Tuple[Optional[Any], Optional[int]]:
+def http_get(url: str, params: Optional[dict] = None, timeout: int = 20) -> Tuple[Optional[Any], Optional[int], str]:
     try:
         r = requests.get(url, params=params, timeout=timeout)
+        txt = (r.text or "")[:500]
         if r.status_code != 200:
-            return None, r.status_code
-        return r.json(), 200
-    except Exception:
-        return None, None
+            return None, r.status_code, txt
+        try:
+            return r.json(), 200, txt
+        except Exception:
+            return None, r.status_code, txt
+    except Exception as e:
+        return None, None, str(e)
 
 
 def _maybe_json(x):
+    """
+    Gamma sometimes returns outcomes/clobTokenIds as JSON-encoded strings.
+    """
     if x is None:
         return None
     if isinstance(x, (list, dict)):
@@ -182,84 +196,71 @@ def save_state(state: Dict[str, Any]) -> None:
 POLY_GAMMA_HOST = os.getenv("POLY_GAMMA_HOST", "https://gamma-api.polymarket.com").strip()
 POLY_CLOB_HOST = os.getenv("POLY_CLOB_HOST", "https://clob.polymarket.com").strip()
 
-POLY_MARKET_SLUG = os.getenv("POLY_MARKET_SLUG", "").strip()
-POLY_EVENT_SLUG = os.getenv("POLY_EVENT_SLUG", "").strip()
-POLY_GAMMA_SLUG = os.getenv("POLY_GAMMA_SLUG", "").strip()
+# IMPORTANT: Use your known good full slug as the seed.
+# You can set it in Railway as POLY_SEED_SLUG. If you don't, we default to the one you pasted.
+POLY_SEED_SLUG = os.getenv("POLY_SEED_SLUG", "btc-updown-5m-1772308500").strip()
+
+# For reference/logging only — we derive prefix from seed slug
+def seed_prefix_from_slug(seed_slug: str) -> str:
+    parts = seed_slug.split("-")
+    if len(parts) < 2:
+        raise RuntimeError(f"Bad POLY_SEED_SLUG: {seed_slug}")
+    # prefix is everything except the last segment (bucket)
+    return "-".join(parts[:-1])
 
 
-def slug_prefix() -> str:
-    for v in (POLY_MARKET_SLUG, POLY_GAMMA_SLUG, POLY_EVENT_SLUG):
-        if v and v.strip():
-            return v.strip()
-    raise RuntimeError("Missing POLY_MARKET_SLUG (recommended) or POLY_GAMMA_SLUG / POLY_EVENT_SLUG")
+def seed_bucket_from_slug(seed_slug: str) -> int:
+    tail = seed_slug.split("-")[-1]
+    if not tail.isdigit():
+        raise RuntimeError(f"Seed slug does not end with numeric bucket: {seed_slug}")
+    b = int(tail)
+    # sanity check: rolling buckets should look like unix epoch seconds (~10 digits in 2026)
+    if b < 1_600_000_000 or b > 2_000_000_000:
+        raise RuntimeError(f"Seed bucket looks wrong (not epoch seconds): {b} from {seed_slug}")
+    return b
 
 
-def fetch_gamma_market_by_slug(full_slug: str) -> Optional[dict]:
-    url = f"{POLY_GAMMA_HOST}/markets/slug/{full_slug}"
-    j, code = http_get_json(url)
-    return j if code == 200 and isinstance(j, dict) else None
-
-
-def gamma_search_markets(prefix: str, limit: int = 200) -> List[dict]:
+def gamma_get_market_by_slug(full_slug: str) -> Tuple[Optional[dict], str]:
     """
-    Gamma commonly supports /markets?search=<term>.
-    We pull a bigger page then filter locally.
+    Gamma endpoints vary. We try multiple patterns and keep debug info.
+
+    Returns: (market_dict_or_none, debug_string)
     """
-    url = f"{POLY_GAMMA_HOST}/markets"
-    params = {"search": prefix, "limit": limit}
-    j, code = http_get_json(url, params=params)
-    if code != 200 or not j:
-        return []
+    attempts: List[str] = []
+
+    # 1) /markets/slug/<slug>
+    url1 = f"{POLY_GAMMA_HOST}/markets/slug/{full_slug}"
+    j, code, txt = http_get(url1, timeout=20)
+    attempts.append(f"slug_endpoint code={code}")
+    if isinstance(j, dict):
+        return j, " | ".join(attempts)
+
+    # 2) /markets?slug=<slug>
+    url2 = f"{POLY_GAMMA_HOST}/markets"
+    j, code, txt = http_get(url2, params={"slug": full_slug, "limit": 1}, timeout=20)
+    attempts.append(f"markets?slug code={code}")
+    if isinstance(j, list) and j and isinstance(j[0], dict):
+        return j[0], " | ".join(attempts)
+    if isinstance(j, dict):
+        mkts = j.get("markets")
+        if isinstance(mkts, list) and mkts and isinstance(mkts[0], dict):
+            return mkts[0], " | ".join(attempts)
+
+    # 3) /markets?search=<slug> (exact search string)
+    j, code, txt = http_get(url2, params={"search": full_slug, "limit": 5}, timeout=20)
+    attempts.append(f"markets?search=FULL_SLUG code={code}")
     if isinstance(j, list):
-        return [x for x in j if isinstance(x, dict)]
-    markets = j.get("markets") if isinstance(j, dict) else None
-    if isinstance(markets, list):
-        return [x for x in markets if isinstance(x, dict)]
-    return []
+        for m in j:
+            if isinstance(m, dict) and m.get("slug") == full_slug:
+                return m, " | ".join(attempts)
+    if isinstance(j, dict):
+        mkts = j.get("markets")
+        if isinstance(mkts, list):
+            for m in mkts:
+                if isinstance(m, dict) and m.get("slug") == full_slug:
+                    return m, " | ".join(attempts)
 
-
-def parse_bucket_from_slug_strict(prefix: str, slug: str) -> Optional[int]:
-    """
-    STRICT:
-    - slug must start with f"{prefix}-"
-    - suffix must be a 10-digit unix epoch (e.g., 1772307900)
-    """
-    want = f"{prefix}-"
-    if not slug.startswith(want):
-        return None
-    suffix = slug[len(want):]
-    if not suffix.isdigit():
-        return None
-    if len(suffix) != 10:
-        return None
-    try:
-        return int(suffix)
-    except Exception:
-        return None
-
-
-def seed_from_gamma_strict(prefix: str) -> Tuple[Optional[str], Optional[int], int]:
-    """
-    Returns (seed_slug, seed_bucket, total_examined)
-    """
-    markets = gamma_search_markets(prefix, limit=200)
-    examined = 0
-    candidates: List[Tuple[int, str]] = []
-    for m in markets:
-        s = m.get("slug")
-        if not isinstance(s, str):
-            continue
-        examined += 1
-        b = parse_bucket_from_slug_strict(prefix, s)
-        if b is not None:
-            candidates.append((b, s))
-
-    if not candidates:
-        return None, None, examined
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    bucket, slug = candidates[0]
-    return slug, bucket, examined
+    return None, " | ".join(attempts)
 
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
@@ -284,16 +285,19 @@ def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]
     return yes_id, no_id
 
 
-def fetch_gamma_market_and_tokens_for_full_slug(full_slug: str) -> Optional[Dict[str, Any]]:
-    m = fetch_gamma_market_by_slug(full_slug)
-    if not m or not isinstance(m, dict):
-        return None
-    yes_id, no_id = extract_yes_no_token_ids(m)
+def fetch_gamma_market_and_tokens_for_slug(full_slug: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    market, dbg = gamma_get_market_by_slug(full_slug)
+    if not market:
+        return None, dbg
+    yes_id, no_id = extract_yes_no_token_ids(market)
     if not yes_id or not no_id:
-        return None
-    return {"market": m, "yes_token_id": yes_id, "no_token_id": no_id}
+        return None, dbg + " | token_extract_failed"
+    return {"market": market, "yes_token_id": yes_id, "no_token_id": no_id}, dbg
 
 
+# ----------------------------
+# CLOB book
+# ----------------------------
 @dataclass
 class BookTop:
     bid: Optional[float]
@@ -359,7 +363,7 @@ def fetch_clob_book_top(token_id: str) -> Tuple[Optional[BookTop], Optional[int]
 
 
 # ----------------------------
-# Phase 4 Book Quality Gates
+# Phase 4 gates
 # ----------------------------
 MIN_BID = env_float("MIN_BID", 0.02)
 MAX_ASK = env_float("MAX_ASK", 0.98)
@@ -403,6 +407,7 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
     counters = {
         "tried": 0,
         "gamma_missing": 0,
+        "gamma_debug_samples": 0,
         "token_missing": 0,
         "clob_404": 0,
         "book_missing_side": 0,
@@ -410,39 +415,34 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
         "ok": 0,
     }
 
-    prefix = slug_prefix()
-    seed_slug, seed_bucket, examined = seed_from_gamma_strict(prefix)
+    seed_slug = POLY_SEED_SLUG
+    prefix = seed_prefix_from_slug(seed_slug)
+    seed_bucket = seed_bucket_from_slug(seed_slug)
 
-    log.info("SEED | prefix=%s | examined=%d | seed_slug=%s | seed_bucket=%s", prefix, examined, seed_slug, seed_bucket)
+    log.info("SEED | seed_slug=%s | prefix=%s | seed_bucket=%d | seed_utc=%s",
+             seed_slug, prefix, seed_bucket, iso_utc_from_epoch(seed_bucket))
 
-    if not seed_slug or seed_bucket is None:
-        # At this point, Gamma search didn't yield any rolling slugs that match prefix-<10digit_epoch>.
-        # That means the prefix is wrong OR Gamma uses a different slug family name.
-        return None, counters
-
-    # Walk back from seed_bucket using the simple rule prefix-bucket
     for i in range(LOOKBACK_BUCKETS):
         bucket = seed_bucket - i * 300
         full_slug = f"{prefix}-{bucket}"
         counters["tried"] += 1
 
-        log.info(
-            "TRY_BUCKET | i=%d | bucket=%d | utc=%s | slug=%s",
-            i,
-            bucket,
-            datetime.fromtimestamp(bucket, tz=timezone.utc).isoformat(),
-            full_slug,
-        )
+        log.info("TRY_BUCKET | i=%d | bucket=%d | utc=%s | slug=%s", i, bucket, iso_utc_from_epoch(bucket), full_slug)
 
-        gamma = fetch_gamma_market_and_tokens_for_full_slug(full_slug)
+        gamma, dbg = fetch_gamma_market_and_tokens_for_slug(full_slug)
         if not gamma:
             counters["gamma_missing"] += 1
+            # Sample a few debug strings so we can see which endpoint is failing (without spamming 96 lines)
+            if counters["gamma_debug_samples"] < 5:
+                counters["gamma_debug_samples"] += 1
+                log.info("GAMMA_MISS | slug=%s | %s", full_slug, dbg)
             continue
 
         yes_token = gamma.get("yes_token_id")
         no_token = gamma.get("no_token_id")
         if not yes_token or not no_token:
             counters["token_missing"] += 1
+            log.info("GAMMA_TOKEN_MISS | slug=%s | %s", full_slug, dbg)
             continue
 
         yes_top, yes_status = fetch_clob_book_top(yes_token)
@@ -481,7 +481,8 @@ def find_tradable_slug_with_real_book() -> Tuple[Optional[TradableSelection], Di
             yes_top=yes_top,
             no_top=no_top,
         )
-        log.info("PHASE4_OK | Selected tradable slug with real book: %s | YES %s | NO %s", sel.slug, sel.yes_top, sel.no_top)
+        log.info("PHASE4_OK | Selected tradable slug with real book: %s | YES %s | NO %s",
+                 sel.slug, sel.yes_top, sel.no_top)
         return sel, counters
 
     return None, counters
@@ -517,11 +518,11 @@ def main() -> None:
     live_armed = live_mode and live_trading_enabled and (not kill_switch)
 
     log.info(
-        "run_mode=%s live_mode=%s live_armed=%s prefix=%s lookback=%d MIN_BID=%.3f MAX_ASK=%.3f MAX_SPREAD=%.3f PHASE4_ONLY=%s db_state_table=%s",
+        "run_mode=%s live_mode=%s live_armed=%s seed_slug=%s lookback=%d MIN_BID=%.3f MAX_ASK=%.3f MAX_SPREAD=%.3f PHASE4_ONLY=%s db_state_table=%s",
         run_mode,
         live_mode,
         live_armed,
-        slug_prefix(),
+        POLY_SEED_SLUG,
         LOOKBACK_BUCKETS,
         MIN_BID,
         MAX_ASK,
@@ -535,6 +536,7 @@ def main() -> None:
         if hs is not None:
             log.info("bun_health_status=%s", hs)
 
+    # Daily reset
     state = load_state()
     today = date.today()
     if state["as_of_date"] != today:
@@ -557,7 +559,7 @@ def main() -> None:
     )
 
     if not sel:
-        log.info("SEED_FAIL_OR_NO_TRADE | reason=NO_VALID_SEED_SLUG_FOUND_OR_NO_REAL_BOOK | hint=prefix_may_be_wrong_or_gamma_search_endpoint_differs")
+        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND_OR_GAMMA_MISS | lookback=%d", LOOKBACK_BUCKETS)
         log.info("BOOT: bot.py finished cleanly")
         return
 

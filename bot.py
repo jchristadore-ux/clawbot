@@ -133,12 +133,12 @@ def _coerce_list_str(x: Any) -> List[str]:
     return out
 
 def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
-    # Skip closed markets (prevents scanning into dead buckets that return 404 books)
-    if _safe_get(mkt, "closed") is True:
-        log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
-    continue
+    """
+    Emits one structured Gamma debug line when DEBUG_GAMMA=1.
+    """
     if not DEBUG_GAMMA:
         return
+
     payload = {
         "slug": slug,
         "id": _safe_get(market, "id"),
@@ -160,8 +160,12 @@ def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
         log.info("GAMMA_DEBUG: %s", json.dumps(payload, default=str))
     except Exception:
         log.info("GAMMA_DEBUG: %s", payload)
-
-
+        
+# Skip closed markets (prevents scanning into dead buckets that return 404 books)
+if _safe_get(mkt, "closed") is True:
+    log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
+    continue
+    
 def _http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> Tuple[int, Any]:
     last_exc = None
     for _ in range(max(1, HTTP_RETRIES + 1)):

@@ -71,6 +71,9 @@ LIVE_SMOKE_SIDE = os.getenv("LIVE_SMOKE_SIDE", "A").upper()  # "A" (Up) or "B" (
 LIVE_SMOKE_ORDER_TYPE = os.getenv("LIVE_SMOKE_ORDER_TYPE", "IOC").upper()
 LIVE_SMOKE_MAX_COST = float(os.getenv("LIVE_SMOKE_MAX_COST", "1.00"))
 LIVE_SMOKE_SIZE = float(os.getenv("LIVE_SMOKE_SIZE", "1.0"))
+LIVE_SMOKE_BYPASS = os.getenv("LIVE_SMOKE_BYPASS", "false").lower() in ("1","true","yes","y")
+LIVE_SMOKE_BYPASS_MAX_ASK = float(os.getenv("LIVE_SMOKE_BYPASS_MAX_ASK", "0.99"))
+LIVE_SMOKE_BYPASS_MIN_BID = float(os.getenv("LIVE_SMOKE_BYPASS_MIN_BID", "0.01"))
 
 # Looping
 RUN_LOOP = os.getenv("RUN_LOOP", "false").lower() in ("1", "true", "yes", "y")
@@ -346,7 +349,6 @@ def best_bid_ask(book: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]
         return None, None
     return bb, ba
 
-
 def book_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
     if bb is None or ba is None:
         return False, "MISSING_BID_OR_ASK"
@@ -359,6 +361,14 @@ def book_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
         return False, f"SPREAD_TOO_WIDE({spread:.3f})"
     return True, "OK"
 
+def smoke_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
+    if bb is None or ba is None:
+        return False, "MISSING_BID_OR_ASK"
+    if bb < LIVE_SMOKE_BYPASS_MIN_BID:
+        return False, f"BID_TOO_LOW({bb:.3f})"
+    if ba > LIVE_SMOKE_BYPASS_MAX_ASK:
+        return False, f"ASK_TOO_HIGH({ba:.3f})"
+    return True, "OK"
 
 def bun_place_order(token_id: str, side: str, price: float, size: float, order_type: str = "IOC") -> Tuple[int, Any]:
     payload = {
@@ -500,19 +510,42 @@ def main_once():
         if DEBUG_BOOK:
             log.info(f"BOOK_TOP | slug={slug} | {oA} bb={bbA} ba={baA} | {oB} bb={bbB} ba={baB}")
 
-        okA, whyA = book_ok(bbA, baA)
-        okB, whyB = book_ok(bbB, baB)
-        if not okA or not okB:
+okA, whyA = book_ok(bbA, baA)
+okB, whyB = book_ok(bbB, baB)
+
+# If not tradable, optionally allow bypass ONLY for LIVE smoke
+if not okA or not okB:
+    # bypass only helps us execute a live smoke order, not “trade for real”
+    if LIVE_MODE and LIVE_ARMED and LIVE_SMOKE and LIVE_SMOKE_BYPASS:
+        sA, sWhyA = smoke_ok(bbA, baA)
+        sB, sWhyB = smoke_ok(bbB, baB)
+
+        if not sA or not sB:
             counts["book_bad"] += 1
-            log.info(f"BOOK_BAD | slug={slug} | A_{whyA} bb={bbA} ba={baA} | B_{whyB} bb={bbB} ba={baB}")
+            log.info(
+                f"BOOK_BAD | slug={slug} | "
+                f"A_{whyA} bb={bbA} ba={baA} smoke={sWhyA} | "
+                f"B_{whyB} bb={bbB} ba={baB} smoke={sWhyB}"
+            )
             continue
 
-        counts["tradable"] += 1
         log.info(
-            f"FOUND_TRADABLE_BOOK | slug={slug} | "
-            f"{oA} token={tA} bb={bbA:.4f} ba={baA:.4f} | "
-            f"{oB} token={tB} bb={bbB:.4f} ba={baB:.4f}"
+            f"SMOKE_BYPASS_OK | slug={slug} | "
+            f"A bb={bbA} ba={baA} | B bb={bbB} ba={baB} | "
+            f"limits: min_bid={LIVE_SMOKE_BYPASS_MIN_BID} max_ask={LIVE_SMOKE_BYPASS_MAX_ASK}"
         )
+        # fall through to LIVE_SMOKE_SEND without incrementing tradable counter
+    else:
+        counts["book_bad"] += 1
+        log.info(f"BOOK_BAD | slug={slug} | A_{whyA} bb={bbA} ba={baA} | B_{whyB} bb={bbB} ba={baB}")
+        continue
+else:
+    counts["tradable"] += 1
+    log.info(
+        f"FOUND_TRADABLE_BOOK | slug={slug} | "
+        f"{oA} token={tA} bb={bbA:.4f} ba={baA:.4f} | "
+        f"{oB} token={tB} bb={bbB:.4f} ba={baB:.4f}"
+    )
 
         # Save last-good in DB state
         try:

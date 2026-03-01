@@ -34,13 +34,12 @@ RUN_MODE = os.getenv("RUN_MODE", "PAPER").upper()  # PAPER or LIVE
 LIVE_MODE = RUN_MODE == "LIVE"
 LIVE_ARMED = os.getenv("LIVE_ARMED", "false").lower() in ("1", "true", "yes", "y")
 
-PREFIX = os.getenv("PREFIX", "btc-updown-5m")
+PREFIX = os.getenv("PREFIX", "btc-updown-5m").strip()
 SEED_SLUG = os.getenv("SEED_SLUG", "").strip()  # e.g. btc-updown-5m-1772308500
 
-# A: tighten defaults (override via env anytime)
-LOOKBACK = int(os.getenv("LOOKBACK", "240"))  # default higher to find real buckets
+LOOKBACK = int(os.getenv("LOOKBACK", "240"))
 
-# Market quality constraints (tightened defaults)
+# Market quality constraints
 MIN_BID = float(os.getenv("MIN_BID", "0.20"))
 MAX_ASK = float(os.getenv("MAX_ASK", "0.80"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.15"))
@@ -51,7 +50,7 @@ DEBUG_BOOK = os.getenv("DEBUG_BOOK", "0").lower() in ("1", "true", "yes", "y")
 
 # DB state table + key
 DB_STATE_TABLE = os.getenv("DB_STATE_TABLE", "j5_state_v2")
-DB_KEY = os.getenv("DB_KEY", PREFIX)  # stable key
+DB_KEY = os.getenv("DB_KEY", PREFIX)
 
 # Endpoints
 BUN_HEALTH_URL = os.getenv("BUN_HEALTH_URL", "http://localhost:3000/health").strip()
@@ -61,7 +60,6 @@ CLOB_BASE = os.getenv("CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 # Bun order routing
 BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
 if not BUN_BASE_URL:
-    # fallback: use health base if caller didn't set it properly
     BUN_BASE_URL = BUN_HEALTH_URL.rsplit("/", 1)[0]
 BUN_ORDER_URL = os.getenv("BUN_ORDER_URL", f"{BUN_BASE_URL.rstrip('/')}/order").strip()
 
@@ -71,7 +69,9 @@ LIVE_SMOKE_SIDE = os.getenv("LIVE_SMOKE_SIDE", "A").upper()  # "A" (Up) or "B" (
 LIVE_SMOKE_ORDER_TYPE = os.getenv("LIVE_SMOKE_ORDER_TYPE", "IOC").upper()
 LIVE_SMOKE_MAX_COST = float(os.getenv("LIVE_SMOKE_MAX_COST", "1.00"))
 LIVE_SMOKE_SIZE = float(os.getenv("LIVE_SMOKE_SIZE", "1.0"))
-LIVE_SMOKE_BYPASS = os.getenv("LIVE_SMOKE_BYPASS", "false").lower() in ("1","true","yes","y")
+
+# Smoke bypass controls (lets us prove execution plumbing even if market is wide)
+LIVE_SMOKE_BYPASS = os.getenv("LIVE_SMOKE_BYPASS", "false").lower() in ("1", "true", "yes", "y")
 LIVE_SMOKE_BYPASS_MAX_ASK = float(os.getenv("LIVE_SMOKE_BYPASS_MAX_ASK", "0.99"))
 LIVE_SMOKE_BYPASS_MIN_BID = float(os.getenv("LIVE_SMOKE_BYPASS_MIN_BID", "0.01"))
 
@@ -103,7 +103,7 @@ def _safe_get(d: Any, k: str, default: Any = None) -> Any:
 
 def _maybe_json(x: Any) -> Any:
     """
-    Gamma sometimes returns fields (outcomes, clobTokenIds, outcomePrices) as JSON-encoded strings.
+    Gamma sometimes returns fields (outcomes, clobTokenIds) as JSON-encoded strings.
     """
     if x is None:
         return None
@@ -132,12 +132,9 @@ def _coerce_list_str(x: Any) -> List[str]:
 
 
 def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
-    """
-    B: debug-only function. NO flow-control allowed here.
-    """
+    """Debug-only. No flow control."""
     if not DEBUG_GAMMA:
         return
-
     payload = {
         "slug": slug,
         "id": _safe_get(market, "id"),
@@ -275,9 +272,6 @@ def db_read_state() -> Dict[str, Any]:
 # Gamma + Token resolution
 # ----------------------------
 def gamma_get_market_by_slug(slug: str) -> Tuple[int, Optional[Dict[str, Any]]]:
-    """
-    Tries robust Gamma shapes.
-    """
     url1 = f"{GAMMA_BASE}/markets"
     code, data = _http_get(url1, params={"slug": slug})
     if code == 200:
@@ -297,13 +291,9 @@ def gamma_get_market_by_slug(slug: str) -> Tuple[int, Optional[Dict[str, Any]]]:
 
 
 def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    outcomes_raw = _safe_get(mkt, "outcomes")
-    token_ids_raw = _safe_get(mkt, "clobTokenIds")
+    outcomes = _maybe_json(_safe_get(mkt, "outcomes"))
+    token_ids = _maybe_json(_safe_get(mkt, "clobTokenIds"))
 
-    outcomes = _maybe_json(outcomes_raw)
-    token_ids = _maybe_json(token_ids_raw)
-
-    # rare nested shapes
     if isinstance(outcomes, dict) and "outcomes" in outcomes:
         outcomes = outcomes["outcomes"]
     if isinstance(token_ids, dict) and "clobTokenIds" in token_ids:
@@ -312,7 +302,6 @@ def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[st
     outcomes_list = _coerce_list_str(outcomes)
     token_ids_list = _coerce_list_str(token_ids)
 
-    # CSV fallback
     if not outcomes_list and isinstance(outcomes, str):
         outcomes_list = [s.strip() for s in outcomes.split(",") if s.strip()]
     if not token_ids_list and isinstance(token_ids, str):
@@ -325,9 +314,6 @@ def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[st
 # CLOB orderbook
 # ----------------------------
 def clob_get_book(token_id: str) -> Tuple[int, Optional[Dict[str, Any]]]:
-    """
-    GET https://clob.polymarket.com/book?token_id=...
-    """
     url = f"{CLOB_BASE}/book"
     code, data = _http_get(url, params={"token_id": token_id})
     if code == 200 and isinstance(data, dict):
@@ -349,6 +335,7 @@ def best_bid_ask(book: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]
         return None, None
     return bb, ba
 
+
 def book_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
     if bb is None or ba is None:
         return False, "MISSING_BID_OR_ASK"
@@ -361,6 +348,7 @@ def book_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
         return False, f"SPREAD_TOO_WIDE({spread:.3f})"
     return True, "OK"
 
+
 def smoke_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
     if bb is None or ba is None:
         return False, "MISSING_BID_OR_ASK"
@@ -369,6 +357,7 @@ def smoke_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
     if ba > LIVE_SMOKE_BYPASS_MAX_ASK:
         return False, f"ASK_TOO_HIGH({ba:.3f})"
     return True, "OK"
+
 
 def bun_place_order(token_id: str, side: str, price: float, size: float, order_type: str = "IOC") -> Tuple[int, Any]:
     payload = {
@@ -422,7 +411,6 @@ def resolve_seed_bucket() -> Tuple[str, int]:
 def main_once():
     log.info("BOOT: bot.py starting")
 
-    # DB setup (safe)
     try:
         ensure_tables()
     except Exception as e:
@@ -433,7 +421,8 @@ def main_once():
         f"run_mode={RUN_MODE} live_mode={LIVE_MODE} live_armed={LIVE_ARMED} "
         f"seed_slug={SEED_SLUG or 'n/a'} prefix={PREFIX} lookback={LOOKBACK} "
         f"MIN_BID={MIN_BID:.3f} MAX_ASK={MAX_ASK:.3f} MAX_SPREAD={MAX_SPREAD:.3f} "
-        f"DEBUG_GAMMA={DEBUG_GAMMA} DEBUG_BOOK={DEBUG_BOOK} LIVE_SMOKE={LIVE_SMOKE}"
+        f"DEBUG_GAMMA={DEBUG_GAMMA} DEBUG_BOOK={DEBUG_BOOK} "
+        f"LIVE_SMOKE={LIVE_SMOKE} LIVE_SMOKE_BYPASS={LIVE_SMOKE_BYPASS}"
     )
     log.info(f"bun_health_status={bun_code}")
 
@@ -449,6 +438,7 @@ def main_once():
         "book_miss": 0,
         "book_bad": 0,
         "tradable": 0,
+        "smoke_bypass_ok": 0,
     }
 
     for i in range(LOOKBACK):
@@ -500,7 +490,7 @@ def main_once():
         bbA, baA = best_bid_ask(bookA)
         bbB, baB = best_bid_ask(bookB)
 
-        # B: always log that a book exists (not implying tradable)
+        # Always log that book exists
         log.info(
             f"FOUND_BOOK | slug={slug} | "
             f"{oA} token={tA} bb={bbA} ba={baA} | "
@@ -510,47 +500,49 @@ def main_once():
         if DEBUG_BOOK:
             log.info(f"BOOK_TOP | slug={slug} | {oA} bb={bbA} ba={baA} | {oB} bb={bbB} ba={baB}")
 
-okA, whyA = book_ok(bbA, baA)
-okB, whyB = book_ok(bbB, baB)
+        okA, whyA = book_ok(bbA, baA)
+        okB, whyB = book_ok(bbB, baB)
 
-# If not tradable, optionally allow bypass ONLY for LIVE smoke
-if not okA or not okB:
-    # bypass only helps us execute a live smoke order, not “trade for real”
-    if LIVE_MODE and LIVE_ARMED and LIVE_SMOKE and LIVE_SMOKE_BYPASS:
-        sA, sWhyA = smoke_ok(bbA, baA)
-        sB, sWhyB = smoke_ok(bbB, baB)
+        tradable = okA and okB
+        bypass_ok = False
 
-        if not sA or not sB:
-            counts["book_bad"] += 1
+        if not tradable:
+            # Optional bypass ONLY for LIVE smoke
+            if LIVE_MODE and LIVE_ARMED and LIVE_SMOKE and LIVE_SMOKE_BYPASS:
+                sA, sWhyA = smoke_ok(bbA, baA)
+                sB, sWhyB = smoke_ok(bbB, baB)
+                if sA and sB:
+                    bypass_ok = True
+                    counts["smoke_bypass_ok"] += 1
+                    log.info(
+                        f"SMOKE_BYPASS_OK | slug={slug} | "
+                        f"A bb={bbA} ba={baA} | B bb={bbB} ba={baB} | "
+                        f"limits: min_bid={LIVE_SMOKE_BYPASS_MIN_BID} max_ask={LIVE_SMOKE_BYPASS_MAX_ASK}"
+                    )
+                else:
+                    counts["book_bad"] += 1
+                    log.info(
+                        f"BOOK_BAD | slug={slug} | "
+                        f"A_{whyA} bb={bbA} ba={baA} smoke={sWhyA} | "
+                        f"B_{whyB} bb={bbB} ba={baB} smoke={sWhyB}"
+                    )
+                    continue
+            else:
+                counts["book_bad"] += 1
+                log.info(f"BOOK_BAD | slug={slug} | A_{whyA} bb={bbA} ba={baA} | B_{whyB} bb={bbB} ba={baB}")
+                continue
+        else:
+            counts["tradable"] += 1
             log.info(
-                f"BOOK_BAD | slug={slug} | "
-                f"A_{whyA} bb={bbA} ba={baA} smoke={sWhyA} | "
-                f"B_{whyB} bb={bbB} ba={baB} smoke={sWhyB}"
+                f"FOUND_TRADABLE_BOOK | slug={slug} | "
+                f"{oA} token={tA} bb={bbA:.4f} ba={baA:.4f} | "
+                f"{oB} token={tB} bb={bbB:.4f} ba={baB:.4f}"
             )
-            continue
 
-        log.info(
-            f"SMOKE_BYPASS_OK | slug={slug} | "
-            f"A bb={bbA} ba={baA} | B bb={bbB} ba={baB} | "
-            f"limits: min_bid={LIVE_SMOKE_BYPASS_MIN_BID} max_ask={LIVE_SMOKE_BYPASS_MAX_ASK}"
-        )
-        # fall through to LIVE_SMOKE_SEND without incrementing tradable counter
-    else:
-        counts["book_bad"] += 1
-        log.info(f"BOOK_BAD | slug={slug} | A_{whyA} bb={bbA} ba={baA} | B_{whyB} bb={bbB} ba={baB}")
-        continue
-else:
-    counts["tradable"] += 1
-    log.info(
-        f"FOUND_TRADABLE_BOOK | slug={slug} | "
-        f"{oA} token={tA} bb={bbA:.4f} ba={baA:.4f} | "
-        f"{oB} token={tB} bb={bbB:.4f} ba={baB:.4f}"
-    )
-
-        # Save last-good in DB state
+        # Persist state (tradable or bypass-ok bucket, both are “last seen good” for different purposes)
         try:
             st = db_read_state()
-            st["last_tradable"] = {
+            st["last_seen"] = {
                 "ts": _now_utc_iso(),
                 "slug": slug,
                 "bucket": bucket,
@@ -560,12 +552,14 @@ else:
                     oA: {"best_bid": bbA, "best_ask": baA},
                     oB: {"best_bid": bbB, "best_ask": baB},
                 },
+                "tradable": bool(tradable),
+                "smoke_bypass_ok": bool(bypass_ok),
             }
             db_write_state(st)
         except Exception as e:
             log.warning(f"DB_WRITE_WARNING | {e}")
 
-        # LIVE SMOKE TRADE (optional)
+        # LIVE SMOKE (optional)
         if LIVE_MODE and LIVE_ARMED and LIVE_SMOKE:
             st = db_read_state()
             last_bucket = (st.get("live") or {}).get("last_smoke_bucket")
@@ -578,50 +572,57 @@ else:
                 else:
                     pick_name, pick_token, pick_ask = oA, tA, baA
 
-                price = float(pick_ask)
-                size = float(LIVE_SMOKE_SIZE)
-
-                if price > 0:
-                    max_size_by_cost = LIVE_SMOKE_MAX_COST / price
-                    if size > max_size_by_cost:
-                        size = max_size_by_cost
-
-                if size <= 0:
-                    log.info(
-                        f"LIVE_SMOKE_ABORT | reason=size<=0_after_cap | price={price} max_cost={LIVE_SMOKE_MAX_COST}"
-                    )
+                if pick_ask is None:
+                    log.info(f"LIVE_SMOKE_ABORT | reason=missing_ask | outcome={pick_name} token={pick_token}")
                 else:
-                    log.info(
-                        f"LIVE_SMOKE_SEND | slug={slug} | outcome={pick_name} | token={pick_token} "
-                        f"| side=BUY price={price:.4f} size={size:.6f} order_type={LIVE_SMOKE_ORDER_TYPE}"
-                    )
-                    codeO, respO = bun_place_order(
-                        token_id=pick_token,
-                        side="BUY",
-                        price=price,
-                        size=size,
-                        order_type=LIVE_SMOKE_ORDER_TYPE,
-                    )
-                    log.info(f"LIVE_SMOKE_RESULT | http_code={codeO} | resp={str(respO)[:1200]}")
+                    price = float(pick_ask)
+                    size = float(LIVE_SMOKE_SIZE)
 
-                    # idempotency marker
-                    st = db_read_state()
-                    live_obj = st.get("live") or {}
-                    live_obj["last_smoke_bucket"] = bucket
-                    live_obj["last_smoke_slug"] = slug
-                    live_obj["last_smoke_ts"] = _now_utc_iso()
-                    st["live"] = live_obj
-                    try:
-                        db_write_state(st)
-                    except Exception as e:
-                        log.warning(f"DB_WRITE_WARNING | {e}")
+                    if price > 0:
+                        max_size_by_cost = LIVE_SMOKE_MAX_COST / price
+                        if size > max_size_by_cost:
+                            size = max_size_by_cost
 
-        # stop at first tradable bucket
+                    if size <= 0:
+                        log.info(
+                            f"LIVE_SMOKE_ABORT | reason=size<=0_after_cap | price={price} max_cost={LIVE_SMOKE_MAX_COST}"
+                        )
+                    else:
+                        log.info(
+                            f"LIVE_SMOKE_SEND | slug={slug} | outcome={pick_name} | token={pick_token} "
+                            f"| side=BUY price={price:.4f} size={size:.6f} order_type={LIVE_SMOKE_ORDER_TYPE}"
+                        )
+                        codeO, respO = bun_place_order(
+                            token_id=pick_token,
+                            side="BUY",
+                            price=price,
+                            size=size,
+                            order_type=LIVE_SMOKE_ORDER_TYPE,
+                        )
+                        log.info(f"LIVE_SMOKE_RESULT | http_code={codeO} | resp={str(respO)[:1200]}")
+
+                        # idempotency marker
+                        st = db_read_state()
+                        live_obj = st.get("live") or {}
+                        live_obj["last_smoke_bucket"] = bucket
+                        live_obj["last_smoke_slug"] = slug
+                        live_obj["last_smoke_ts"] = _now_utc_iso()
+                        st["live"] = live_obj
+                        try:
+                            db_write_state(st)
+                        except Exception as e:
+                            log.warning(f"DB_WRITE_WARNING | {e}")
+
+        # Stop at first bucket that passes either:
+        # - real tradable constraints OR
+        # - smoke bypass constraints (only matters in LIVE smoke mode)
         break
 
     log.info(
         "SEARCH_SUMMARY | tried={tried} | gamma_missing={gamma_missing} | closed={closed} | token_missing={token_missing} | "
-        "clob_404={clob_404} | book_miss={book_miss} | book_bad={book_bad} | tradable={tradable}".format(**counts)
+        "clob_404={clob_404} | book_miss={book_miss} | book_bad={book_bad} | tradable={tradable} | smoke_bypass_ok={smoke_bypass_ok}".format(
+            **counts
+        )
     )
 
     if counts["tradable"] == 0:

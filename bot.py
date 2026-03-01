@@ -582,7 +582,6 @@ def main():
 
     log.info("BOOT: bot.py finished cleanly")
 
-
 if __name__ == "__main__":
     run_loop = os.getenv("RUN_LOOP", "true").lower() in ("1", "true", "yes", "y")
     loop_seconds = int(os.getenv("LOOP_SECONDS", "30"))

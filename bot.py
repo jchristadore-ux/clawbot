@@ -47,6 +47,9 @@ MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.080"))
 # Phase 4 only behavior flag (kept for parity)
 PHASE4_ONLY = os.getenv("PHASE4_ONLY", "true").lower() in ("1", "true", "yes", "y")
 
+# Debug flags
+DEBUG_GAMMA = os.getenv("DEBUG_GAMMA", "0").lower() in ("1", "true", "yes", "y")
+
 # DB state table (fixes the earlier key=null issue)
 DB_STATE_TABLE = os.getenv("DB_STATE_TABLE", "j5_state")
 DB_KEY = os.getenv("DB_KEY", PREFIX)  # always non-null
@@ -69,14 +72,28 @@ def _now_utc_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def _safe_get(d: Any, k: str, default: Any = None) -> Any:
+    try:
+        if isinstance(d, dict):
+            return d.get(k, default)
+    except Exception:
+        pass
+    return default
+
+
 def _maybe_json(x: Any) -> Any:
     """
     Gamma sometimes returns fields (outcomes, clobTokenIds, outcomePrices) as JSON-encoded strings.
-    This converts:
+    Converts:
       - '["Up","Down"]' -> ["Up","Down"]
-      - '["0x..","0x.."]' -> ["0x..","0x.."]
+      - '["123","456"]' -> ["123","456"]
+      - already list/dict -> unchanged
     Otherwise returns x unchanged.
     """
+    if x is None:
+        return None
+    if isinstance(x, (list, dict)):
+        return x
     if isinstance(x, str):
         s = x.strip()
         if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
@@ -85,6 +102,53 @@ def _maybe_json(x: Any) -> Any:
             except Exception:
                 return x
     return x
+
+
+def _coerce_list_str(x: Any) -> List[str]:
+    """
+    Turns a list of values into a list[str] without dropping valid ints/decimals.
+    Returns [] if it can't safely coerce.
+    """
+    x = _maybe_json(x)
+    if not isinstance(x, list):
+        return []
+    out: List[str] = []
+    for v in x:
+        if v is None:
+            continue
+        # token ids can come back as ints or strings depending on endpoint/version
+        out.append(str(v))
+    return out
+
+
+def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
+    """
+    Emits one structured Gamma debug line when DEBUG_GAMMA=1.
+    """
+    if not DEBUG_GAMMA:
+        return
+
+    payload = {
+        "slug": slug,
+        "id": _safe_get(market, "id"),
+        "conditionId": _safe_get(market, "conditionId"),
+        "question": _safe_get(market, "question"),
+        "active": _safe_get(market, "active"),
+        "closed": _safe_get(market, "closed"),
+        "archived": _safe_get(market, "archived"),
+        "enableOrderBook": _safe_get(market, "enableOrderBook"),
+        "liquidity": _safe_get(market, "liquidity"),
+        "liquidityClob": _safe_get(market, "liquidityClob"),
+        "liquidityAmm": _safe_get(market, "liquidityAmm"),
+        "outcomes_type": type(_safe_get(market, "outcomes")).__name__,
+        "clobTokenIds_type": type(_safe_get(market, "clobTokenIds")).__name__,
+        "outcomes_parsed": _maybe_json(_safe_get(market, "outcomes")),
+        "clobTokenIds_parsed": _maybe_json(_safe_get(market, "clobTokenIds")),
+    }
+    try:
+        log.info("GAMMA_DEBUG: %s", json.dumps(payload, default=str))
+    except Exception:
+        log.info("GAMMA_DEBUG: %s", payload)
 
 
 def _http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> Tuple[int, Any]:
@@ -128,14 +192,18 @@ def db_conn():
 
 def ensure_tables():
     """
-    Creates a simple key/value state table. Guarantees non-null key usage to avoid:
-      psycopg2.errors.NotNullViolation: null value in column "key"
+    Creates a simple key/value state table. Guarantees non-null key usage.
+
+    Also hardens against older tables that may not have a 'key' column yet:
+      WARNING | column "key" of relation "j5_state" does not exist
     """
     conn = db_conn()
     if conn is None:
         return
+
     with conn:
         with conn.cursor() as cur:
+            # Try create expected schema
             cur.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {DB_STATE_TABLE} (
@@ -145,7 +213,28 @@ def ensure_tables():
                 );
                 """
             )
-            # Ensure a row exists for our DB_KEY (never null)
+
+            # If table existed with different schema, try to patch it
+            # (If the column already exists, Postgres will error unless IF NOT EXISTS is used)
+            try:
+                cur.execute(f"ALTER TABLE {DB_STATE_TABLE} ADD COLUMN IF NOT EXISTS key TEXT;")
+                cur.execute(f"ALTER TABLE {DB_STATE_TABLE} ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;")
+                cur.execute(f"ALTER TABLE {DB_STATE_TABLE} ADD COLUMN IF NOT EXISTS state JSONB;")
+            except Exception as e:
+                log.warning(f"DB_SCHEMA_PATCH_WARNING | {e}")
+
+            # Ensure defaults (safe; may error on some schemas, so guard)
+            try:
+                cur.execute(f"ALTER TABLE {DB_STATE_TABLE} ALTER COLUMN updated_at SET DEFAULT NOW();")
+            except Exception:
+                pass
+            try:
+                cur.execute(f"ALTER TABLE {DB_STATE_TABLE} ALTER COLUMN state SET DEFAULT '{{}}'::jsonb;")
+            except Exception:
+                pass
+
+            # Ensure our row exists for DB_KEY (never null)
+            # If an old schema exists that doesn't support this, it'll be caught by caller.
             cur.execute(
                 f"""
                 INSERT INTO {DB_STATE_TABLE} (key, state)
@@ -215,23 +304,33 @@ def gamma_get_market_by_slug(slug: str) -> Tuple[int, Optional[Dict[str, Any]]]:
 
 def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     """
-    Returns (outcomes, clobTokenIds) as lists.
-    Handles Gamma returning these as JSON strings.
+    Returns (outcomes, clobTokenIds) as lists[str].
+    Handles Gamma returning these as JSON strings, lists, or lists of ints.
     """
-    outcomes = _maybe_json(mkt.get("outcomes"))
-    token_ids = _maybe_json(mkt.get("clobTokenIds"))
+    # Sometimes Gamma nests these (rare), keep your handling.
+    outcomes_raw = _safe_get(mkt, "outcomes")
+    token_ids_raw = _safe_get(mkt, "clobTokenIds")
+
+    outcomes = _maybe_json(outcomes_raw)
+    token_ids = _maybe_json(token_ids_raw)
 
     if isinstance(outcomes, dict) and "outcomes" in outcomes:
         outcomes = outcomes["outcomes"]
     if isinstance(token_ids, dict) and "clobTokenIds" in token_ids:
         token_ids = token_ids["clobTokenIds"]
 
-    if not isinstance(outcomes, list) or not all(isinstance(x, str) for x in outcomes):
-        outcomes = []
-    if not isinstance(token_ids, list) or not all(isinstance(x, str) for x in token_ids):
-        token_ids = []
+    outcomes_list = _coerce_list_str(outcomes)
+    token_ids_list = _coerce_list_str(token_ids)
 
-    return outcomes, token_ids
+    # Normalize common edge case: outcomes come back as comma-separated string
+    if not outcomes_list and isinstance(outcomes, str):
+        outcomes_list = [s.strip() for s in outcomes.split(",") if s.strip()]
+
+    # Normalize common edge case: token ids come back as comma-separated string
+    if not token_ids_list and isinstance(token_ids, str):
+        token_ids_list = [s.strip() for s in token_ids.split(",") if s.strip()]
+
+    return outcomes_list, token_ids_list
 
 
 # ----------------------------
@@ -317,10 +416,12 @@ def main():
         log.warning(f"DB_INIT_WARNING | {e}")
 
     bun_code = bun_healthcheck()
-    log.info(f"run_mode={RUN_MODE} live_mode={LIVE_MODE} live_armed={LIVE_ARMED} "
-             f"seed_slug={SEED_SLUG or 'n/a'} prefix={PREFIX} lookback={LOOKBACK} "
-             f"MIN_BID={MIN_BID:.3f} MAX_ASK={MAX_ASK:.3f} MAX_SPREAD={MAX_SPREAD:.3f} "
-             f"PHASE4_ONLY={PHASE4_ONLY} db_state_table={DB_STATE_TABLE}")
+    log.info(
+        f"run_mode={RUN_MODE} live_mode={LIVE_MODE} live_armed={LIVE_ARMED} "
+        f"seed_slug={SEED_SLUG or 'n/a'} prefix={PREFIX} lookback={LOOKBACK} "
+        f"MIN_BID={MIN_BID:.3f} MAX_ASK={MAX_ASK:.3f} MAX_SPREAD={MAX_SPREAD:.3f} "
+        f"PHASE4_ONLY={PHASE4_ONLY} db_state_table={DB_STATE_TABLE} DEBUG_GAMMA={DEBUG_GAMMA}"
+    )
     log.info(f"bun_health_status={bun_code}")
 
     seed_slug = SEED_SLUG.strip() or ""
@@ -337,7 +438,9 @@ def main():
             seed_bucket = (now // 300) * 300
             seed_slug = make_slug(PREFIX, seed_bucket)
 
-    log.info(f"SEED | seed_slug={seed_slug} | prefix={PREFIX} | seed_bucket={seed_bucket} | seed_utc={bucket_to_utc_iso(seed_bucket)}")
+    log.info(
+        f"SEED | seed_slug={seed_slug} | prefix={PREFIX} | seed_bucket={seed_bucket} | seed_utc={bucket_to_utc_iso(seed_bucket)}"
+    )
 
     counts = {
         "tried": 0,
@@ -361,19 +464,32 @@ def main():
             log.info(f"GAMMA_MISS | slug={slug} | slug_endpoint code={code}")
             continue
 
+        # New: optional deep debug of Gamma response shape
+        debug_gamma_market(mkt, slug)
+
         outcomes, token_ids = extract_outcomes_and_tokens(mkt)
 
         if len(outcomes) < 2 or len(token_ids) < 2:
             counts["token_missing"] += 1
+
             keys = list(mkt.keys())
             fields = {
-                "slug": type(mkt.get("slug")).__name__,
-                "outcomes": type(mkt.get("outcomes")).__name__,
-                "clobTokenIds": type(mkt.get("clobTokenIds")).__name__,
+                "slug_type": type(mkt.get("slug")).__name__,
+                "outcomes_type": type(mkt.get("outcomes")).__name__,
+                "clobTokenIds_type": type(mkt.get("clobTokenIds")).__name__,
+                "outcomes_parsed": _maybe_json(mkt.get("outcomes")),
+                "clobTokenIds_parsed": _maybe_json(mkt.get("clobTokenIds")),
+                "outcomes_coerced": outcomes,
+                "clobTokenIds_coerced": token_ids,
+                "enableOrderBook": _safe_get(mkt, "enableOrderBook"),
+                "active": _safe_get(mkt, "active"),
+                "closed": _safe_get(mkt, "closed"),
+                "liquidityClob": _safe_get(mkt, "liquidityClob"),
             }
+
             log.info(
                 f"TOKEN_DEBUG | slug={slug} | slug_endpoint code={code} | token_extract_failed | "
-                f"keys={keys[:40]}... fields={fields}"
+                f"keys={keys[:40]}... fields={json.dumps(fields, default=str)[:1200]}"
             )
             log.info(f"GAMMA_MISS | slug={slug} | slug_endpoint code={code} | token_extract_failed")
             continue

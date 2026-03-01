@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import os
 import json
 import time
@@ -44,11 +45,9 @@ MIN_BID = float(os.getenv("MIN_BID", "0.020"))
 MAX_ASK = float(os.getenv("MAX_ASK", "0.980"))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.080"))
 
-# Phase 4 only behavior flag (kept for parity)
-PHASE4_ONLY = os.getenv("PHASE4_ONLY", "true").lower() in ("1", "true", "yes", "y")
-
 # Debug flags
 DEBUG_GAMMA = os.getenv("DEBUG_GAMMA", "0").lower() in ("1", "true", "yes", "y")
+DEBUG_BOOK = os.getenv("DEBUG_BOOK", "0").lower() in ("1", "true", "yes", "y")
 
 # DB state table + key
 DB_STATE_TABLE = os.getenv("DB_STATE_TABLE", "j5_state_v2")
@@ -56,22 +55,21 @@ DB_KEY = os.getenv("DB_KEY", PREFIX)  # always non-null
 
 # Endpoints
 BUN_HEALTH_URL = os.getenv("BUN_HEALTH_URL", "http://localhost:3000/health")
-GAMMA_BASE = os.getenv("GAMMA_BASE", "https://gamma-api.polymarket.com")
-CLOB_BASE = os.getenv("CLOB_BASE", "https://clob.polymarket.com")
+GAMMA_BASE = os.getenv("GAMMA_BASE", "https://gamma-api.polymarket.com").rstrip("/")
+CLOB_BASE = os.getenv("CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 
 # Bun order routing
-BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()  # e.g. https://<bun-service>.up.railway.app
+BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
 if not BUN_BASE_URL:
-    # Back-compat: if BUN_HEALTH_URL is a base URL (no /health), use it
     BUN_BASE_URL = BUN_HEALTH_URL.rstrip("/")
 BUN_ORDER_URL = os.getenv("BUN_ORDER_URL", f"{BUN_BASE_URL.rstrip('/')}/order")
 
 # Live smoke trade controls (fastest path to prove live trading)
 LIVE_SMOKE = os.getenv("LIVE_SMOKE", "false").lower() in ("1", "true", "yes", "y")
 LIVE_SMOKE_SIDE = os.getenv("LIVE_SMOKE_SIDE", "A").upper()  # "A" (Up) or "B" (Down)
-LIVE_SMOKE_ORDER_TYPE = os.getenv("LIVE_SMOKE_ORDER_TYPE", "IOC").upper()  # IOC recommended for smoke
-LIVE_SMOKE_MAX_COST = float(os.getenv("LIVE_SMOKE_MAX_COST", "1.00"))  # max $ to risk per smoke trade
-LIVE_SMOKE_SIZE = float(os.getenv("LIVE_SMOKE_SIZE", "1.0"))  # shares (will be capped by MAX_COST)
+LIVE_SMOKE_ORDER_TYPE = os.getenv("LIVE_SMOKE_ORDER_TYPE", "IOC").upper()
+LIVE_SMOKE_MAX_COST = float(os.getenv("LIVE_SMOKE_MAX_COST", "1.00"))
+LIVE_SMOKE_SIZE = float(os.getenv("LIVE_SMOKE_SIZE", "1.0"))
 
 # Request tuning
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
@@ -98,10 +96,6 @@ def _safe_get(d: Any, k: str, default: Any = None) -> Any:
 def _maybe_json(x: Any) -> Any:
     """
     Gamma sometimes returns fields (outcomes, clobTokenIds, outcomePrices) as JSON-encoded strings.
-    Converts:
-      - '["Up","Down"]' -> ["Up","Down"]
-      - already list/dict -> unchanged
-    Otherwise returns x unchanged.
     """
     if x is None:
         return None
@@ -118,10 +112,6 @@ def _maybe_json(x: Any) -> Any:
 
 
 def _coerce_list_str(x: Any) -> List[str]:
-    """
-    Turns a list of values into a list[str] without dropping valid ints/decimals.
-    Returns [] if it can't safely coerce.
-    """
     x = _maybe_json(x)
     if not isinstance(x, list):
         return []
@@ -132,10 +122,9 @@ def _coerce_list_str(x: Any) -> List[str]:
         out.append(str(v))
     return out
 
+
 def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
-    """
-    Emits one structured Gamma debug line when DEBUG_GAMMA=1.
-    """
+    """Log one structured Gamma line when DEBUG_GAMMA=1. No flow-control here."""
     if not DEBUG_GAMMA:
         return
 
@@ -160,12 +149,8 @@ def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
         log.info("GAMMA_DEBUG: %s", json.dumps(payload, default=str))
     except Exception:
         log.info("GAMMA_DEBUG: %s", payload)
-        
-# Skip closed markets (prevents scanning into dead buckets that return 404 books)
-if _safe_get(mkt, "closed") is True:
-    log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
-continue
-    
+
+
 def _http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> Tuple[int, Any]:
     last_exc = None
     for _ in range(max(1, HTTP_RETRIES + 1)):
@@ -237,7 +222,6 @@ def ensure_tables():
                 );
                 """
             )
-            # Ensure our row exists for DB_KEY (never null)
             cur.execute(
                 f"""
                 INSERT INTO {DB_STATE_TABLE} (key, state)
@@ -285,7 +269,6 @@ def gamma_get_market_by_slug(slug: str) -> Tuple[int, Optional[Dict[str, Any]]]:
     Gamma has multiple shapes depending on endpoint.
     We'll try a couple robustly and normalize.
     """
-    # 1) /markets?slug=
     url1 = f"{GAMMA_BASE}/markets"
     code, data = _http_get(url1, params={"slug": slug})
     if code == 200:
@@ -296,7 +279,6 @@ def gamma_get_market_by_slug(slug: str) -> Tuple[int, Optional[Dict[str, Any]]]:
         if isinstance(data, dict) and data.get("slug") == slug:
             return code, data
 
-    # 2) /markets/{slug}
     url2 = f"{GAMMA_BASE}/markets/{slug}"
     code2, data2 = _http_get(url2)
     if code2 == 200 and isinstance(data2, dict):
@@ -312,6 +294,7 @@ def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[st
     outcomes = _maybe_json(outcomes_raw)
     token_ids = _maybe_json(token_ids_raw)
 
+    # handle rare nested shapes
     if isinstance(outcomes, dict) and "outcomes" in outcomes:
         outcomes = outcomes["outcomes"]
     if isinstance(token_ids, dict) and "clobTokenIds" in token_ids:
@@ -320,6 +303,7 @@ def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[st
     outcomes_list = _coerce_list_str(outcomes)
     token_ids_list = _coerce_list_str(token_ids)
 
+    # last-resort CSV fallback
     if not outcomes_list and isinstance(outcomes, str):
         outcomes_list = [s.strip() for s in outcomes.split(",") if s.strip()]
     if not token_ids_list and isinstance(token_ids, str):
@@ -333,8 +317,7 @@ def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[st
 # ----------------------------
 def clob_get_book(token_id: str) -> Tuple[int, Optional[Dict[str, Any]]]:
     """
-    Correct Polymarket endpoint:
-      GET https://clob.polymarket.com/book?token_id=...
+    GET https://clob.polymarket.com/book?token_id=...
     """
     url = f"{CLOB_BASE}/book"
     code, data = _http_get(url, params={"token_id": token_id})
@@ -372,9 +355,6 @@ def book_ok(bb: Optional[float], ba: Optional[float]) -> Tuple[bool, str]:
 
 
 def bun_place_order(token_id: str, side: str, price: float, size: float, order_type: str = "IOC") -> Tuple[int, Any]:
-    """
-    Routes an order to the Bun service which holds the Polymarket API credentials.
-    """
     payload = {
         "token_id": str(token_id),
         "side": side.upper(),  # BUY / SELL
@@ -386,7 +366,7 @@ def bun_place_order(token_id: str, side: str, price: float, size: float, order_t
 
 
 # ----------------------------
-# Rolling 5m slug search
+# Rolling 5m slug helpers
 # ----------------------------
 def parse_seed_bucket(seed_slug: str) -> Optional[int]:
     try:
@@ -424,10 +404,11 @@ def main():
         f"run_mode={RUN_MODE} live_mode={LIVE_MODE} live_armed={LIVE_ARMED} "
         f"seed_slug={SEED_SLUG or 'n/a'} prefix={PREFIX} lookback={LOOKBACK} "
         f"MIN_BID={MIN_BID:.3f} MAX_ASK={MAX_ASK:.3f} MAX_SPREAD={MAX_SPREAD:.3f} "
-        f"PHASE4_ONLY={PHASE4_ONLY} db_state_table={DB_STATE_TABLE} DEBUG_GAMMA={DEBUG_GAMMA}"
+        f"DEBUG_GAMMA={DEBUG_GAMMA} DEBUG_BOOK={DEBUG_BOOK}"
     )
     log.info(f"bun_health_status={bun_code}")
 
+    # Resolve seed bucket
     seed_slug = SEED_SLUG.strip() or ""
     if not seed_slug:
         now = int(time.time())
@@ -440,11 +421,9 @@ def main():
             seed_bucket = (now // 300) * 300
             seed_slug = make_slug(PREFIX, seed_bucket)
 
-    log.info(
-        f"SEED | seed_slug={seed_slug} | prefix={PREFIX} | seed_bucket={seed_bucket} | seed_utc={bucket_to_utc_iso(seed_bucket)}"
-    )
+    log.info(f"SEED | seed_slug={seed_slug} | seed_bucket={seed_bucket} | seed_utc={bucket_to_utc_iso(seed_bucket)}")
 
-    counts = {"tried": 0, "gamma_missing": 0, "token_missing": 0, "clob_404": 0, "book_bad": 0, "ok": 0}
+    counts = {"tried": 0, "gamma_missing": 0, "closed": 0, "token_missing": 0, "clob_404": 0, "book_miss": 0, "book_bad": 0, "ok": 0}
 
     for i in range(LOOKBACK):
         bucket = seed_bucket - (i * 300)
@@ -460,13 +439,14 @@ def main():
             continue
 
         debug_gamma_market(mkt, slug)
-        # Skip closed markets (prevents scanning into dead buckets that return 404 books)
+
+        # ✅ correct: only skip when closed
         if _safe_get(mkt, "closed") is True:
+            counts["closed"] += 1
             log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
-        continue
+            continue
 
         outcomes, token_ids = extract_outcomes_and_tokens(mkt)
-
         if len(outcomes) < 2 or len(token_ids) < 2:
             counts["token_missing"] += 1
             log.info(
@@ -485,7 +465,7 @@ def main():
             counts["clob_404"] += 1
 
         if not bookA or not bookB:
-            counts["book_bad"] += 1
+            counts["book_miss"] += 1
             log.info(
                 f"BOOK_MISS | slug={slug} | A_code={codeA} B_code={codeB} | "
                 f"A={'ok' if bookA else 'no_book'} B={'ok' if bookB else 'no_book'}"
@@ -495,13 +475,14 @@ def main():
         bbA, baA = best_bid_ask(bookA)
         bbB, baB = best_bid_ask(bookB)
 
+        if DEBUG_BOOK:
+            log.info(f"BOOK_TOP | slug={slug} | {oA} bb={bbA} ba={baA} | {oB} bb={bbB} ba={baB}")
+
         okA, whyA = book_ok(bbA, baA)
         okB, whyB = book_ok(bbB, baB)
         if not okA or not okB:
             counts["book_bad"] += 1
-            log.info(
-                f"BOOK_BAD | slug={slug} | A_{whyA} bb={bbA} ba={baA} | B_{whyB} bb={bbB} ba={baB}"
-            )
+            log.info(f"BOOK_BAD | slug={slug} | A_{whyA} bb={bbA} ba={baA} | B_{whyB} bb={bbB} ba={baB}")
             continue
 
         counts["ok"] += 1
@@ -511,9 +492,25 @@ def main():
             f"{oB} token={tB} bb={bbB:.4f} ba={baB:.4f}"
         )
 
-        # ----------------------------
+        # Save last-good in DB state
+        try:
+            st = db_read_state()
+            st["last_good"] = {
+                "ts": _now_utc_iso(),
+                "slug": slug,
+                "bucket": bucket,
+                "outcomes": [oA, oB],
+                "token_ids": [tA, tB],
+                "books": {
+                    oA: {"best_bid": bbA, "best_ask": baA},
+                    oB: {"best_bid": bbB, "best_ask": baB},
+                },
+            }
+            db_write_state(st)
+        except Exception as e:
+            log.warning(f"DB_WRITE_WARNING | {e}")
+
         # LIVE SMOKE TRADE (optional)
-        # ----------------------------
         if LIVE_MODE and LIVE_ARMED and LIVE_SMOKE:
             st = db_read_state()
             last_bucket = (st.get("live") or {}).get("last_smoke_bucket")
@@ -535,9 +532,7 @@ def main():
                         size = max_size_by_cost
 
                 if size <= 0:
-                    log.info(
-                        f"LIVE_SMOKE_ABORT | reason=size<=0_after_cap | price={price} max_cost={LIVE_SMOKE_MAX_COST}"
-                    )
+                    log.info(f"LIVE_SMOKE_ABORT | reason=size<=0_after_cap | price={price} max_cost={LIVE_SMOKE_MAX_COST}")
                 else:
                     log.info(
                         f"LIVE_SMOKE_SEND | slug={slug} | outcome={pick_name} | token={pick_token} "
@@ -552,7 +547,7 @@ def main():
                     )
                     log.info(f"LIVE_SMOKE_RESULT | http_code={codeO} | resp={str(respO)[:1200]}")
 
-                    # Persist idempotency marker
+                    # idempotency marker
                     st = db_read_state()
                     live_obj = st.get("live") or {}
                     live_obj["last_smoke_bucket"] = bucket
@@ -564,35 +559,19 @@ def main():
                     except Exception as e:
                         log.warning(f"DB_WRITE_WARNING | {e}")
 
-        # Save last-good in DB state
-        st = db_read_state()
-        st["last_good"] = {
-            "ts": _now_utc_iso(),
-            "slug": slug,
-            "bucket": bucket,
-            "outcomes": [oA, oB],
-            "token_ids": [tA, tB],
-            "books": {
-                oA: {"best_bid": bbA, "best_ask": baA},
-                oB: {"best_bid": bbB, "best_ask": baB},
-            },
-        }
-        try:
-            db_write_state(st)
-        except Exception as e:
-            log.warning(f"DB_WRITE_WARNING | {e}")
-
         # Stop at first good bucket
         break
 
     log.info(
-        "SEARCH_SUMMARY | tried={tried} | gamma_missing={gamma_missing} | token_missing={token_missing} | "
-        "clob_404={clob_404} | book_bad={book_bad} | ok={ok}".format(**counts)
+        "SEARCH_SUMMARY | tried={tried} | gamma_missing={gamma_missing} | closed={closed} | token_missing={token_missing} | "
+        "clob_404={clob_404} | book_miss={book_miss} | book_bad={book_bad} | ok={ok}".format(**counts)
     )
+
     if counts["ok"] == 0:
-        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND_OR_TOKEN_PARSE_FAIL | lookback=%d", LOOKBACK)
+        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND | lookback=%d", LOOKBACK)
 
     log.info("BOOT: bot.py finished cleanly")
+
 
 if __name__ == "__main__":
     run_loop = os.getenv("RUN_LOOP", "true").lower() in ("1", "true", "yes", "y")

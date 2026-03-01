@@ -453,8 +453,13 @@ def main():
             continue
 
         debug_gamma_market(mkt, slug)
+        # Skip closed markets (prevents scanning into dead buckets that return 404 books)
+        if _safe_get(mkt, "closed") is True:
+            log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
+        continue
 
         outcomes, token_ids = extract_outcomes_and_tokens(mkt)
+
         if len(outcomes) < 2 or len(token_ids) < 2:
             counts["token_missing"] += 1
             log.info(

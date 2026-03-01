@@ -584,4 +584,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_loop = os.getenv("RUN_LOOP", "true").lower() in ("1", "true", "yes", "y")
+    loop_seconds = int(os.getenv("LOOP_SECONDS", "30"))
+
+    if run_loop:
+        log.info(f"RUN_LOOP | enabled=true | loop_seconds={loop_seconds}")
+        while True:
+            try:
+                main()
+            except Exception as e:
+                log.exception(f"FATAL_LOOP_EXCEPTION | {e}")
+            time.sleep(loop_seconds)
+    else:
+        main()

@@ -164,7 +164,7 @@ def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
 # Skip closed markets (prevents scanning into dead buckets that return 404 books)
 if _safe_get(mkt, "closed") is True:
     log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
-    continue
+continue
     
 def _http_get(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> Tuple[int, Any]:
     last_exc = None

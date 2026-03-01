@@ -132,8 +132,11 @@ def _coerce_list_str(x: Any) -> List[str]:
         out.append(str(v))
     return out
 
-
 def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
+    # Skip closed markets (prevents scanning into dead buckets that return 404 books)
+if _safe_get(mkt, "closed") is True:
+    log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
+    continue
     if not DEBUG_GAMMA:
         return
     payload = {

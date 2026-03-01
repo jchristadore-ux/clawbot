@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import json
 import time
@@ -35,15 +34,16 @@ RUN_MODE = os.getenv("RUN_MODE", "PAPER").upper()  # PAPER or LIVE
 LIVE_MODE = RUN_MODE == "LIVE"
 LIVE_ARMED = os.getenv("LIVE_ARMED", "false").lower() in ("1", "true", "yes", "y")
 
-# Rolling 5m market prefix + seed slug
 PREFIX = os.getenv("PREFIX", "btc-updown-5m")
-SEED_SLUG = os.getenv("SEED_SLUG", "")  # e.g. btc-updown-5m-1772308500
-LOOKBACK = int(os.getenv("LOOKBACK", "96"))  # how many 5-min buckets to try
+SEED_SLUG = os.getenv("SEED_SLUG", "").strip()  # e.g. btc-updown-5m-1772308500
 
-# Market quality constraints
-MIN_BID = float(os.getenv("MIN_BID", "0.020"))
-MAX_ASK = float(os.getenv("MAX_ASK", "0.980"))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.080"))
+# A: tighten defaults (override via env anytime)
+LOOKBACK = int(os.getenv("LOOKBACK", "240"))  # default higher to find real buckets
+
+# Market quality constraints (tightened defaults)
+MIN_BID = float(os.getenv("MIN_BID", "0.20"))
+MAX_ASK = float(os.getenv("MAX_ASK", "0.80"))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.15"))
 
 # Debug flags
 DEBUG_GAMMA = os.getenv("DEBUG_GAMMA", "0").lower() in ("1", "true", "yes", "y")
@@ -51,25 +51,30 @@ DEBUG_BOOK = os.getenv("DEBUG_BOOK", "0").lower() in ("1", "true", "yes", "y")
 
 # DB state table + key
 DB_STATE_TABLE = os.getenv("DB_STATE_TABLE", "j5_state_v2")
-DB_KEY = os.getenv("DB_KEY", PREFIX)  # always non-null
+DB_KEY = os.getenv("DB_KEY", PREFIX)  # stable key
 
 # Endpoints
-BUN_HEALTH_URL = os.getenv("BUN_HEALTH_URL", "http://localhost:3000/health")
+BUN_HEALTH_URL = os.getenv("BUN_HEALTH_URL", "http://localhost:3000/health").strip()
 GAMMA_BASE = os.getenv("GAMMA_BASE", "https://gamma-api.polymarket.com").rstrip("/")
 CLOB_BASE = os.getenv("CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 
 # Bun order routing
 BUN_BASE_URL = os.getenv("BUN_BASE_URL", "").strip()
 if not BUN_BASE_URL:
-    BUN_BASE_URL = BUN_HEALTH_URL.rstrip("/")
-BUN_ORDER_URL = os.getenv("BUN_ORDER_URL", f"{BUN_BASE_URL.rstrip('/')}/order")
+    # fallback: use health base if caller didn't set it properly
+    BUN_BASE_URL = BUN_HEALTH_URL.rsplit("/", 1)[0]
+BUN_ORDER_URL = os.getenv("BUN_ORDER_URL", f"{BUN_BASE_URL.rstrip('/')}/order").strip()
 
-# Live smoke trade controls (fastest path to prove live trading)
+# Live smoke trade controls
 LIVE_SMOKE = os.getenv("LIVE_SMOKE", "false").lower() in ("1", "true", "yes", "y")
 LIVE_SMOKE_SIDE = os.getenv("LIVE_SMOKE_SIDE", "A").upper()  # "A" (Up) or "B" (Down)
 LIVE_SMOKE_ORDER_TYPE = os.getenv("LIVE_SMOKE_ORDER_TYPE", "IOC").upper()
 LIVE_SMOKE_MAX_COST = float(os.getenv("LIVE_SMOKE_MAX_COST", "1.00"))
 LIVE_SMOKE_SIZE = float(os.getenv("LIVE_SMOKE_SIZE", "1.0"))
+
+# Looping
+RUN_LOOP = os.getenv("RUN_LOOP", "false").lower() in ("1", "true", "yes", "y")
+LOOP_SECONDS = int(os.getenv("LOOP_SECONDS", "30"))
 
 # Request tuning
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
@@ -124,7 +129,9 @@ def _coerce_list_str(x: Any) -> List[str]:
 
 
 def debug_gamma_market(market: Dict[str, Any], slug: str) -> None:
-    """Log one structured Gamma line when DEBUG_GAMMA=1. No flow-control here."""
+    """
+    B: debug-only function. NO flow-control allowed here.
+    """
     if not DEBUG_GAMMA:
         return
 
@@ -266,8 +273,7 @@ def db_read_state() -> Dict[str, Any]:
 # ----------------------------
 def gamma_get_market_by_slug(slug: str) -> Tuple[int, Optional[Dict[str, Any]]]:
     """
-    Gamma has multiple shapes depending on endpoint.
-    We'll try a couple robustly and normalize.
+    Tries robust Gamma shapes.
     """
     url1 = f"{GAMMA_BASE}/markets"
     code, data = _http_get(url1, params={"slug": slug})
@@ -294,7 +300,7 @@ def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[st
     outcomes = _maybe_json(outcomes_raw)
     token_ids = _maybe_json(token_ids_raw)
 
-    # handle rare nested shapes
+    # rare nested shapes
     if isinstance(outcomes, dict) and "outcomes" in outcomes:
         outcomes = outcomes["outcomes"]
     if isinstance(token_ids, dict) and "clobTokenIds" in token_ids:
@@ -303,7 +309,7 @@ def extract_outcomes_and_tokens(mkt: Dict[str, Any]) -> Tuple[List[str], List[st
     outcomes_list = _coerce_list_str(outcomes)
     token_ids_list = _coerce_list_str(token_ids)
 
-    # last-resort CSV fallback
+    # CSV fallback
     if not outcomes_list and isinstance(outcomes, str):
         outcomes_list = [s.strip() for s in outcomes.split(",") if s.strip()]
     if not token_ids_list and isinstance(token_ids, str):
@@ -387,10 +393,23 @@ def bucket_to_utc_iso(bucket: int) -> str:
         return "n/a"
 
 
+def resolve_seed_bucket() -> Tuple[str, int]:
+    seed_slug = SEED_SLUG.strip()
+    if seed_slug:
+        b = parse_seed_bucket(seed_slug)
+        if b is not None:
+            return seed_slug, b
+
+    now = int(time.time())
+    seed_bucket = (now // 300) * 300
+    seed_slug = make_slug(PREFIX, seed_bucket)
+    return seed_slug, seed_bucket
+
+
 # ----------------------------
 # Main
 # ----------------------------
-def main():
+def main_once():
     log.info("BOOT: bot.py starting")
 
     # DB setup (safe)
@@ -404,26 +423,23 @@ def main():
         f"run_mode={RUN_MODE} live_mode={LIVE_MODE} live_armed={LIVE_ARMED} "
         f"seed_slug={SEED_SLUG or 'n/a'} prefix={PREFIX} lookback={LOOKBACK} "
         f"MIN_BID={MIN_BID:.3f} MAX_ASK={MAX_ASK:.3f} MAX_SPREAD={MAX_SPREAD:.3f} "
-        f"DEBUG_GAMMA={DEBUG_GAMMA} DEBUG_BOOK={DEBUG_BOOK}"
+        f"DEBUG_GAMMA={DEBUG_GAMMA} DEBUG_BOOK={DEBUG_BOOK} LIVE_SMOKE={LIVE_SMOKE}"
     )
     log.info(f"bun_health_status={bun_code}")
 
-    # Resolve seed bucket
-    seed_slug = SEED_SLUG.strip() or ""
-    if not seed_slug:
-        now = int(time.time())
-        seed_bucket = (now // 300) * 300
-        seed_slug = make_slug(PREFIX, seed_bucket)
-    else:
-        seed_bucket = parse_seed_bucket(seed_slug)
-        if seed_bucket is None:
-            now = int(time.time())
-            seed_bucket = (now // 300) * 300
-            seed_slug = make_slug(PREFIX, seed_bucket)
-
+    seed_slug, seed_bucket = resolve_seed_bucket()
     log.info(f"SEED | seed_slug={seed_slug} | seed_bucket={seed_bucket} | seed_utc={bucket_to_utc_iso(seed_bucket)}")
 
-    counts = {"tried": 0, "gamma_missing": 0, "closed": 0, "token_missing": 0, "clob_404": 0, "book_miss": 0, "book_bad": 0, "ok": 0}
+    counts = {
+        "tried": 0,
+        "gamma_missing": 0,
+        "closed": 0,
+        "token_missing": 0,
+        "clob_404": 0,
+        "book_miss": 0,
+        "book_bad": 0,
+        "tradable": 0,
+    }
 
     for i in range(LOOKBACK):
         bucket = seed_bucket - (i * 300)
@@ -440,7 +456,6 @@ def main():
 
         debug_gamma_market(mkt, slug)
 
-        # ✅ correct: only skip when closed
         if _safe_get(mkt, "closed") is True:
             counts["closed"] += 1
             log.info(f"SKIP_CLOSED | slug={slug} | bucket={bucket}")
@@ -475,6 +490,13 @@ def main():
         bbA, baA = best_bid_ask(bookA)
         bbB, baB = best_bid_ask(bookB)
 
+        # B: always log that a book exists (not implying tradable)
+        log.info(
+            f"FOUND_BOOK | slug={slug} | "
+            f"{oA} token={tA} bb={bbA} ba={baA} | "
+            f"{oB} token={tB} bb={bbB} ba={baB}"
+        )
+
         if DEBUG_BOOK:
             log.info(f"BOOK_TOP | slug={slug} | {oA} bb={bbA} ba={baA} | {oB} bb={bbB} ba={baB}")
 
@@ -485,9 +507,9 @@ def main():
             log.info(f"BOOK_BAD | slug={slug} | A_{whyA} bb={bbA} ba={baA} | B_{whyB} bb={bbB} ba={baB}")
             continue
 
-        counts["ok"] += 1
+        counts["tradable"] += 1
         log.info(
-            f"FOUND_REAL_BOOK | slug={slug} | "
+            f"FOUND_TRADABLE_BOOK | slug={slug} | "
             f"{oA} token={tA} bb={bbA:.4f} ba={baA:.4f} | "
             f"{oB} token={tB} bb={bbB:.4f} ba={baB:.4f}"
         )
@@ -495,7 +517,7 @@ def main():
         # Save last-good in DB state
         try:
             st = db_read_state()
-            st["last_good"] = {
+            st["last_tradable"] = {
                 "ts": _now_utc_iso(),
                 "slug": slug,
                 "bucket": bucket,
@@ -532,11 +554,13 @@ def main():
                         size = max_size_by_cost
 
                 if size <= 0:
-                    log.info(f"LIVE_SMOKE_ABORT | reason=size<=0_after_cap | price={price} max_cost={LIVE_SMOKE_MAX_COST}")
+                    log.info(
+                        f"LIVE_SMOKE_ABORT | reason=size<=0_after_cap | price={price} max_cost={LIVE_SMOKE_MAX_COST}"
+                    )
                 else:
                     log.info(
                         f"LIVE_SMOKE_SEND | slug={slug} | outcome={pick_name} | token={pick_token} "
-                        f"| side=BUY price={price:.4f} size={size:.4f} order_type={LIVE_SMOKE_ORDER_TYPE}"
+                        f"| side=BUY price={price:.4f} size={size:.6f} order_type={LIVE_SMOKE_ORDER_TYPE}"
                     )
                     codeO, respO = bun_place_order(
                         token_id=pick_token,
@@ -559,31 +583,32 @@ def main():
                     except Exception as e:
                         log.warning(f"DB_WRITE_WARNING | {e}")
 
-        # Stop at first good bucket
+        # stop at first tradable bucket
         break
 
     log.info(
         "SEARCH_SUMMARY | tried={tried} | gamma_missing={gamma_missing} | closed={closed} | token_missing={token_missing} | "
-        "clob_404={clob_404} | book_miss={book_miss} | book_bad={book_bad} | ok={ok}".format(**counts)
+        "clob_404={clob_404} | book_miss={book_miss} | book_bad={book_bad} | tradable={tradable}".format(**counts)
     )
 
-    if counts["ok"] == 0:
-        log.info("NO_TRADE | reason=NO_REAL_BOOK_FOUND | lookback=%d", LOOKBACK)
+    if counts["tradable"] == 0:
+        log.info("NO_TRADE | reason=NO_TRADABLE_BOOK_FOUND | lookback=%d", LOOKBACK)
 
     log.info("BOOT: bot.py finished cleanly")
 
 
-if __name__ == "__main__":
-    run_loop = os.getenv("RUN_LOOP", "true").lower() in ("1", "true", "yes", "y")
-    loop_seconds = int(os.getenv("LOOP_SECONDS", "30"))
-
-    if run_loop:
-        log.info(f"RUN_LOOP | enabled=true | loop_seconds={loop_seconds}")
+def main():
+    if RUN_LOOP:
+        log.info(f"RUN_LOOP | enabled=true | loop_seconds={LOOP_SECONDS}")
         while True:
             try:
-                main()
+                main_once()
             except Exception as e:
                 log.exception(f"FATAL_LOOP_EXCEPTION | {e}")
-            time.sleep(loop_seconds)
+            time.sleep(LOOP_SECONDS)
     else:
-        main()
+        main_once()
+
+
+if __name__ == "__main__":
+    main()

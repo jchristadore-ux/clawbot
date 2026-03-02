@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { createSign, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 
 const PORT = Number(process.env.PORT || 3000);
 const KALSHI_BASE_URL = (process.env.KALSHI_BASE_URL || "https://api.elections.kalshi.com").replace(/\/$/, "");
@@ -21,14 +22,30 @@ function asNumber(x: unknown): number | null {
 }
 
 async function loadPrivateKey(): Promise<string | null> {
-  if (KALSHI_PRIVATE_KEY_PEM.trim()) return KALSHI_PRIVATE_KEY_PEM;
-  if (!KALSHI_PRIVATE_KEY_PATH) return null;
+  if (KALSHI_PRIVATE_KEY_PEM.trim()) return KALSHI_PRIVATE_KEY_PEM.trim();
+
+  const raw = KALSHI_PRIVATE_KEY_PATH.trim();
+  if (!raw) return null;
+
+  if (raw.includes("BEGIN")) return raw;
+
   try {
-    const f = Bun.file(KALSHI_PRIVATE_KEY_PATH);
-    return await f.text();
+    if (raw.length < 512) {
+      const text = await readFile(raw, "utf-8");
+      if (text.includes("BEGIN")) return text;
+    }
   } catch {
-    return null;
+    // fallthrough
   }
+
+  try {
+    const decoded = Buffer.from(raw, "base64").toString("utf-8");
+    if (decoded.includes("BEGIN")) return decoded;
+  } catch {
+    // fallthrough
+  }
+
+  return null;
 }
 
 async function signedKalshiHeaders(method: string, path: string): Promise<Record<string, string>> {

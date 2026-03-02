@@ -16,6 +16,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+print("BOOT: bot.py started", flush=True)
 
 # =============================================================================
 # Safe env helpers (fixes Railway blank var crashes)
@@ -173,9 +174,20 @@ class KalshiClient:
     def __init__(self) -> None:
         self.session = requests.Session()
         self.private_key = None
+
         pem = self._resolve_private_key_material()
         if pem:
-            self.private_key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+            try:
+                self.private_key = serialization.load_pem_private_key(
+                    pem.encode("utf-8"),
+                    password=None,
+                )
+            except Exception as e:
+                # Do NOT crash the bot; just disable signing and keep going
+                print(f"BOOT_WARN: could not load private key ({type(e).__name__}): {e}", flush=True)
+                self.private_key = None
+        else:
+            print("BOOT_WARN: no private key material found in env", flush=True)
 
      @staticmethod
     def _resolve_private_key_material() -> str:

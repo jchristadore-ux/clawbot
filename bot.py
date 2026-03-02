@@ -183,18 +183,16 @@ class KalshiClient:
                     password=None,
                 )
             except Exception as e:
-                # Do NOT crash the bot; just disable signing and keep going
-                print(f"BOOT_WARN: could not load private key ({type(e).__name__}): {e}", flush=True)
+                print(f"BOOT_WARN: could not load private key: {e}", flush=True)
                 self.private_key = None
         else:
-            print("BOOT_WARN: no private key material found in env", flush=True)
+            print("BOOT_WARN: no private key found", flush=True)
 
-     @staticmethod
+    @staticmethod
     def _resolve_private_key_material() -> str:
-        # Preferred: direct PEM in env var.
         raw_pem = KALSHI_PRIVATE_KEY_PEM.strip()
+
         if raw_pem:
-            # If Railway stored "\n" literally, convert to real newlines.
             raw_pem = raw_pem.replace("\\n", "\n").strip().strip('"').strip("'")
             return raw_pem
 
@@ -202,11 +200,9 @@ class KalshiClient:
         if not raw:
             return ""
 
-        # If user accidentally pasted PEM into *_PATH
         if "BEGIN" in raw:
             return raw.replace("\\n", "\n").strip().strip('"').strip("'")
 
-        # Try file path
         try:
             p = Path(raw)
             if len(raw) < 512 and p.exists():
@@ -215,7 +211,6 @@ class KalshiClient:
         except OSError:
             pass
 
-        # Try base64 encoded PEM
         try:
             decoded = base64.b64decode(raw, validate=True).decode("utf-8")
             decoded = decoded.replace("\\n", "\n").strip().strip('"').strip("'")
@@ -226,20 +221,21 @@ class KalshiClient:
         return ""
 
     def _headers(self, method: str, path: str) -> dict[str, str]:
-        # If creds missing, return empty headers (public endpoints may still work)
         if not (KALSHI_API_KEY_ID and self.private_key):
             return {}
 
         ts_ms = str(int(time.time() * 1000))
         msg = f"{ts_ms}{method.upper()}{path}".encode("utf-8")
 
-        # Common Kalshi signing uses RSA + SHA256; we use PSS here (more standard).
-        # If your account requires PKCS1v15, swap padding below.
         sig = self.private_key.sign(
             msg,
-            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
             hashes.SHA256(),
         )
+
         sig_b64 = base64.b64encode(sig).decode("utf-8")
 
         return {
@@ -252,6 +248,7 @@ class KalshiClient:
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         headers = self._headers(method, path)
         url = f"{KALSHI_BASE_URL}{path}"
+
         r = self.session.request(
             method=method.upper(),
             url=url,
@@ -259,43 +256,9 @@ class KalshiClient:
             json=payload,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
+
         r.raise_for_status()
-        out = r.json()
-        if not isinstance(out, dict):
-            raise RuntimeError("Unexpected Kalshi response shape")
-        return out
-
-    def get_open_market(self) -> dict[str, Any]:
-        # Choose first open market returned (Kalshi generally returns soonest-closing first; if not, still workable)
-        data = self._request("GET", f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open")
-        markets = data.get("markets", [])
-        if not markets:
-            raise RuntimeError(f"No open markets for {SERIES_TICKER}")
-        return markets[0]
-
-    def get_orderbook(self, ticker: str) -> dict[str, Any]:
-        return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
-
-    def place_order_buy(self, ticker: str, side: str, contracts: int, price_cents: int) -> dict[str, Any]:
-        if not LIVE_MODE:
-            return {"ok": True, "paper": True}
-
-        payload: dict[str, Any] = {
-            "ticker": ticker,
-            "action": "buy",
-            "side": side.lower(),   # "yes" | "no"
-            "count": int(contracts),
-            "type": "limit",
-            "client_order_id": f"j5-{int(time.time())}",
-        }
-        if side == "YES":
-            payload["yes_price"] = int(price_cents)
-        else:
-            payload["no_price"] = int(price_cents)
-
-        return self._request("POST", "/trade-api/v2/portfolio/orders", payload)
-
-
+        return r.json()
 # =============================================================================
 # Market data
 # =============================================================================

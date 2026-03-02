@@ -257,16 +257,40 @@ class KalshiClient:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
+        # If Kalshi rejects or errors, show a tight debug message
+        if r.status_code >= 400:
+            text = (r.text or "")[:500]
+            raise RuntimeError(f"Kalshi HTTP {r.status_code} on {path}: {text}")
+
+        try:
+            out = r.json()
+        except Exception:
+            text = (r.text or "")[:500]
+            raise RuntimeError(f"Kalshi non-JSON response on {path}: {text}")
+
+        if not isinstance(out, dict):
+            raise RuntimeError(f"Kalshi unexpected JSON type on {path}: {type(out).__name__}")
+
+        return out
+
     def get_open_market(self) -> dict[str, Any]:
-        # Returns the first open market for the configured series ticker
         data = self._request(
             "GET",
             f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open",
         )
-        markets = data.get("markets", [])
-        if not markets:
-            raise RuntimeError(f"No open markets for {SERIES_TICKER}")
-        return markets[0]
+
+        markets = data.get("markets")
+        if not isinstance(markets, list) or len(markets) == 0:
+            raise RuntimeError(f"No open markets returned. Response keys={list(data.keys())}")
+
+        m0 = markets[0]
+        if not isinstance(m0, dict):
+            raise RuntimeError(f"Unexpected market item type: {type(m0).__name__}")
+
+        if not m0.get("ticker"):
+            raise RuntimeError(f"Market missing ticker. Market keys={list(m0.keys())}")
+
+        return m0
 
     def get_orderbook(self, ticker: str) -> dict[str, Any]:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")

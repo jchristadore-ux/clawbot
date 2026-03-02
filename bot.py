@@ -177,33 +177,37 @@ class KalshiClient:
         if pem:
             self.private_key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
 
-    @staticmethod
+     @staticmethod
     def _resolve_private_key_material() -> str:
-        # Preferred: direct PEM in env var
-        if KALSHI_PRIVATE_KEY_PEM.strip():
-            return KALSHI_PRIVATE_KEY_PEM.strip()
+        # Preferred: direct PEM in env var.
+        raw_pem = KALSHI_PRIVATE_KEY_PEM.strip()
+        if raw_pem:
+            # If Railway stored "\n" literally, convert to real newlines.
+            raw_pem = raw_pem.replace("\\n", "\n").strip().strip('"').strip("'")
+            return raw_pem
 
         raw = KALSHI_PRIVATE_KEY_PATH.strip()
         if not raw:
             return ""
 
-        # Support accidentally putting PEM/base64 into *_PATH
+        # If user accidentally pasted PEM into *_PATH
         if "BEGIN" in raw:
-            return raw
+            return raw.replace("\\n", "\n").strip().strip('"').strip("'")
 
-        # Attempt file path (only if it looks like a real path)
+        # Try file path
         try:
             p = Path(raw)
             if len(raw) < 512 and p.exists():
-                return p.read_text(encoding="utf-8")
+                txt = p.read_text(encoding="utf-8")
+                return txt.replace("\\n", "\n").strip().strip('"').strip("'")
         except OSError:
             pass
 
-        # Attempt base64 decode
+        # Try base64 encoded PEM
         try:
             decoded = base64.b64decode(raw, validate=True).decode("utf-8")
-            if "BEGIN" in decoded:
-                return decoded
+            decoded = decoded.replace("\\n", "\n").strip().strip('"').strip("'")
+            return decoded
         except (binascii.Error, UnicodeDecodeError):
             pass
 

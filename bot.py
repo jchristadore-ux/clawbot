@@ -690,13 +690,11 @@ def main() -> None:
         except KeyboardInterrupt:
             return
         except Exception as exc:
-            # suppress spam unless explicitly debugging
-            if DEBUG_ERRORS and debug_throttle("loop_error", 10):
-                log.error("loop error: %s", exc)
-            write_status(state, message=f"error: {exc}", fair_yes=0.5, mark_yes=0.5, edge=0.0)
-            save_state(state)
+            # always print a single-line error summary (Railway-friendly)
+            print(json.dumps({"ts": utc_iso(), "event": "ERROR", "error": str(exc)[:300]}), flush=True)
+            if DEBUG_ERRORS:
+              log.exception("loop error")
             time.sleep(max(10.0, POLL_SECONDS))
-
-
+        
 if __name__ == "__main__":
     main()

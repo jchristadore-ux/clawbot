@@ -10,16 +10,15 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, List
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-print("BOOT: bot.py started", flush=True)
 
 # =============================================================================
-# Safe env helpers (fixes Railway blank var crashes)
+# Safe env helpers (Railway blank-var proof)
 # =============================================================================
 
 def env_str(name: str, default: str = "") -> str:
@@ -39,7 +38,7 @@ def env_int(name: str, default: int) -> int:
     v = os.getenv(name)
     if v is None or v.strip() == "":
         return default
-    return int(float(v))  # tolerate "8.0"
+    return int(float(v))
 
 def env_float(name: str, default: float) -> float:
     v = os.getenv(name)
@@ -56,7 +55,7 @@ KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
 KALSHI_API_KEY_ID = env_str("KALSHI_API_KEY_ID", "")
 KALSHI_PRIVATE_KEY_PEM = env_str("KALSHI_PRIVATE_KEY_PEM", "")
 KALSHI_PRIVATE_KEY_PATH = env_str("KALSHI_PRIVATE_KEY_PATH", "")
-SERIES_TICKER = env_str("SERIES_TICKER", "KXBTC15M")
+SERIES_TICKER = env_str("SERIES_TICKER", "KXBTC15M").upper()
 
 LIVE_MODE = env_bool("LIVE_MODE", False)
 
@@ -74,21 +73,31 @@ LOOKBACK = env_int("LOOKBACK", 20)
 MIN_CONVICTION_Z = env_float("MIN_CONVICTION_Z", 1.0)
 FAIR_MOVE_SCALE = env_float("FAIR_MOVE_SCALE", 0.15)
 
-STATUS_FILE = Path(env_str("STATUS_FILE", ".runtime/status.json"))
-STATE_FILE = Path(env_str("STATE_FILE", ".runtime/state.json"))
+STATUS_FILE = Path(env_str("STATUS_FILE", "/data/status.json"))
+STATE_FILE = Path(env_str("STATE_FILE", "/data/state.json"))
 
 KRAKEN_TICKER_URL = env_str("KRAKEN_TICKER_URL", "https://api.kraken.com/0/public/Ticker?pair=XBTUSD")
 
+# Trade-only logs: we will NOT print loop errors unless DEBUG_ERRORS=true
+DEBUG_ERRORS = env_bool("DEBUG_ERRORS", False)
+DEBUG_BOOK_DUMP = env_bool("DEBUG_BOOK_DUMP", False)  # dumps a small orderbook preview when empty (throttled)
+
 
 # =============================================================================
-# Logging: only trades + errors
+# Logging
 # =============================================================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("johnny5")
 
-def trade_log_json(payload: dict) -> None:
-    print(json.dumps(payload), flush=True)
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ensure_runtime_dir() -> None:
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
@@ -106,15 +115,6 @@ class BotState:
     position_entry_prob: Optional[float] = None
     position_contracts: int = 0
     market_ticker: Optional[str] = None
-
-
-def utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def ensure_runtime_dir() -> None:
-    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
 def load_state() -> BotState:
@@ -167,6 +167,21 @@ def write_status(state: BotState, message: str, fair_yes: float, mark_yes: float
 
 
 # =============================================================================
+# Throttled debug printing (prevents spam)
+# =============================================================================
+
+_last_debug: dict[str, float] = {}
+
+def debug_throttle(key: str, every_seconds: float) -> bool:
+    now = time.time()
+    last = _last_debug.get(key, 0.0)
+    if now - last >= every_seconds:
+        _last_debug[key] = now
+        return True
+    return False
+
+
+# =============================================================================
 # Kalshi client
 # =============================================================================
 
@@ -183,6 +198,7 @@ class KalshiClient:
                     password=None,
                 )
             except Exception as e:
+                # Don't crash paper mode
                 print(f"BOOT_WARN: could not load private key: {e}", flush=True)
                 self.private_key = None
         else:
@@ -191,10 +207,8 @@ class KalshiClient:
     @staticmethod
     def _resolve_private_key_material() -> str:
         raw_pem = KALSHI_PRIVATE_KEY_PEM.strip()
-
         if raw_pem:
-            raw_pem = raw_pem.replace("\\n", "\n").strip().strip('"').strip("'")
-            return raw_pem
+            return raw_pem.replace("\\n", "\n").strip().strip('"').strip("'")
 
         raw = KALSHI_PRIVATE_KEY_PATH.strip()
         if not raw:
@@ -203,6 +217,7 @@ class KalshiClient:
         if "BEGIN" in raw:
             return raw.replace("\\n", "\n").strip().strip('"').strip("'")
 
+        # file path
         try:
             p = Path(raw)
             if len(raw) < 512 and p.exists():
@@ -211,10 +226,10 @@ class KalshiClient:
         except OSError:
             pass
 
+        # base64 pem
         try:
             decoded = base64.b64decode(raw, validate=True).decode("utf-8")
-            decoded = decoded.replace("\\n", "\n").strip().strip('"').strip("'")
-            return decoded
+            return decoded.replace("\\n", "\n").strip().strip('"').strip("'")
         except (binascii.Error, UnicodeDecodeError):
             pass
 
@@ -229,13 +244,9 @@ class KalshiClient:
 
         sig = self.private_key.sign(
             msg,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
-            ),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
             hashes.SHA256(),
         )
-
         sig_b64 = base64.b64encode(sig).decode("utf-8")
 
         return {
@@ -248,7 +259,6 @@ class KalshiClient:
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         headers = self._headers(method, path)
         url = f"{KALSHI_BASE_URL}{path}"
-
         r = self.session.request(
             method=method.upper(),
             url=url,
@@ -257,46 +267,66 @@ class KalshiClient:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
-        # If Kalshi rejects or errors, show a tight debug message
         if r.status_code >= 400:
-            text = (r.text or "")[:500]
-            raise RuntimeError(f"Kalshi HTTP {r.status_code} on {path}: {text}")
+            raise RuntimeError(f"Kalshi HTTP {r.status_code} on {path}: {(r.text or '')[:300]}")
 
         try:
             out = r.json()
         except Exception:
-            text = (r.text or "")[:500]
-            raise RuntimeError(f"Kalshi non-JSON response on {path}: {text}")
+            raise RuntimeError(f"Kalshi non-JSON response on {path}: {(r.text or '')[:300]}")
 
         if not isinstance(out, dict):
             raise RuntimeError(f"Kalshi unexpected JSON type on {path}: {type(out).__name__}")
 
         return out
 
-    def get_open_market(self) -> dict[str, Any]:
-        data = self._request(
-            "GET",
-            f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open",
-        )
+    def get_open_markets(self) -> List[dict[str, Any]]:
+        data = self._request("GET", f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open")
+        markets = data.get("markets", [])
+        return markets if isinstance(markets, list) else []
 
-        markets = data.get("markets")
-        if not isinstance(markets, list) or len(markets) == 0:
-            raise RuntimeError(f"No open markets returned. Response keys={list(data.keys())}")
+    @staticmethod
+    def pick_active_market(markets: List[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """
+        Prefer a market that is currently active (open_time <= now < close_time).
+        If times aren't present, fallback to first.
+        """
+        now = datetime.now(timezone.utc)
 
-        m0 = markets[0]
-        if not isinstance(m0, dict):
-            raise RuntimeError(f"Unexpected market item type: {type(m0).__name__}")
+        def parse_ts(x: Any) -> Optional[datetime]:
+            if not isinstance(x, str) or not x:
+                return None
+            try:
+                return datetime.fromisoformat(x.replace("Z", "+00:00"))
+            except Exception:
+                return None
 
-        if not m0.get("ticker"):
-            raise RuntimeError(f"Market missing ticker. Market keys={list(m0.keys())}")
+        active: List[Tuple[datetime, dict[str, Any]]] = []
+        future: List[Tuple[datetime, dict[str, Any]]] = []
 
-        return m0
+        for m in markets:
+            if not isinstance(m, dict):
+                continue
+            ot = parse_ts(m.get("open_time") or m.get("open_ts"))
+            ct = parse_ts(m.get("close_time") or m.get("close_ts"))
+            if ot and ct:
+                if ot <= now < ct:
+                    active.append((ct, m))
+                elif ct >= now:
+                    future.append((ct, m))
+
+        if active:
+            active.sort(key=lambda x: x[0])  # soonest close
+            return active[0][1]
+        if future:
+            future.sort(key=lambda x: x[0])
+            return future[0][1]
+        return markets[0] if markets else None
 
     def get_orderbook(self, ticker: str) -> dict[str, Any]:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
 
     def place_order_buy(self, ticker: str, side: str, contracts: int, price_cents: int) -> dict[str, Any]:
-        # Paper mode: pretend ok
         if not LIVE_MODE:
             return {"ok": True, "paper": True}
 
@@ -311,7 +341,6 @@ class KalshiClient:
             "count": int(contracts),
             "client_order_id": f"j5-{int(time.time())}",
         }
-
         if side == "YES":
             payload["yes_price"] = int(price_cents)
         else:
@@ -319,10 +348,9 @@ class KalshiClient:
 
         return self._request("POST", "/trade-api/v2/portfolio/orders", payload)
 
-        r.raise_for_status()
-        return r.json()
+
 # =============================================================================
-# Market data
+# Kraken price + model
 # =============================================================================
 
 def kraken_last_price() -> float:
@@ -334,29 +362,6 @@ def kraken_last_price() -> float:
         raise RuntimeError("Kraken price missing")
     key = next(iter(result))
     return float(result[key]["c"][0])
-
-
-def mark_yes_from_orderbook(orderbook: dict[str, Any]) -> float:
-    # Kalshi orderbook typically returns bids; we use YES best bid and implied YES ask = 100 - NO best bid
-    ob = orderbook.get("orderbook", orderbook)
-    yes_bids = ob.get("yes_bids") or ob.get("yes") or []
-    no_bids = ob.get("no_bids") or ob.get("no") or []
-    if not yes_bids or not no_bids:
-        raise RuntimeError("Orderbook missing yes/no bids")
-
-    def price_of(level: Any) -> int:
-        if isinstance(level, list) and len(level) >= 1:
-            return int(level[0])
-        if isinstance(level, dict) and "price" in level:
-            return int(level["price"])
-        raise RuntimeError("Bad orderbook level shape")
-
-    best_yes_bid = price_of(yes_bids[0])
-    best_no_bid = price_of(no_bids[0])
-
-    implied_yes_ask = 100 - best_no_bid
-    mid_yes = (best_yes_bid + implied_yes_ask) / 2.0
-    return max(0.01, min(0.99, mid_yes / 100.0))
 
 
 def model_fair_yes(prices: list[float]) -> Tuple[float, float]:
@@ -391,7 +396,63 @@ def compute_contracts(equity: float, price_prob: float) -> int:
 
 
 # =============================================================================
-# Trading logic
+# Orderbook -> mark
+# =============================================================================
+
+def _levels(ob: dict[str, Any]) -> Tuple[list, list]:
+    root = ob.get("orderbook", ob)
+    yes = root.get("yes_bids") or root.get("yes") or []
+    no = root.get("no_bids") or root.get("no") or []
+    if not isinstance(yes, list):
+        yes = []
+    if not isinstance(no, list):
+        no = []
+    return yes, no
+
+def _top_price(level: Any) -> Optional[int]:
+    if isinstance(level, list) and len(level) >= 1:
+        try:
+            return int(level[0])
+        except Exception:
+            return None
+    if isinstance(level, dict) and "price" in level:
+        try:
+            return int(level["price"])
+        except Exception:
+            return None
+    return None
+
+def mark_yes_from_orderbook(orderbook: dict[str, Any], ticker: str = "") -> Optional[float]:
+    yes_bids, no_bids = _levels(orderbook)
+
+    best_yes = _top_price(yes_bids[0]) if yes_bids else None
+    best_no = _top_price(no_bids[0]) if no_bids else None
+
+    # If both sides empty -> no liquidity right now; skip quietly
+    if best_yes is None and best_no is None:
+        if DEBUG_BOOK_DUMP and debug_throttle(f"empty_book:{ticker}", 60):
+            preview = {"ticker": ticker, "yes_len": len(yes_bids), "no_len": len(no_bids)}
+            print(json.dumps({"ts": utc_iso(), "event": "EMPTY_BOOK", "preview": preview}), flush=True)
+        return None
+
+    # If one side missing, fall back to a conservative estimate:
+    # - if only YES bid exists: assume implied ask is 100 - best_yes (worst-ish), mid around best_yes
+    # - if only NO bid exists: implied YES ask is 100 - best_no; mid around that
+    if best_yes is None and best_no is not None:
+        implied_yes_ask = 100 - best_no
+        mid_yes = implied_yes_ask  # conservative: use ask-like level
+    elif best_no is None and best_yes is not None:
+        mid_yes = best_yes  # conservative: use bid-like level
+    else:
+        implied_yes_ask = 100 - int(best_no)
+        mid_yes = (int(best_yes) + implied_yes_ask) / 2.0
+
+    p = max(0.01, min(0.99, float(mid_yes) / 100.0))
+    return p
+
+
+# =============================================================================
+# Trading
 # =============================================================================
 
 def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, edge: float, note: str = "") -> None:
@@ -401,26 +462,29 @@ def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, ed
     elif state.position_side == "NO" and state.position_entry_prob is not None:
         unrealized = ((1.0 - mark_yes) - state.position_entry_prob) * state.position_contracts
 
-    trade_log_json(
-        {
-            "ts": utc_iso(),
-            "event": event,
-            "note": note,
-            "live": LIVE_MODE,
-            "equity": round(state.equity + unrealized, 4),
-            "cash": round(state.equity, 4),
-            "realized_pnl": round(state.realized_pnl, 4),
-            "daily_realized_pnl": round(state.daily_realized_pnl, 4),
-            "position": {
-                "side": state.position_side,
-                "contracts": state.position_contracts,
-                "entry_prob": state.position_entry_prob,
-                "market_ticker": state.market_ticker,
-            },
-            "market_yes": round(mark_yes, 6),
-            "fair_yes": round(fair_yes, 6),
-            "edge": round(edge, 6),
-        }
+    print(
+        json.dumps(
+            {
+                "ts": utc_iso(),
+                "event": event,
+                "note": note,
+                "live": LIVE_MODE,
+                "equity": round(state.equity + unrealized, 4),
+                "cash": round(state.equity, 4),
+                "realized_pnl": round(state.realized_pnl, 4),
+                "daily_realized_pnl": round(state.daily_realized_pnl, 4),
+                "position": {
+                    "side": state.position_side,
+                    "contracts": state.position_contracts,
+                    "entry_prob": state.position_entry_prob,
+                    "market_ticker": state.market_ticker,
+                },
+                "market_yes": round(mark_yes, 6),
+                "fair_yes": round(fair_yes, 6),
+                "edge": round(edge, 6),
+            }
+        ),
+        flush=True,
     )
 
 
@@ -468,7 +532,7 @@ def maybe_exit(state: BotState, fair_yes: float, mark_yes: float, client: Kalshi
         should_exit = edge <= EDGE_EXIT
         pnl = (mark_yes - state.position_entry_prob) * state.position_contracts
         close_price = mark_yes
-        close_side = "NO"  # hedge-close (buy opposite) since this simple bot only uses buy actions
+        close_side = "NO"  # hedge close
     else:
         should_exit = edge >= -EDGE_EXIT
         pnl = ((1.0 - mark_yes) - state.position_entry_prob) * state.position_contracts
@@ -480,7 +544,7 @@ def maybe_exit(state: BotState, fair_yes: float, mark_yes: float, client: Kalshi
 
     cents = max(1, min(99, int(round(close_price * 100))))
     client.place_order_buy(
-        ticker=state.market_ticker or SERIES_TICKER,
+        ticker=state.market_ticker or ticker_fallback(client),
         side=close_side,
         contracts=state.position_contracts,
         price_cents=cents,
@@ -500,20 +564,33 @@ def maybe_exit(state: BotState, fair_yes: float, mark_yes: float, client: Kalshi
     return True
 
 
+def ticker_fallback(client: KalshiClient) -> str:
+    markets = client.get_open_markets()
+    m = client.pick_active_market(markets)
+    if not m or not m.get("ticker"):
+        return SERIES_TICKER
+    return str(m["ticker"])
+
+
 # =============================================================================
 # Main
 # =============================================================================
 
 def main() -> None:
+    print("BOOT: bot.py started", flush=True)
     ensure_runtime_dir()
     state = load_state()
     client = KalshiClient()
     prices: list[float] = []
 
-    # One boot line (not spammy, but helps you confirm env)
     log.warning(
         "BOOT | live=%s series=%s poll=%.1fs timeout=%ss state=%s status=%s",
-        LIVE_MODE, SERIES_TICKER, POLL_SECONDS, REQUEST_TIMEOUT_SECONDS, str(STATE_FILE), str(STATUS_FILE)
+        LIVE_MODE,
+        SERIES_TICKER,
+        POLL_SECONDS,
+        REQUEST_TIMEOUT_SECONDS,
+        str(STATE_FILE),
+        str(STATUS_FILE),
     )
 
     while True:
@@ -524,12 +601,27 @@ def main() -> None:
             if len(prices) > LOOKBACK * 5:
                 prices = prices[-LOOKBACK * 5 :]
 
-            market = client.get_open_market()
-            ticker = market.get("ticker")
-            if not ticker:
-                raise RuntimeError("Open market missing ticker")
+            # pick current active market
+            markets = client.get_open_markets()
+            m = client.pick_active_market(markets)
+            if not m or not m.get("ticker"):
+                # no market => sleep quietly
+                write_status(state, message="no_open_market", fair_yes=0.5, mark_yes=0.5, edge=0.0)
+                save_state(state)
+                time.sleep(max(5.0, POLL_SECONDS))
+                continue
 
-            mark_yes = mark_yes_from_orderbook(client.get_orderbook(ticker))
+            ticker = str(m["ticker"])
+
+            ob = client.get_orderbook(ticker)
+            mark_yes = mark_yes_from_orderbook(ob, ticker=ticker)
+            if mark_yes is None:
+                # No liquidity / empty book — this is normal, skip quietly (no error spam)
+                write_status(state, message="empty_orderbook", fair_yes=0.5, mark_yes=0.5, edge=0.0)
+                save_state(state)
+                time.sleep(max(3.0, POLL_SECONDS))
+                continue
+
             fair_yes, z = model_fair_yes(prices)
             edge = fair_yes - mark_yes
 
@@ -545,13 +637,11 @@ def main() -> None:
         except KeyboardInterrupt:
             return
         except Exception as exc:
-            # only errors (no spam)
-            log.error("loop error: %s", exc)
-            try:
-                write_status(state, message=f"error: {exc}", fair_yes=0.5, mark_yes=0.5, edge=0.0)
-                save_state(state)
-            except Exception:
-                pass
+            # suppress spam unless explicitly debugging
+            if DEBUG_ERRORS and debug_throttle("loop_error", 10):
+                log.error("loop error: %s", exc)
+            write_status(state, message=f"error: {exc}", fair_yes=0.5, mark_yes=0.5, edge=0.0)
+            save_state(state)
             time.sleep(max(10.0, POLL_SECONDS))
 
 

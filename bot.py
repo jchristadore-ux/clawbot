@@ -257,6 +257,44 @@ class KalshiClient:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
 
+    def get_open_market(self) -> dict[str, Any]:
+        # Returns the first open market for the configured series ticker
+        data = self._request(
+            "GET",
+            f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open",
+        )
+        markets = data.get("markets", [])
+        if not markets:
+            raise RuntimeError(f"No open markets for {SERIES_TICKER}")
+        return markets[0]
+
+    def get_orderbook(self, ticker: str) -> dict[str, Any]:
+        return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
+
+    def place_order_buy(self, ticker: str, side: str, contracts: int, price_cents: int) -> dict[str, Any]:
+        # Paper mode: pretend ok
+        if not LIVE_MODE:
+            return {"ok": True, "paper": True}
+
+        if side not in ("YES", "NO"):
+            raise ValueError("side must be YES or NO")
+
+        payload: dict[str, Any] = {
+            "ticker": ticker,
+            "action": "buy",
+            "type": "limit",
+            "side": side.lower(),
+            "count": int(contracts),
+            "client_order_id": f"j5-{int(time.time())}",
+        }
+
+        if side == "YES":
+            payload["yes_price"] = int(price_cents)
+        else:
+            payload["no_price"] = int(price_cents)
+
+        return self._request("POST", "/trade-api/v2/portfolio/orders", payload)
+
         r.raise_for_status()
         return r.json()
 # =============================================================================

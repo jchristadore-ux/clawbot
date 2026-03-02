@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -112,11 +114,42 @@ class KalshiClient:
     def __init__(self) -> None:
         self.session = requests.Session()
         self.private_key = None
-        pem = KALSHI_PRIVATE_KEY_PEM
-        if not pem and KALSHI_PRIVATE_KEY_PATH and Path(KALSHI_PRIVATE_KEY_PATH).exists():
-            pem = Path(KALSHI_PRIVATE_KEY_PATH).read_text()
+
+        pem = self._resolve_private_key_material()
         if pem:
             self.private_key = serialization.load_pem_private_key(pem.encode(), password=None)
+
+    @staticmethod
+    def _resolve_private_key_material() -> str:
+        # Preferred: direct PEM in env var.
+        if KALSHI_PRIVATE_KEY_PEM.strip():
+            return KALSHI_PRIVATE_KEY_PEM.strip()
+
+        raw = KALSHI_PRIVATE_KEY_PATH.strip()
+        if not raw:
+            return ""
+
+        # Support users accidentally putting PEM/base64 in *_PATH env.
+        if "BEGIN" in raw:
+            return raw
+
+        # Try file path first, but guard against giant non-path strings.
+        try:
+            p = Path(raw)
+            if len(raw) < 512 and p.exists():
+                return p.read_text()
+        except OSError:
+            pass
+
+        # Try base64 encoded PEM fallback.
+        try:
+            decoded = base64.b64decode(raw, validate=True).decode("utf-8")
+            if "BEGIN" in decoded:
+                return decoded
+        except (binascii.Error, UnicodeDecodeError):
+            pass
+
+        return ""
 
     def _headers(self, method: str, path: str) -> dict[str, str]:
         if not (KALSHI_API_KEY_ID and self.private_key):

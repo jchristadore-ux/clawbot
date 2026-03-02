@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Johnny 5 – Polymarket bot (rollover-stable)
+Johnny 5 — Kalshi-only trading bot (quiet logs + long backoff)
 
-Key fix vs your logs:
-- Rollover is handled as a single state transition.
-- Cooldown is tracked with `cooldown_until` so we do NOT repeatedly "roll over" each loop.
-- When no open markets exist, we back off and keep current ticker (don’t thrash).
+Goals:
+- ONLY Kalshi (no Gamma/Polymarket references)
+- Long backoff when no open markets found (avoid tight loops)
+- Optional hard-stop after N consecutive "no markets" cycles (so container can restart)
+- Logs basically ONLY when a trade is made, showing equity + pnl
+
+Kalshi API uses:
+- Headers: KALSHI-ACCESS-KEY / KALSHI-ACCESS-SIGNATURE / KALSHI-ACCESS-TIMESTAMP (ms)  (docs)
+- Create Order: POST /trade-api/v2/portfolio/orders (docs)
 """
 
 from __future__ import annotations
@@ -13,78 +18,145 @@ from __future__ import annotations
 import os
 import time
 import json
+import uuid
+import base64
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+# Crypto for RSA-PSS signing
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
 
 # =========================
-# CONFIG (edit or env vars)
+# CONFIG (ENV VARS)
 # =========================
 
-SERIES = os.getenv("SERIES", "KXBTC15M")  # <-- CHANGE THIS if needed
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "5"))
-ROLLOVER_COOLDOWN_SECONDS = int(os.getenv("ROLLOVER_COOLDOWN_SECONDS", "30"))
+# Kalshi base URL (docs show elections subdomain for trade api)
+KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com")
 
-# Gamma / Polymarket endpoints (adjust to your setup)
-GAMMA_BASE_URL = os.getenv("GAMMA_BASE_URL", "https://gamma-api.polymarket.com")
-CLOB_BASE_URL = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
+# Market discovery:
+# Set this to the prefix of the market tickers you want to trade.
+# Example idea: "KXBTC15M" -> matches "KXBTC15M-20260302-0300" style tickers.
+MARKET_PREFIX = os.getenv("MARKET_PREFIX", "KXBTC15M")
 
-# Optional: if you require auth headers/cookies for gamma/clob, add here:
-GAMMA_TIMEOUT = float(os.getenv("GAMMA_TIMEOUT", "10"))
-CLOB_TIMEOUT = float(os.getenv("CLOB_TIMEOUT", "10"))
+# Polling / backoff:
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "10"))  # normal poll when things are healthy
+LONG_SLEEP_SECONDS = int(os.getenv("LONG_SLEEP_SECONDS", "900"))  # 15 min backoff when no markets
+STOP_AFTER_NO_MARKETS = int(os.getenv("STOP_AFTER_NO_MARKETS", "20"))  # exit after N consecutive no-market checks
 
-# Wallet / trading config (stubs here — wire into your existing trade code)
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")  # <-- SET THIS in env
+# Trading:
 LIVE_MODE = os.getenv("LIVE_MODE", "false").lower() in ("1", "true", "yes")
-MAX_POSITION_USD = float(os.getenv("MAX_POSITION_USD", "50"))
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.01"))  # e.g., required edge to trade
+MAX_ORDER_COUNT = int(os.getenv("MAX_ORDER_COUNT", "2"))  # contracts per order (simple cap)
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.02"))  # placeholder edge threshold (2%)
 
-# Backoff when gamma returns no markets
-NO_MARKETS_BACKOFF_SECONDS = int(os.getenv("NO_MARKETS_BACKOFF_SECONDS", "20"))
+# Auth (REQUIRED):
+KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "").strip()
+
+# Optional: Subaccount
+SUBACCOUNT = os.getenv("KALSHI_SUBACCOUNT", "").strip()  # e.g. "0" or empty
+
+# Timeouts
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
 
 
 # =========================
-# LOGGING
+# LOGGING (QUIET)
 # =========================
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Only emit INFO logs for actual trades. Everything else: WARNING/ERROR.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, LOG_LEVEL, logging.WARNING),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("bot")
+log = logging.getLogger("johnny5")
 
-
-# =========================
-# HELPERS
-# =========================
 
 def _now() -> float:
     return time.time()
 
-def _sleep(seconds: float) -> None:
-    time.sleep(max(0.0, seconds))
 
-def _safe_json(x: Any) -> Any:
-    """
-    Gamma sometimes returns JSON-encoded strings for fields that should be lists/dicts.
-    """
-    if isinstance(x, str):
-        s = x.strip()
-        if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
-            try:
-                return json.loads(s)
-            except Exception:
-                return x
-    return x
+def _sleep(sec: float) -> None:
+    time.sleep(max(0.0, sec))
 
-def _http_get(url: str, timeout: float, headers: Optional[Dict[str, str]] = None) -> Any:
-    r = requests.get(url, headers=headers or {}, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+
+# =========================
+# KALSHI CLIENT
+# =========================
+
+class KalshiClient:
+    """
+    Minimal Kalshi Trade API v2 client with RSA-PSS request signing.
+    """
+
+    def __init__(self, base_url: str, key_id: str, private_key_pem: bytes):
+        self.base_url = base_url.rstrip("/")
+        self.key_id = key_id
+        self.private_key = serialization.load_pem_private_key(private_key_pem, password=None)
+
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+
+    def _sign(self, timestamp_ms: str, method: str, path: str, body: str) -> str:
+        """
+        Kalshi signature: RSA-PSS over a canonical message.
+        We use a common canonical form: "{timestamp}{method}{path}{body}"
+        (This matches the standard approach described in Kalshi docs examples.)
+        """
+        msg = (timestamp_ms + method.upper() + path + body).encode("utf-8")
+
+        sig = self.private_key.sign(
+            msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(sig).decode("utf-8")
+
+    def _request(self, method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None) -> Any:
+        ts_ms = str(int(_now() * 1000))
+        body_str = "" if json_body is None else json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+
+        signature = self._sign(ts_ms, method, path, body_str)
+
+        headers = {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        }
+
+        url = f"{self.base_url}{path}"
+
+        r = self.session.request(
+            method=method.upper(),
+            url=url,
+            params=params or None,
+            data=None if json_body is None else body_str,
+            headers=headers,
+            timeout=HTTP_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # ---- API wrappers ----
+
+    def get_balance(self) -> Dict[str, Any]:
+        return self._request("GET", "/trade-api/v2/portfolio/balance")
+
+    def get_markets(self, status: str = "open", limit: int = 200, cursor: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"status": status, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return self._request("GET", "/trade-api/v2/markets", params=params)
+
+    def create_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/trade-api/v2/portfolio/orders", json_body=payload)
 
 
 # =========================
@@ -94,216 +166,253 @@ def _http_get(url: str, timeout: float, headers: Optional[Dict[str, str]] = None
 @dataclass
 class Market:
     ticker: str
-    slug: Optional[str]
-    start_ts: Optional[int]
-    end_ts: Optional[int]
-    is_open: bool
+    status: str
     raw: Dict[str, Any]
 
-@dataclass
-class BotState:
-    current_ticker: Optional[str] = None
-    cooldown_until: float = 0.0
-    last_no_markets_until: float = 0.0
-
 
 # =========================
-# MARKET DISCOVERY / SELECTION
+# MARKET DISCOVERY / PICK
 # =========================
 
-def fetch_open_markets_for_series(series: str) -> List[Market]:
+def fetch_open_markets_matching_prefix(client: KalshiClient, prefix: str) -> List[Market]:
     """
-    Pull markets from Gamma and filter to open markets in this series.
-
-    IMPORTANT: Gamma schema varies. You may need to tweak fields here to match your exact market objects.
+    Pull open markets, paginate, filter by ticker prefix.
     """
-    # Common gamma endpoint patterns vary; you may already have a working one.
-    # If yours differs, replace this URL with your known-good one.
-    # Examples seen in the wild:
-    #   /markets?closed=false&limit=100
-    #   /markets?series=<...>
-    #
-    # We'll do a broad fetch then filter locally:
-    url = f"{GAMMA_BASE_URL}/markets?closed=false&limit=200"
-    data = _http_get(url, timeout=GAMMA_TIMEOUT)
+    out: List[Market] = []
+    cursor: Optional[str] = None
 
-    markets: List[Market] = []
-    for m in data if isinstance(data, list) else data.get("markets", []):
-        mm = dict(m)
-        # Try to normalize fields (adjust as needed)
-        ticker = mm.get("ticker") or mm.get("marketTicker") or ""
-        if not ticker:
-            continue
+    # Keep pagination bounded to avoid runaway loops
+    for _ in range(20):
+        data = client.get_markets(status="open", limit=200, cursor=cursor)
+        items = data.get("markets") or data.get("data") or []
+        for m in items:
+            t = m.get("ticker") or ""
+            if t.startswith(prefix):
+                out.append(Market(ticker=t, status=m.get("status", "open"), raw=m))
+        cursor = data.get("cursor") or data.get("next_cursor")
+        if not cursor:
+            break
 
-        # series match: ticker starts with series + "-"
-        if not ticker.startswith(series + "-"):
-            continue
-
-        is_open = bool(mm.get("closed") is False) or bool(mm.get("isOpen", True))
-        # sometimes "closed" missing; use "active" or "status"
-        if "closed" in mm:
-            is_open = (mm["closed"] is False)
-
-        slug = mm.get("slug")
-        start_ts = mm.get("startTime") or mm.get("startTs") or mm.get("start_ts")
-        end_ts = mm.get("endTime") or mm.get("endTs") or mm.get("end_ts")
-
-        # ensure ints where possible
-        try:
-            start_ts = int(start_ts) if start_ts is not None else None
-        except Exception:
-            start_ts = None
-        try:
-            end_ts = int(end_ts) if end_ts is not None else None
-        except Exception:
-            end_ts = None
-
-        markets.append(Market(
-            ticker=ticker,
-            slug=slug,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            is_open=is_open,
-            raw=mm,
-        ))
-
-    # filter to open only
-    return [m for m in markets if m.is_open]
+    return out
 
 
-def pick_current_market(markets: List[Market], now_ts: Optional[int] = None) -> Optional[Market]:
+def pick_current_market(markets: List[Market]) -> Optional[Market]:
     """
-    Decide which market is "current".
-    Default rule: pick the open market whose [start_ts, end_ts] contains now.
-    If timestamps are missing, fall back to lexicographic latest ticker.
+    Simple selection:
+    - pick the lexicographically greatest ticker (often embeds time)
     """
     if not markets:
         return None
-
-    if now_ts is None:
-        now_ts = int(_now())
-
-    with_window = [m for m in markets if m.start_ts and m.end_ts]
-    if with_window:
-        active = [m for m in with_window if (m.start_ts <= now_ts < m.end_ts)]
-        if active:
-            # If multiple, pick the one with the nearest end_ts (soonest ending)
-            return sorted(active, key=lambda m: m.end_ts or 0)[0]
-
-        # If none active (clock skew or gaps), pick the one with the closest start_ts <= now
-        past = [m for m in with_window if (m.start_ts <= now_ts)]
-        if past:
-            return sorted(past, key=lambda m: m.start_ts or 0, reverse=True)[0]
-
-        # Otherwise pick earliest upcoming
-        future = [m for m in with_window if (m.start_ts > now_ts)]
-        if future:
-            return sorted(future, key=lambda m: m.start_ts or 0)[0]
-
-    # Fallback: pick "latest" ticker by sorting (works if tickers encode time)
     return sorted(markets, key=lambda m: m.ticker)[-1]
 
 
 # =========================
-# TRADING (HOOK YOUR LOGIC HERE)
+# STRATEGY (PLACEHOLDER)
 # =========================
 
-def compute_signal_for_market(market: Market) -> Tuple[str, Dict[str, Any]]:
+def compute_signal(market: Market) -> Tuple[str, Dict[str, Any]]:
     """
     Replace this with your real strategy.
-    Return: (signal_name, debug_dict)
+    Return:
+      ("NO_TRADE", {...}) OR ("BUY_YES"/"BUY_NO"/"SELL_YES"/"SELL_NO", {...})
+
+    Right now: placeholder => never trades.
     """
-    # Placeholder strategy: do nothing
-    return ("NO", {"reason": "placeholder"})
+    return ("NO_TRADE", {"reason": "strategy_placeholder"})
 
 
-def place_trade_if_needed(market: Market, signal: str, debug: Dict[str, Any]) -> None:
+def build_order_payload(market_ticker: str, action: str, side: str, count: int) -> Dict[str, Any]:
     """
-    Replace this with your real order placement logic.
-    """
-    if signal == "NO":
-        return
+    Minimal order payload for Kalshi Create Order.
 
-    # Example: stub
-    if LIVE_MODE:
-        log.info("LIVE trade would be placed here | ticker=%s signal=%s debug=%s", market.ticker, signal, debug)
-    else:
-        log.info("PAPER trade | ticker=%s signal=%s debug=%s", market.ticker, signal, debug)
+    We use market orders indirectly by setting a price; but since we don’t have
+    your pricing logic here, we leave price out of the placeholder trade flow.
+    When you wire your strategy, you will set yes_price/no_price.
+
+    Docs: POST /trade-api/v2/portfolio/orders
+    """
+    payload: Dict[str, Any] = {
+        "ticker": market_ticker,
+        "action": action,   # "buy" or "sell"
+        "side": side,       # "yes" or "no"
+        "count": int(count),
+        "client_order_id": str(uuid.uuid4()),
+        # You should set one of:
+        #  - "yes_price": int cents 1..99
+        #  - "no_price": int cents 1..99
+        #
+        # Example:
+        # "yes_price": 54
+        # (meaning $0.54)
+        #
+        # And optionally:
+        # "time_in_force": "fill_or_kill" / "good_til_cancelled" etc.
+    }
+    if SUBACCOUNT:
+        try:
+            payload["subaccount"] = int(SUBACCOUNT)
+        except Exception:
+            pass
+    return payload
 
 
 # =========================
-# MAIN LOOP (ROLLOVER-SAFE)
+# MAIN
 # =========================
 
-def maybe_rollover(state: BotState, target_market: Optional[Market]) -> None:
+def dollars_from_balance_resp(balance_resp: Dict[str, Any]) -> float:
     """
-    Apply rollover once when ticker changes. Sets cooldown timer.
+    Balance response shape can vary; we defensively try common fields.
+    Many Kalshi money fields are in cents.
     """
-    if target_market is None:
-        return
+    # Common possibilities:
+    # balance_resp["balance"]["available_cash"] or similar
+    b = balance_resp.get("balance") if isinstance(balance_resp.get("balance"), dict) else balance_resp
 
-    if state.current_ticker != target_market.ticker:
-        state.current_ticker = target_market.ticker
-        state.cooldown_until = _now() + ROLLOVER_COOLDOWN_SECONDS
-        log.info("Market rollover -> current ticker=%s", state.current_ticker)
-        log.info("Cooldown at rollover (%ss) — waiting.", ROLLOVER_COOLDOWN_SECONDS)
+    for key in ("equity", "balance", "available_cash", "cash_balance", "available_balance"):
+        v = b.get(key)
+        if v is None:
+            continue
+        # if already float dollars
+        if isinstance(v, float):
+            return float(v)
+        # if int cents
+        if isinstance(v, int):
+            return v / 100.0
+        # if string
+        if isinstance(v, str):
+            try:
+                # could be dollars or cents; assume dollars if it has a decimal point
+                if "." in v:
+                    return float(v)
+                return int(v) / 100.0
+            except Exception:
+                continue
+
+    # If nothing matched, return 0
+    return 0.0
 
 
 def run() -> None:
-    state = BotState()
+    if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_PATH:
+        raise SystemExit(
+            "Missing required env vars: KALSHI_KEY_ID and/or KALSHI_PRIVATE_KEY_PATH"
+        )
 
-    log.info("BOOT: bot.py starting")
-    log.info("series=%s poll=%ss cooldown=%ss live=%s", SERIES, POLL_SECONDS, ROLLOVER_COOLDOWN_SECONDS, LIVE_MODE)
+    with open(KALSHI_PRIVATE_KEY_PATH, "rb") as f:
+        private_key_pem = f.read()
+
+    client = KalshiClient(
+        base_url=KALSHI_BASE_URL,
+        key_id=KALSHI_KEY_ID,
+        private_key_pem=private_key_pem,
+    )
+
+    # One boot line (you can silence this too by setting LOG_LEVEL=ERROR)
+    log.warning("BOOT: Johnny 5 starting | kalshi=%s | prefix=%s | live=%s", KALSHI_BASE_URL, MARKET_PREFIX, LIVE_MODE)
+
+    # Track equity baseline for simple PnL
+    try:
+        start_bal = client.get_balance()
+        start_equity = dollars_from_balance_resp(start_bal)
+    except Exception:
+        start_equity = 0.0
+
+    consecutive_no_markets = 0
+    current_ticker: Optional[str] = None
 
     while True:
-        now = _now()
-
-        # If we are in cooldown, do NOT recompute rollover; just wait.
-        if now < state.cooldown_until:
-            _sleep(min(POLL_SECONDS, state.cooldown_until - now))
-            continue
-
-        # If we recently saw "no markets", back off a bit.
-        if now < state.last_no_markets_until:
-            _sleep(POLL_SECONDS)
-            continue
-
-        # Fetch open markets
         try:
-            markets = fetch_open_markets_for_series(SERIES)
+            markets = fetch_open_markets_matching_prefix(client, MARKET_PREFIX)
         except Exception as e:
-            log.warning("Failed to fetch markets: %s", e)
-            _sleep(POLL_SECONDS)
+            # Quiet by default; treat as "no markets" and long sleep
+            consecutive_no_markets += 1
+            if consecutive_no_markets >= STOP_AFTER_NO_MARKETS:
+                raise SystemExit(f"Exiting after repeated failures fetching markets ({consecutive_no_markets}). Last error: {e}")
+            _sleep(LONG_SLEEP_SECONDS)
             continue
 
         if not markets:
-            log.warning("No open markets found for series=%s", SERIES)
-            state.last_no_markets_until = _now() + NO_MARKETS_BACKOFF_SECONDS
-            _sleep(POLL_SECONDS)
+            consecutive_no_markets += 1
+            if consecutive_no_markets >= STOP_AFTER_NO_MARKETS:
+                raise SystemExit(f"Exiting: no open markets for prefix={MARKET_PREFIX} after {consecutive_no_markets} checks.")
+            _sleep(LONG_SLEEP_SECONDS)
             continue
 
-        # Pick the market that should be current
+        # healthy
+        consecutive_no_markets = 0
+
         target = pick_current_market(markets)
+        if target is None:
+            _sleep(LONG_SLEEP_SECONDS)
+            continue
 
-        # Perform rollover at most once per new ticker
-        maybe_rollover(state, target)
+        if current_ticker != target.ticker:
+            current_ticker = target.ticker
+            # No log here (keeps it quiet)
 
-        # If cooldown just started, loop will sleep next tick
-        if _now() < state.cooldown_until:
+        # Strategy decision
+        signal, dbg = compute_signal(target)
+
+        if signal == "NO_TRADE":
             _sleep(POLL_SECONDS)
             continue
 
-        # Trade on current market
-        current = next((m for m in markets if m.ticker == state.current_ticker), None)
-        if current is None:
-            # If current ticker vanished from open list, force selection next loop
-            log.warning("Current ticker not in open list; will reselect. current=%s", state.current_ticker)
-            state.current_ticker = None
+        # Map signal -> order
+        # Expected formats: BUY_YES, BUY_NO, SELL_YES, SELL_NO
+        try:
+            action, side = signal.split("_", 1)
+            action = action.lower()  # buy/sell
+            side = side.lower()      # yes/no
+            if action not in ("buy", "sell") or side not in ("yes", "no"):
+                raise ValueError("bad signal")
+        except Exception:
+            # If signal is malformed, just skip quietly
             _sleep(POLL_SECONDS)
             continue
 
-        signal, dbg = compute_signal_for_market(current)
-        place_trade_if_needed(current, signal, dbg)
+        count = min(MAX_ORDER_COUNT, int(dbg.get("count", MAX_ORDER_COUNT)))
+        payload = build_order_payload(target.ticker, action=action, side=side, count=count)
+
+        # IMPORTANT: you MUST set yes_price/no_price in dbg or inside compute_signal()
+        # before live trading can work.
+        if side == "yes" and "yes_price" in dbg:
+            payload["yes_price"] = int(dbg["yes_price"])
+        elif side == "no" and "no_price" in dbg:
+            payload["no_price"] = int(dbg["no_price"])
+        else:
+            # no price => skip (prevents accidental market-like behavior)
+            _sleep(POLL_SECONDS)
+            continue
+
+        # Execute
+        if LIVE_MODE:
+            resp = client.create_order(payload)
+            mode = "LIVE"
+        else:
+            resp = {"paper": True, "payload": payload}
+            mode = "PAPER"
+
+        # Balance + PnL snapshot (logged ONLY when trade happens)
+        try:
+            bal = client.get_balance()
+            equity = dollars_from_balance_resp(bal)
+        except Exception:
+            equity = 0.0
+
+        pnl = equity - start_equity if start_equity else 0.0
+
+        log.info(
+            "TRADE | mode=%s | ticker=%s | %s_%s | count=%s | px=%s | equity=%.2f | pnl=%.2f",
+            mode,
+            target.ticker,
+            action.upper(),
+            side.upper(),
+            payload.get("count"),
+            dbg.get("yes_price") if side == "yes" else dbg.get("no_price"),
+            equity,
+            pnl,
+        )
 
         _sleep(POLL_SECONDS)
 

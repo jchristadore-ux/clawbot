@@ -46,6 +46,42 @@ def env_float(name: str, default: float) -> float:
         return default
     return float(v)
 
+def parse_iso(ts: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def prune_24h(state: BotState) -> None:
+    if not state.trade_history_24h:
+        state.trade_history_24h = []
+        return
+    now = datetime.now(timezone.utc)
+    keep: list[dict[str, Any]] = []
+    for t in state.trade_history_24h:
+        ts = t.get("ts")
+        dt = parse_iso(ts) if isinstance(ts, str) else None
+        if dt and (now - dt) <= timedelta(hours=24):
+            keep.append(t)
+    state.trade_history_24h = keep
+
+def record_trade_24h(state: BotState, typ: str, pnl: float) -> None:
+    if state.trade_history_24h is None:
+        state.trade_history_24h = []
+    state.trade_history_24h.append({"ts": utc_iso(), "type": typ, "pnl": float(pnl)})
+    prune_24h(state)
+
+def summarize_24h(state: BotState) -> tuple[int, float]:
+    prune_24h(state)
+    trades = len(state.trade_history_24h or [])
+    pnl = 0.0
+    for t in state.trade_history_24h or []:
+        try:
+            pnl += float(t.get("pnl", 0.0))
+        except Exception:
+            pass
+    return trades, pnl
+
 
 # =============================================================================
 # Runtime config
@@ -103,19 +139,22 @@ def ensure_runtime_dir() -> None:
 # =============================================================================
 # State
 # =============================================================================
-
 @dataclass
 class BotState:
-    equity: float = START_EQUITY
-    realized_pnl: float = 0.0
-    daily_realized_pnl: float = 0.0
-    trades: int = 0
+    equity: float = START_EQUITY                 # cash balance (realized)
+    realized_pnl: float = 0.0                    # lifetime realized pnl (paper accounting)
+    daily_realized_pnl: float = 0.0              # kept for compatibility; no longer the “main” 24h metric
+    trades: int = 0                              # lifetime trade count
     last_day: str = ""
-    position_side: Optional[str] = None  # "YES" or "NO"
+
+    # Position
+    position_side: Optional[str] = None          # "YES" or "NO"
     position_entry_prob: Optional[float] = None
     position_contracts: int = 0
     market_ticker: Optional[str] = None
 
+    # Rolling 24h metrics (persisted)
+    trade_history_24h: list[dict[str, Any]] = None  # list of {"ts": "...Z", "type": "ENTER/EXIT", "pnl": float}
 
 def load_state() -> BotState:
     if not STATE_FILE.exists():
@@ -124,6 +163,8 @@ def load_state() -> BotState:
         return s
     raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     s = BotState(**raw)
+    if s.trade_history_24h is None:
+        s.trade_history_24h = []
     if not s.last_day:
         s.last_day = datetime.now(timezone.utc).date().isoformat()
     return s
@@ -454,13 +495,20 @@ def mark_yes_from_orderbook(orderbook: dict[str, Any], ticker: str = "") -> Opti
 # =============================================================================
 # Trading
 # =============================================================================
+def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, edge: float, note: str = "", pnl_delta: float = 0.0) -> None:
+    # Update rolling 24h stats
+    record_trade_24h(state, event, pnl_delta)
+    trades_24h, pnl_24h = summarize_24h(state)
 
-def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, edge: float, note: str = "") -> None:
+    # Compute unrealized for equity
     unrealized = 0.0
     if state.position_side == "YES" and state.position_entry_prob is not None:
         unrealized = (mark_yes - state.position_entry_prob) * state.position_contracts
     elif state.position_side == "NO" and state.position_entry_prob is not None:
         unrealized = ((1.0 - mark_yes) - state.position_entry_prob) * state.position_contracts
+
+    total_equity = state.equity + unrealized  # cash + unrealized
+    cash_balance = state.equity
 
     print(
         json.dumps(
@@ -469,10 +517,15 @@ def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, ed
                 "event": event,
                 "note": note,
                 "live": LIVE_MODE,
-                "equity": round(state.equity + unrealized, 4),
-                "cash": round(state.equity, 4),
-                "realized_pnl": round(state.realized_pnl, 4),
-                "daily_realized_pnl": round(state.daily_realized_pnl, 4),
+
+                # what you asked for:
+                "balance_cash": round(cash_balance, 4),
+                "equity_total": round(total_equity, 4),
+                "pnl_24h_realized": round(pnl_24h, 4),
+                "trades_24h": trades_24h,
+
+                # extra context (still useful):
+                "pnl_lifetime_realized": round(state.realized_pnl, 4),
                 "position": {
                     "side": state.position_side,
                     "contracts": state.position_contracts,
@@ -486,8 +539,6 @@ def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, ed
         ),
         flush=True,
     )
-
-
 def maybe_enter(state: BotState, ticker: str, fair_yes: float, mark_yes: float, z: float, client: KalshiClient) -> bool:
     if state.position_side is not None:
         return False
@@ -518,7 +569,7 @@ def maybe_enter(state: BotState, ticker: str, fair_yes: float, mark_yes: float, 
     state.market_ticker = ticker
     state.trades += 1
 
-    emit_trade("ENTER", state, mark_yes, fair_yes, edge)
+    emit_trade("ENTER", state, mark_yes, fair_yes, edge, pnl_delta=0.0)
     return True
 
 
@@ -560,7 +611,7 @@ def maybe_exit(state: BotState, fair_yes: float, mark_yes: float, client: Kalshi
     state.market_ticker = None
     state.trades += 1
 
-    emit_trade("EXIT", state, mark_yes, fair_yes, edge, note=f"pnl={pnl:.4f}")
+    emit_trade("EXIT", state, mark_yes, fair_yes, edge, note=f"pnl={pnl:.4f}", pnl_delta=pnl)
     return True
 
 

@@ -1,19 +1,11 @@
-diff --git a/function-bun/package.json b/function-bun/package.json
-index f217b9070eec52cbc20bc8cd94e8018136dffb26..2e14dec92bbd9b8dad0764d2a95beabdb84ee39e 100644
---- a/function-bun/package.json
-+++ b/function-bun/package.json
-@@ -1,12 +1,11 @@
- {
--  "name": "function-bun",
-+  "name": "kalshi-order-gateway",
-   "private": true,
-   "type": "module",
-   "scripts": {
-     "start": "bun run index.ts"
-   },
-   "dependencies": {
--    "hono": "latest",
--    "@polymarket/clob-client": "latest"
-+    "hono": "4.6.10"
-   }
- }
+{
+  "name": "kalshi-order-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts"
+  },
+  "dependencies": {
+    "hono": "4.6.10"
+  }
+}

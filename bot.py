@@ -16,6 +16,8 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+print("BOT_VERSION=2026-03-02_24H_METRICS_v1", flush=True)
+
 
 # =============================================================================
 # Safe env helpers (Railway blank-var proof)

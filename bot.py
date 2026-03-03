@@ -688,6 +688,8 @@ def main() -> None:
             ticker = str(m["ticker"])
 
             ob = client.get_orderbook(ticker)
+            if DEBUG_BOOK_DUMP and debug_throttle("raw_book", 60):
+                print(json.dumps({"ts": utc_iso(), "event": "RAW_BOOK", "book": ob}), flush=True)
             mark_yes = mark_yes_from_orderbook(ob, ticker=ticker)
 
             # If we cannot compute a real mark from the orderbook, do not trade.

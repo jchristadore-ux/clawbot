@@ -807,12 +807,22 @@ def main() -> None:
             best_yes_bid, best_no_bid = parse_best_bids(ob)
             mark_yes = mark_yes_from_book(best_yes_bid, best_no_bid)
 
+            if debug_throttle("markdbg", 60):
+                print(json.dumps({
+                    "ts": utc_iso(),
+                    "event": "MARK_DEBUG",
+                    "ticker": ticker,
+                    "best_yes_bid": best_yes_bid,
+                    "best_no_bid": best_no_bid,
+                    "mark_yes": mark_yes
+                }), flush=True)
+
             # If book is missing either side, do not trade.
-            if mark_yes is None:
-                write_status(state, "one_sided_or_empty_book", ticker=ticker, mark_yes=None, fair_yes=0.5, z=0.0, edge=0.0)
+            if mark_yes is None or abs(mark_yes - 0.5) < 1e-9:
+                write_status(state, "bad_mark_skip", ticker=ticker, mark_yes=mark_yes, fair_yes=0.5, z=0.0, edge=0.0)
                 save_state(state)
                 time.sleep(max(3.0, POLL_SECONDS))
-                continue
+                 continue
 
             fair_yes, z = model_fair_yes(prices)
             edge = fair_yes - mark_yes

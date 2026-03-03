@@ -822,7 +822,7 @@ def main() -> None:
                 write_status(state, "bad_mark_skip", ticker=ticker, mark_yes=mark_yes, fair_yes=0.5, z=0.0, edge=0.0)
                 save_state(state)
                 time.sleep(max(3.0, POLL_SECONDS))
-                 continue
+                continue
 
             fair_yes, z = model_fair_yes(prices)
             edge = fair_yes - mark_yes

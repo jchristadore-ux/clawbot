@@ -466,38 +466,59 @@ def _top_price(level: Any) -> Optional[int]:
     return None
 
 def mark_yes_from_orderbook(orderbook: dict[str, Any], ticker: str = "") -> Optional[float]:
-    yes_bids, no_bids = _levels(orderbook)
+    root = orderbook.get("orderbook", orderbook)
+    yes = root.get("yes_bids") or root.get("yes") or []
+    no = root.get("no_bids") or root.get("no") or []
 
-    best_yes = _top_price(yes_bids[0]) if yes_bids else None
-    best_no = _top_price(no_bids[0]) if no_bids else None
+    if not isinstance(yes, list):
+        yes = []
+    if not isinstance(no, list):
+        no = []
 
-    # If both sides empty -> no liquidity right now; skip quietly
-    if best_yes is None and best_no is None:
-        if DEBUG_BOOK_DUMP and debug_throttle(f"empty_book:{ticker}", 60):
-            preview = {"ticker": ticker, "yes_len": len(yes_bids), "no_len": len(no_bids)}
-            print(json.dumps({"ts": utc_iso(), "event": "EMPTY_BOOK", "preview": preview}), flush=True)
+    def top_price(levels: list[Any]) -> Optional[int]:
+        if not levels:
+            return None
+        lvl = levels[0]
+        if isinstance(lvl, list) and len(lvl) >= 1:
+            try:
+                return int(lvl[0])
+            except Exception:
+                return None
+        if isinstance(lvl, dict) and "price" in lvl:
+            try:
+                return int(lvl["price"])
+            except Exception:
+                return None
         return None
 
-    # If one side missing, fall back to a conservative estimate:
-    # - if only YES bid exists: assume implied ask is 100 - best_yes (worst-ish), mid around best_yes
-    # - if only NO bid exists: implied YES ask is 100 - best_no; mid around that
+    best_yes = top_price(yes)
+    best_no = top_price(no)
+
+    # Both sides empty -> no mark -> skip
+    if best_yes is None and best_no is None:
+        return None
+
+    # One-sided fallback (still a real number, but conservative)
     if best_yes is None and best_no is not None:
         implied_yes_ask = 100 - best_no
-        mid_yes = implied_yes_ask  # conservative: use ask-like level
-    elif best_no is None and best_yes is not None:
-        mid_yes = best_yes  # conservative: use bid-like level
-    else:
-        implied_yes_ask = 100 - int(best_no)
-        mid_yes = (int(best_yes) + implied_yes_ask) / 2.0
+        p = implied_yes_ask / 100.0
+        return max(0.01, min(0.99, p))
 
-    p = max(0.01, min(0.99, float(mid_yes) / 100.0))
-    return p
+    if best_no is None and best_yes is not None:
+        p = best_yes / 100.0
+        return max(0.01, min(0.99, p))
+
+    # Two-sided midpoint
+    implied_yes_ask = 100 - best_no
+    mid_yes = (best_yes + implied_yes_ask) / 2.0
+    p = mid_yes / 100.0
+    return max(0.01, min(0.99, p))
 
 
 # =============================================================================
 # Trading
 # =============================================================================
-def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, edge: float, note: str = "", pnl_delta: float = 0.0) -> None:
+def emit_trade(event: str, state: BotState, : float, fair_yes: float, edge: float, note: str = "", pnl_delta: float = 0.0) -> None:
     # Update rolling 24h stats
     record_trade_24h(state, event, pnl_delta)
     trades_24h, pnl_24h = summarize_24h(state)
@@ -505,9 +526,9 @@ def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, ed
     # Compute unrealized for equity
     unrealized = 0.0
     if state.position_side == "YES" and state.position_entry_prob is not None:
-        unrealized = (mark_yes - state.position_entry_prob) * state.position_contracts
+        unrealized = ( - state.position_entry_prob) * state.position_contracts
     elif state.position_side == "NO" and state.position_entry_prob is not None:
-        unrealized = ((1.0 - mark_yes) - state.position_entry_prob) * state.position_contracts
+        unrealized = ((1.0 - ) - state.position_entry_prob) * state.position_contracts
 
     total_equity = state.equity + unrealized  # cash + unrealized
     cash_balance = state.equity
@@ -534,14 +555,14 @@ def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, ed
                     "entry_prob": state.position_entry_prob,
                     "market_ticker": state.market_ticker,
                 },
-                "market_yes": round(mark_yes, 6),
+                "market_yes": round(, 6),
                 "fair_yes": round(fair_yes, 6),
                 "edge": round(edge, 6),
             }
         ),
         flush=True,
     )
-def maybe_enter(state: BotState, ticker: str, fair_yes: float, mark_yes: float, z: float, client: KalshiClient) -> bool:
+def maybe_enter(state: BotState, ticker: str, fair_yes: float, : float, z: float, client: KalshiClient) -> bool:
     if state.position_side is not None:
         return False
     if state.daily_realized_pnl <= -abs(MAX_DAILY_LOSS):
@@ -668,9 +689,10 @@ def main() -> None:
 
             ob = client.get_orderbook(ticker)
             mark_yes = mark_yes_from_orderbook(ob, ticker=ticker)
+
+            # If we cannot compute a real mark from the orderbook, do not trade.
             if mark_yes is None:
-                # No liquidity / empty book — this is normal, skip quietly (no error spam)
-                write_status(state, message="empty_orderbook", fair_yes=0.5, mark_yes=0.5, edge=0.0)
+                write_status(state, message="empty_or_one_sided_orderbook", fair_yes=0.5, mark_yes=0.5, edge=0.0)
                 save_state(state)
                 time.sleep(max(3.0, POLL_SECONDS))
                 continue

@@ -484,23 +484,30 @@ def _top_price(levels: Any) -> Optional[int]:
 def parse_best_bids(orderbook: dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
     """
     Returns: (best_yes_bid_cents, best_no_bid_cents)
+    Kalshi orderbook here is shaped like:
+      {"orderbook": {"yes": [[price_cents, qty], ...], "no": [[price_cents, qty], ...], ...}}
     """
     root = orderbook.get("orderbook", orderbook)
-    yes = root.get("yes_bids") or root.get("yes") or []
-    no = root.get("no_bids") or root.get("no") or []
-    best_yes = _top_price(yes)
-    best_no = _top_price(no)
+
+    yes_levels = root.get("yes") or root.get("yes_bids") or []
+    no_levels = root.get("no") or root.get("no_bids") or []
+
+    best_yes = _top_price(yes_levels)
+    best_no = _top_price(no_levels)
     return best_yes, best_no
+
 
 def mark_yes_from_book(best_yes_bid: Optional[int], best_no_bid: Optional[int]) -> Optional[float]:
     """
-    Compute a usable mark for YES probability. Requires both sides.
-    If either side missing, return None (skip trading).
+    We need BOTH sides to compute a defensible midpoint:
+      YES bid is best_yes_bid
+      YES ask is implied by (100 - best_no_bid)
     """
     if best_yes_bid is None or best_no_bid is None:
         return None
-    implied_yes_ask = 100 - best_no_bid
-    mid_yes_cents = (best_yes_bid + implied_yes_ask) / 2.0
+
+    implied_yes_ask = 100 - int(best_no_bid)
+    mid_yes_cents = (int(best_yes_bid) + implied_yes_ask) / 2.0
     p = mid_yes_cents / 100.0
     return max(0.01, min(0.99, p))
 

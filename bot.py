@@ -528,7 +528,7 @@ def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, ed
     if state.position_side == "YES" and state.position_entry_prob is not None:
         unrealized = ( - state.position_entry_prob) * state.position_contracts
     elif state.position_side == "NO" and state.position_entry_prob is not None:
-        unrealized = ((1.0 - ) - state.position_entry_prob) * state.position_contracts
+        unrealized = ((1.0 - mark_yes) - state.position_entry_prob) * state.position_contracts
 
     total_equity = state.equity + unrealized  # cash + unrealized
     cash_balance = state.equity

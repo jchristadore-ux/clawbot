@@ -34,14 +34,14 @@ state = {
 def utc():
     return datetime.now(timezone.utc).isoformat()
 
-
 def save_state():
+    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
-
 def load_state():
     global state
+    os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             state = json.load(f)

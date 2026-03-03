@@ -518,7 +518,7 @@ def mark_yes_from_orderbook(orderbook: dict[str, Any], ticker: str = "") -> Opti
 # =============================================================================
 # Trading
 # =============================================================================
-def emit_trade(event: str, state: BotState, : float, fair_yes: float, edge: float, note: str = "", pnl_delta: float = 0.0) -> None:
+def emit_trade(event: str, state: BotState, mark_yes: float, fair_yes: float, edge: float, note: str = "", pnl_delta: float = 0.0) -> None:
     # Update rolling 24h stats
     record_trade_24h(state, event, pnl_delta)
     trades_24h, pnl_24h = summarize_24h(state)

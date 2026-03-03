@@ -349,40 +349,43 @@ class KalshiClient:
         markets = data.get("markets", [])
         return markets if isinstance(markets, list) else []
 
-    @staticmethod
+   @staticmethod
     def pick_active_market(markets: List[dict[str, Any]]) -> Optional[dict[str, Any]]:
-        # Prefer market where open_time <= now < close_time; else soonest close in future.
+        ""
+        Choose active market with highest total bid liquidity.
+        """
         now = datetime.now(timezone.utc)
 
         def parse_ts(x: Any) -> Optional[datetime]:
             if not isinstance(x, str) or not x:
-                return None
+                 return None
             try:
                 return datetime.fromisoformat(x.replace("Z", "+00:00"))
             except Exception:
                 return None
 
-        active: list[tuple[datetime, dict[str, Any]]] = []
-        future: list[tuple[datetime, dict[str, Any]]] = []
+        candidates = []
 
         for m in markets:
-            if not isinstance(m, dict):
-                continue
             ot = parse_ts(m.get("open_time") or m.get("open_ts"))
             ct = parse_ts(m.get("close_time") or m.get("close_ts"))
-            if ot and ct:
-                if ot <= now < ct:
-                    active.append((ct, m))
-                elif ct >= now:
-                    future.append((ct, m))
+            if not ot or not ct:
+                continue
+            if not (ot <= now < ct):
+                continue
 
-        if active:
-            active.sort(key=lambda x: x[0])
-            return active[0][1]
-        if future:
-            future.sort(key=lambda x: x[0])
-            return future[0][1]
-        return markets[0] if markets else None
+            # crude liquidity proxy: volume or open_interest
+            vol = m.get("volume") or 0
+            oi = m.get("open_interest") or 0
+            score = float(vol) + float(oi)
+
+            candidates.append((score, m))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
 
     def get_orderbook(self, ticker: str) -> dict[str, Any]:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")

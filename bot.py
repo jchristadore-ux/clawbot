@@ -349,7 +349,7 @@ class KalshiClient:
         markets = data.get("markets", [])
         return markets if isinstance(markets, list) else []
 
-   @staticmethod
+    @staticmethod
     def pick_active_market(markets: List[dict[str, Any]]) -> Optional[dict[str, Any]]:
         ""
         Choose active market with highest total bid liquidity.

@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Johnny5 — Kalshi BTC-15M Trading Bot  (PRODUCTION v3)
+Johnny5 — Kalshi BTC-15M Trading Bot  (PRODUCTION v4)
 ======================================================
 Single-file, Railway-deployable. Postgres-backed idempotency.
 
-Changes from v2:
-  - RSA signing switched from PKCS1v15 → RSA-PSS (salt_length=32) to fix
-    INCORRECT_API_KEY_SIGNATURE on balance/positions endpoints
-  - z-score gate now correctly blocks entry when abs(z) < MIN_CONVICTION_Z
-    regardless of edge magnitude
-  - Both z AND edge must pass independently to enter
+Changes from v3:
+  - Replaced z-score momentum model with binary option pricing model
+    (digital call: fair_yes = Φ(d) where d uses log-distance to strike,
+     realized volatility, and time remaining in the bucket)
+  - Strike parsed from market API fields (floor_strike / cap_strike)
+    rather than guessed from ticker suffix
+  - Three new entry guards:
+      MIN_SECS_BEFORE_EXPIRY  — no entry if < 2 min left (120s default)
+      MAX_SECS_BEFORE_EXPIRY  — no entry if > 12 min left (720s default)
+      MIN_EDGE_CENTS          — minimum mispricing in cents (5¢ default)
+  - Volatility window: 30 prices (SHORT, ~5 min at 10s poll)
+  - Model logs: spot, strike, T_remaining, sigma, d, fair_yes on every loop
 """
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -110,9 +117,9 @@ def secs_since(ts: Optional[str]) -> float:
     return (datetime.now(timezone.utc) - dt).total_seconds()
 
 # =============================================================================
-# Config — all from env, safe defaults for a $50 account
+# Config
 # =============================================================================
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_PROD_v3"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_PROD_v4"
 
 # Kalshi
 KALSHI_BASE_URL          = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -136,20 +143,40 @@ STATUS_FILE  = Path(env_str("STATUS_FILE", ".runtime/status.json"))
 _CB_FILE     = Path(".runtime/circuit_breaker.json")
 
 # Price feed
-KRAKEN_TICKER_URL = env_str("KRAKEN_TICKER_URL", "https://api.kraken.com/0/public/Ticker?pair=XBTUSD")
+KRAKEN_TICKER_URL = env_str(
+    "KRAKEN_TICKER_URL", "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
+)
 
-# Strategy
-LOOKBACK         = env_int("LOOKBACK", 20)
-FAIR_MOVE_SCALE  = env_float("FAIR_MOVE_SCALE", 0.15)
-MIN_CONVICTION_Z = env_float("MIN_CONVICTION_Z", 1.5)   # BOTH z AND edge must pass independently
-EDGE_ENTER       = env_float("EDGE_ENTER", 0.08)
-EDGE_EXIT        = env_float("EDGE_EXIT", 0.02)
+# =============================================================================
+# Model config — binary option pricing
+# =============================================================================
+# Volatility: 30-price rolling window, annualised from 10s returns
+# 30 * 10s = ~5 minutes of history
+VOL_WINDOW        = env_int("VOL_WINDOW", 30)
 
+# Fallback annualised σ when we don't have enough prices yet.
+# BTC typical daily vol ~3-4%, annualised ~55-75%.  0.65 is conservative mid.
+VOL_FLOOR         = env_float("VOL_FLOOR", 0.65)
+VOL_CAP           = env_float("VOL_CAP", 3.0)   # cap at 300% ann. to avoid absurd fairs
+
+# Edge gate: minimum difference between our fair_yes and the book mid (in cents).
+# e.g. 5 means we need 5¢ of mispricing before entering.
+MIN_EDGE_CENTS    = env_int("MIN_EDGE_CENTS", 5)
+
+# Time-in-bucket guards (seconds)
+MIN_SECS_BEFORE_EXPIRY = env_int("MIN_SECS_BEFORE_EXPIRY", 120)   # don't enter < 2 min left
+MAX_SECS_BEFORE_EXPIRY = env_int("MAX_SECS_BEFORE_EXPIRY", 720)   # don't enter > 12 min left
+
+# =============================================================================
 # Risk / sizing — conservative for $50
+# =============================================================================
 MAX_POSITION_USD        = env_float("MAX_POSITION_USD", 5.0)
 RISK_FRACTION           = env_float("RISK_FRACTION", 0.06)
 MAX_CONTRACTS           = env_int("MAX_CONTRACTS_PER_TICKER", 8)
 MAX_NOTIONAL_PER_TICKER = env_float("MAX_NOTIONAL_PER_TICKER", 6.0)
+
+# Exit: close when our edge has collapsed to this many cents or less
+EXIT_EDGE_CENTS   = env_int("EXIT_EDGE_CENTS", 1)
 
 # Circuit breakers
 MAX_DAILY_LOSS      = env_float("MAX_DAILY_LOSS_DOLLARS", 8.0)
@@ -169,9 +196,7 @@ MAX_SPREAD_CENTS    = env_int("MAX_SPREAD_CENTS", 8)
 MIN_DEPTH_CONTRACTS = env_int("MIN_DEPTH_CONTRACTS", 3)
 MAX_SLIPPAGE_CENTS  = env_int("MAX_SLIPPAGE_CENTS", 4)
 
-# Expired-market guard: clear local position after this many consecutive
-# null-book loops (best_yes=null AND best_no=null) on a held ticker.
-# At POLL_SECONDS=10, 6 loops = ~60s of dead book before giving up.
+# Expired-market guard
 NULL_BOOK_EXPIRE_LOOPS = env_int("NULL_BOOK_EXPIRE_LOOPS", 6)
 
 # Control switches
@@ -181,7 +206,7 @@ ALLOW_PYRAMIDING     = env_bool("ALLOW_PYRAMIDING", False)
 
 # Debug
 DEBUG_ERRORS    = env_bool("DEBUG_ERRORS", False)
-DEBUG_MARK      = env_bool("DEBUG_MARK", False)
+DEBUG_MODEL     = env_bool("DEBUG_MODEL", False)    # logs fair_yes calculation each loop
 DEBUG_PICK      = env_bool("DEBUG_PICK", False)
 DEBUG_BOOK_DUMP = env_bool("DEBUG_BOOK_DUMP", False)
 
@@ -196,11 +221,13 @@ def send_telegram(message: str) -> None:
             return
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message, "disable_web_page_preview": True},
+            json={"chat_id": chat_id, "text": message,
+                  "disable_web_page_preview": True},
             timeout=10,
         )
         if r.status_code != 200:
-            jlog("warning", "telegram_fail", status=r.status_code, body=r.text[:200])
+            jlog("warning", "telegram_fail",
+                 status=r.status_code, body=r.text[:200])
     except Exception as e:
         jlog("warning", "telegram_error", error=str(e)[:200])
 
@@ -319,7 +346,9 @@ def make_trade_key(ticker: str, bucket_ts: str, intent: str, side: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 def trade_key_status(trade_key: str) -> Optional[str]:
-    row = db_fetchone("SELECT status FROM j5_trades WHERE trade_key=%s", (trade_key,))
+    row = db_fetchone(
+        "SELECT status FROM j5_trades WHERE trade_key=%s", (trade_key,)
+    )
     return row[0] if row else None
 
 def upsert_trade(
@@ -336,7 +365,8 @@ def upsert_trade(
            ON CONFLICT (trade_key) DO UPDATE SET
                status=EXCLUDED.status,
                order_id=COALESCE(EXCLUDED.order_id, j5_trades.order_id),
-               client_order_id=COALESCE(EXCLUDED.client_order_id, j5_trades.client_order_id),
+               client_order_id=COALESCE(EXCLUDED.client_order_id,
+                                        j5_trades.client_order_id),
                reason=COALESCE(EXCLUDED.reason, j5_trades.reason),
                updated_at=NOW()
         """,
@@ -349,15 +379,15 @@ def upsert_trade(
 # =============================================================================
 @dataclass
 class CBState:
-    halted:        bool           = False
-    halt_reason:   str            = ""
-    daily_loss:    float          = 0.0
-    daily_trades:  int            = 0
-    hourly_orders: int            = 0
-    consec_errors: int            = 0
-    last_order_ts: Optional[str]  = None
-    reset_day:     Optional[str]  = None   # YYYY-MM-DD
-    reset_hour:    Optional[str]  = None   # YYYY-MM-DDTHH
+    halted:        bool          = False
+    halt_reason:   str           = ""
+    daily_loss:    float         = 0.0
+    daily_trades:  int           = 0
+    hourly_orders: int           = 0
+    consec_errors: int           = 0
+    last_order_ts: Optional[str] = None
+    reset_day:     Optional[str] = None
+    reset_hour:    Optional[str] = None
 
 _cb      = CBState()
 _cb_lock = threading.Lock()
@@ -380,7 +410,6 @@ def cb_load() -> None:
         _cb.reset_day     = str(row[7]) if row[7] else None
         _cb.reset_hour    = row[8].isoformat() if row[8] else None
         return
-    # Fallback: file
     try:
         if _CB_FILE.exists():
             data = json.loads(_CB_FILE.read_text())
@@ -420,7 +449,6 @@ def _cb_reset_hourly() -> None:
         jlog("info", "cb_hourly_reset", hour=hour)
 
 def cb_tick() -> None:
-    """Call once per loop to roll daily/hourly windows."""
     with _cb_lock:
         _cb_reset_daily()
         _cb_reset_hourly()
@@ -438,7 +466,8 @@ def cb_halt(reason: str) -> None:
             send_telegram(
                 f"🚨 Johnny5 HALTED\n"
                 f"Reason: {reason}\n"
-                f"To re-arm: set halted=false in j5_circuit_breaker table and redeploy."
+                f"Re-arm: UPDATE j5_circuit_breaker SET halted=false "
+                f"WHERE id=1; then redeploy."
             )
             cb_save()
 
@@ -453,39 +482,38 @@ def cb_increment_error() -> None:
             reason = f"MAX_CONSECUTIVE_ERRORS={MAX_CONSEC_ERRORS} reached"
             _cb.halted      = True
             _cb.halt_reason = reason
-            jlog("critical", "CIRCUIT_BREAKER_CONSEC_ERRORS", count=_cb.consec_errors)
+            jlog("critical", "CIRCUIT_BREAKER_CONSEC_ERRORS",
+                 count=_cb.consec_errors)
             send_telegram(f"🚨 Johnny5 HALTED — {reason}. Check logs.")
             cb_save()
 
-def cb_check_order_allowed(unrealized_loss: float = 0.0) -> Tuple[bool, str]:
-    """Returns (allowed, reason). Call before every order attempt."""
+def cb_check_order_allowed(
+    unrealized_loss: float = 0.0,
+) -> Tuple[bool, str]:
     with _cb_lock:
         if _cb.halted:
             return False, f"halted: {_cb.halt_reason}"
         if KILL_SWITCH:
             return False, "KILL_SWITCH=true"
-
         _cb_reset_daily()
         _cb_reset_hourly()
-
         total_loss = _cb.daily_loss + max(0.0, unrealized_loss)
         if total_loss >= MAX_DAILY_LOSS:
-            reason = f"MAX_DAILY_LOSS={MAX_DAILY_LOSS:.2f} breached (loss={total_loss:.2f})"
+            reason = (f"MAX_DAILY_LOSS={MAX_DAILY_LOSS:.2f} breached "
+                      f"(loss={total_loss:.2f})")
             _cb.halted      = True
             _cb.halt_reason = reason
             cb_save()
             return False, reason
-
         if _cb.daily_trades >= MAX_TRADES_PER_DAY:
             return False, f"MAX_TRADES_PER_DAY={MAX_TRADES_PER_DAY} reached"
-
         if _cb.hourly_orders >= MAX_ORDERS_PER_HOUR:
             return False, f"MAX_ORDERS_PER_HOUR={MAX_ORDERS_PER_HOUR} reached"
-
-        if _cb.last_order_ts and secs_since(_cb.last_order_ts) < MIN_ORDER_INTERVAL:
+        if (_cb.last_order_ts
+                and secs_since(_cb.last_order_ts) < MIN_ORDER_INTERVAL):
             age = secs_since(_cb.last_order_ts)
-            return False, f"order interval cooldown ({age:.1f}s < {MIN_ORDER_INTERVAL}s)"
-
+            return False, (f"order interval cooldown "
+                           f"({age:.1f}s < {MIN_ORDER_INTERVAL}s)")
         return True, ""
 
 def cb_record_order_submitted() -> None:
@@ -497,13 +525,12 @@ def cb_record_order_submitted() -> None:
         cb_save()
 
 def cb_record_realized_loss(loss_usd: float) -> None:
-    """Call with a positive value when a trade closes at a loss."""
     with _cb_lock:
         _cb.daily_loss += abs(loss_usd)
         cb_save()
 
 # =============================================================================
-# Position store (DB-backed + runtime dict)
+# Position store
 # =============================================================================
 @dataclass
 class PositionSnapshot:
@@ -533,7 +560,8 @@ def pos_load_db() -> None:
                 ticker = row[0]
                 _positions[ticker] = PositionSnapshot(
                     ticker=ticker, side=row[1], contracts=int(row[2]),
-                    entry_price=float(row[3] or 0), open_ts=str(row[4] or ""),
+                    entry_price=float(row[3] or 0),
+                    open_ts=str(row[4] or ""),
                     trade_key=row[5] or "",
                 )
         jlog("info", "positions_loaded", count=len(_positions))
@@ -579,7 +607,6 @@ class KalshiClient:
     def __init__(self) -> None:
         self.session     = requests.Session()
         self.private_key = None
-
         pem = self._resolve_pem()
         if pem:
             try:
@@ -587,7 +614,8 @@ class KalshiClient:
                     pem.encode("utf-8"), password=None
                 )
                 jlog("info", "kalshi_key_loaded",
-                     key_id=(KALSHI_API_KEY_ID[:8] + "…") if KALSHI_API_KEY_ID else "none")
+                     key_id=(KALSHI_API_KEY_ID[:8] + "…")
+                     if KALSHI_API_KEY_ID else "none")
             except Exception as e:
                 self.private_key = None
                 jlog("warning", "kalshi_key_load_fail", error=str(e)[:200])
@@ -617,18 +645,12 @@ class KalshiClient:
             return ""
 
     def _headers(self, method: str, path: str) -> Dict[str, str]:
-        """
-        Build Kalshi authentication headers using RSA-PSS with SHA-256.
-        salt_length=32 matches the Bun gateway implementation that already works.
-        PKCS1v15 is NOT accepted by Kalshi — this was the cause of 401s in v2.
-        """
+        """RSA-PSS with SHA-256, salt_length=32 — required by Kalshi."""
         if not (KALSHI_API_KEY_ID and self.private_key):
             return {"Content-Type": "application/json"}
-
         ts_ms = str(int(time.time() * 1000))
         msg   = f"{ts_ms}{method.upper()}{path}".encode("utf-8")
-
-        sig = self.private_key.sign(
+        sig   = self.private_key.sign(
             msg,
             asym_padding.PSS(
                 mgf=asym_padding.MGF1(crypto_hashes.SHA256()),
@@ -636,7 +658,6 @@ class KalshiClient:
             ),
             crypto_hashes.SHA256(),
         )
-
         return {
             "KALSHI-ACCESS-KEY":       KALSHI_API_KEY_ID,
             "KALSHI-ACCESS-TIMESTAMP": ts_ms,
@@ -650,7 +671,9 @@ class KalshiClient:
         for attempt in range(retries):
             headers = self._headers("GET", path)
             try:
-                r = self.session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                r = self.session.get(
+                    url, headers=headers, timeout=REQUEST_TIMEOUT
+                )
                 if r.status_code == 429:
                     wait = min(30, 2 ** attempt)
                     jlog("warning", "kalshi_rate_limited", wait=wait)
@@ -658,14 +681,17 @@ class KalshiClient:
                     continue
                 if r.status_code >= 500:
                     wait = min(30, 2 ** attempt + 1)
-                    jlog("warning", "kalshi_5xx", status=r.status_code, wait=wait)
+                    jlog("warning", "kalshi_5xx",
+                         status=r.status_code, wait=wait)
                     time.sleep(wait)
                     continue
                 if r.status_code == 404:
                     raise RuntimeError(f"Kalshi 404 {path}")
                 if r.status_code >= 400:
                     body = (r.text or "")[:300]
-                    raise RuntimeError(f"Kalshi HTTP {r.status_code} {path}: {body}")
+                    raise RuntimeError(
+                        f"Kalshi HTTP {r.status_code} {path}: {body}"
+                    )
                 out = r.json()
                 if not isinstance(out, dict):
                     raise RuntimeError(f"Kalshi non-dict JSON on {path}")
@@ -685,28 +711,30 @@ class KalshiClient:
     # ── Market data ──────────────────────────────────────────────────────────
 
     def list_open_markets(self) -> List[Dict[str, Any]]:
-        data    = self._get(f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open")
+        data    = self._get(
+            f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open"
+        )
         markets = data.get("markets", [])
         return markets if isinstance(markets, list) else []
+
+    def get_market(self, ticker: str) -> Dict[str, Any]:
+        """Fetch full market details including floor_strike / cap_strike."""
+        return self._get(f"/trade-api/v2/markets/{ticker}")
 
     def get_orderbook(self, ticker: str) -> Dict[str, Any]:
         return self._get(f"/trade-api/v2/markets/{ticker}/orderbook")
 
-    # ── Account data (LIVE only) ──────────────────────────────────────────────
+    # ── Account data ─────────────────────────────────────────────────────────
 
     def get_balance(self) -> Optional[float]:
-        """
-        Returns available balance in USD.
-        Kalshi returns cents in the 'balance' field (or similar).
-        Raw response keys are logged once so you can adjust if needed.
-        """
         try:
             data  = self._get("/trade-api/v2/portfolio/balance")
             cents = (data.get("balance")
                      or data.get("available_balance")
                      or data.get("buying_power"))
             if cents is None:
-                jlog("warning", "balance_field_not_found", raw_keys=list(data.keys()))
+                jlog("warning", "balance_field_not_found",
+                     raw_keys=list(data.keys()))
                 return None
             return float(cents) / 100.0
         except Exception as e:
@@ -714,21 +742,18 @@ class KalshiClient:
             return None
 
     def get_positions(self) -> List[Dict[str, Any]]:
-        """Returns list of current positions from Kalshi."""
         try:
             data      = self._get("/trade-api/v2/portfolio/positions")
-            positions = data.get("market_positions") or data.get("positions") or []
-            if not isinstance(positions, list):
-                jlog("warning", "positions_unexpected_type",
-                     type=type(positions).__name__)
-                return []
-            return positions
+            positions = (data.get("market_positions")
+                         or data.get("positions") or [])
+            return positions if isinstance(positions, list) else []
         except Exception as e:
             jlog("warning", "get_positions_fail", error=str(e)[:200])
             return []
 
-    def get_open_orders(self, ticker: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Returns list of resting orders."""
+    def get_open_orders(
+        self, ticker: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         try:
             path = "/trade-api/v2/portfolio/orders?status=resting"
             if ticker:
@@ -745,11 +770,14 @@ class KalshiClient:
             path    = f"/trade-api/v2/portfolio/orders/{order_id}"
             url     = f"{KALSHI_BASE_URL}{path}"
             headers = self._headers("DELETE", path)
-            r       = self.session.delete(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            r       = self.session.delete(
+                url, headers=headers, timeout=REQUEST_TIMEOUT
+            )
             if r.status_code in (200, 204):
                 jlog("info", "order_cancelled", order_id=order_id)
                 return True
-            jlog("warning", "cancel_fail", order_id=order_id, status=r.status_code)
+            jlog("warning", "cancel_fail",
+                 order_id=order_id, status=r.status_code)
             return False
         except Exception as e:
             jlog("warning", "cancel_error", error=str(e)[:200])
@@ -768,13 +796,14 @@ class KalshiClient:
     ) -> Dict[str, Any]:
         if not LIVE_MODE:
             fake_id = f"paper-{uuid.uuid4().hex[:8]}"
-            jlog("info", "PAPER_ORDER", action=action, ticker=ticker, side=side,
-                 contracts=contracts, price_cents=price_cents, order_id=fake_id)
+            jlog("info", "PAPER_ORDER", action=action, ticker=ticker,
+                 side=side, contracts=contracts, price_cents=price_cents,
+                 order_id=fake_id)
             return {"ok": True, "paper": True, "order": {"order_id": fake_id}}
 
         if not KALSHI_ORDER_GATEWAY_URL:
             raise RuntimeError(
-                "KALSHI_ORDER_GATEWAY_URL is not set (required for LIVE_MODE)"
+                "KALSHI_ORDER_GATEWAY_URL not set (required for LIVE_MODE)"
             )
         if action not in ("buy", "sell"):
             raise ValueError(f"invalid action: {action}")
@@ -785,12 +814,12 @@ class KalshiClient:
 
         coid    = client_order_id or uuid.uuid4().hex
         payload: Dict[str, Any] = {
-            "ticker":           ticker,
-            "action":           action,
-            "type":             "limit",
-            "side":             side,
-            "count":            int(contracts),
-            "client_order_id":  coid,
+            "ticker":          ticker,
+            "action":          action,
+            "type":            "limit",
+            "side":            side,
+            "count":           int(contracts),
+            "client_order_id": coid,
         }
         if side == "YES":
             payload["yes_price"] = max(1, min(99, int(price_cents)))
@@ -802,7 +831,6 @@ class KalshiClient:
             json=payload,
             timeout=REQUEST_TIMEOUT,
         )
-
         if r.status_code >= 400:
             body = (r.text or "")[:500]
             if "insufficient_balance" in body.lower():
@@ -821,7 +849,6 @@ class KalshiClient:
                 cb_halt(reason)
                 raise RuntimeError(reason)
             raise RuntimeError(f"Order gateway rejected: {body_str}")
-
         return out
 
 # =============================================================================
@@ -848,14 +875,14 @@ def start_health_server() -> None:
                 self.end_headers()
 
         def log_message(self, fmt: str, *args: Any) -> None:
-            pass  # silence access logs
+            pass
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     jlog("info", "health_server_started", port=PORT)
 
 # =============================================================================
-# Market selection
+# Market selection + strike parsing
 # =============================================================================
 def _as_float(x: Any) -> float:
     try:
@@ -871,26 +898,85 @@ def _parse_ts_any(x: Any) -> Optional[datetime]:
     except Exception:
         return None
 
-def pick_best_active_market(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def extract_strike(market: Dict[str, Any]) -> Optional[float]:
+    """
+    Extract the strike price from a market dict.
+
+    Kalshi binary markets that resolve "above K" have a floor_strike field.
+    For markets that resolve "between K1 and K2", we use the midpoint.
+    Falls back gracefully — returns None if we can't determine a strike,
+    which will cause the bot to skip that market.
+
+    Field names observed in the wild (Kalshi may use any of these):
+      floor_strike, cap_strike, strike_price, strike, result_value
+    """
+    # Primary: floor_strike (above-K binary)
+    raw = (market.get("floor_strike")
+           or market.get("strike_price")
+           or market.get("strike"))
+    if raw is not None:
+        try:
+            val = float(raw)
+            if val > 100:        # sanity: must look like a real price not a %
+                return val
+        except Exception:
+            pass
+
+    # Secondary: midpoint of a range market
+    floor = market.get("floor_strike") or market.get("floor")
+    cap   = market.get("cap_strike")   or market.get("cap")
+    if floor is not None and cap is not None:
+        try:
+            return (float(floor) + float(cap)) / 2.0
+        except Exception:
+            pass
+
+    # Tertiary: result_value sometimes carries the settlement price target
+    rv = market.get("result_value")
+    if rv is not None:
+        try:
+            val = float(rv)
+            if val > 100:
+                return val
+        except Exception:
+            pass
+
+    return None
+
+def pick_best_active_market(
+    markets: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Pick the open market with the best liquidity (volume + open interest).
+    Only considers markets that have a parseable close_time in the future.
+    """
     now        = datetime.now(timezone.utc)
     candidates = []
     for m in markets:
         if not isinstance(m, dict): continue
-        ot = _parse_ts_any(m.get("open_time") or m.get("open_ts"))
         ct = _parse_ts_any(m.get("close_time") or m.get("close_ts"))
+        ot = _parse_ts_any(m.get("open_time")  or m.get("open_ts"))
         if not ot or not ct: continue
-        if ot <= now < ct:
-            vol   = _as_float(m.get("volume") or m.get("volume_24h") or m.get("vol"))
-            oi    = _as_float(m.get("open_interest") or m.get("openInterest") or m.get("oi"))
-            score = vol + oi
-            candidates.append((score, ct, m))
+        if not (ot <= now < ct): continue
+        vol   = _as_float(m.get("volume") or m.get("volume_24h") or 0)
+        oi    = _as_float(m.get("open_interest") or m.get("oi") or 0)
+        score = vol + oi
+        candidates.append((score, ct, m))
     if not candidates:
         return None
     candidates.sort(key=lambda x: (x[0], -x[1].timestamp()), reverse=True)
     return candidates[0][2]
 
 def bucket_ts_for_market(m: Dict[str, Any]) -> str:
-    return str(m.get("open_time") or m.get("open_ts") or m.get("ticker") or "unknown")
+    return str(
+        m.get("open_time") or m.get("open_ts")
+        or m.get("ticker") or "unknown"
+    )
+
+def secs_until_close(m: Dict[str, Any]) -> Optional[float]:
+    ct = _parse_ts_any(m.get("close_time") or m.get("close_ts"))
+    if not ct: return None
+    return max(0.0, (ct - datetime.now(timezone.utc)).total_seconds())
 
 # =============================================================================
 # Orderbook parsing + quality guards
@@ -919,7 +1005,7 @@ class BookState:
     yes_levels:   List
     no_levels:    List
     spread_cents: Optional[int]
-    mark_yes:     Optional[float]
+    mark_yes:     Optional[float]   # mid-market as a probability 0-1
 
     @property
     def ok(self) -> bool:
@@ -936,11 +1022,14 @@ def parse_book(orderbook: Dict[str, Any]) -> BookState:
     best_yes = _best_price_cents(yes_levels)
     best_no  = _best_price_cents(no_levels)
 
-    # Bounds check
-    if best_yes is not None and (best_yes < MIN_BID_CENTS or best_yes > MAX_BID_CENTS):
+    if best_yes is not None and (
+        best_yes < MIN_BID_CENTS or best_yes > MAX_BID_CENTS
+    ):
         best_yes = None
-    if best_no  is not None and (best_no  < MIN_BID_CENTS or best_no  > MAX_BID_CENTS):
-        best_no  = None
+    if best_no is not None and (
+        best_no < MIN_BID_CENTS or best_no > MAX_BID_CENTS
+    ):
+        best_no = None
 
     spread: Optional[int]   = None
     mark:   Optional[float] = None
@@ -969,15 +1058,11 @@ def book_quality_ok(book: BookState) -> Tuple[bool, str]:
         return False, f"spread={book.spread_cents}c > MAX={MAX_SPREAD_CENTS}c"
     return True, ""
 
-def compute_entry_price_cents(book: BookState, side: str) -> Optional[int]:
-    """
-    YES entry: buy at implied YES ask = 100 - best_no_bid.
-    NO  entry: buy at implied NO  ask = 100 - best_yes_bid.
-    Rejected if slippage from mid exceeds MAX_SLIPPAGE_CENTS.
-    """
+def compute_entry_price_cents(
+    book: BookState, side: str
+) -> Optional[int]:
     if book.mark_yes is None: return None
     mid_cents = int(book.mark_yes * 100)
-
     if side == "YES":
         if book.best_no_bid is None: return None
         price = 100 - book.best_no_bid
@@ -989,8 +1074,9 @@ def compute_entry_price_cents(book: BookState, side: str) -> Optional[int]:
         if price - (100 - mid_cents) > MAX_SLIPPAGE_CENTS: return None
         return max(1, min(99, price))
 
-def compute_exit_price_cents(book: BookState, side: str) -> Optional[int]:
-    """Sell into best available bid."""
+def compute_exit_price_cents(
+    book: BookState, side: str
+) -> Optional[int]:
     if side == "YES":
         if book.best_yes_bid is None: return None
         return max(1, min(99, book.best_yes_bid))
@@ -999,10 +1085,10 @@ def compute_exit_price_cents(book: BookState, side: str) -> Optional[int]:
         return max(1, min(99, book.best_no_bid))
 
 # =============================================================================
-# Model + sizing
+# Price feed
 # =============================================================================
 def kraken_last_price() -> float:
-    r      = requests.get(KRAKEN_TICKER_URL, timeout=REQUEST_TIMEOUT)
+    r = requests.get(KRAKEN_TICKER_URL, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     body   = r.json()
     result = body.get("result", {})
@@ -1011,41 +1097,95 @@ def kraken_last_price() -> float:
     key = next(iter(result))
     return float(result[key]["c"][0])
 
-def model_fair_yes(prices: List[float]) -> Tuple[float, float]:
+# =============================================================================
+# Binary option model
+# =============================================================================
+def _norm_cdf(x: float) -> float:
     """
-    Returns (fair_yes, z).
-    Both MIN_CONVICTION_Z and EDGE_ENTER must be satisfied independently to enter.
-    z=0 means insufficient price history — bot will never trade on z=0.
+    Standard normal CDF using the math.erfc approximation.
+    Accurate to ~7 significant figures — more than enough for 1¢ resolution.
     """
-    if len(prices) < LOOKBACK:
-        return 0.5, 0.0
+    return 0.5 * math.erfc(-x / math.sqrt(2.0))
 
-    window = prices[-LOOKBACK:]
-    rets: List[float] = []
+def realized_vol_annualised(prices: List[float]) -> float:
+    """
+    Compute annualised volatility from the last VOL_WINDOW log-returns.
+    Prices are sampled every POLL_SECONDS seconds.
+    Returns VOL_FLOOR if there isn't enough data.
+    """
+    if len(prices) < VOL_WINDOW + 1:
+        return VOL_FLOOR
+
+    window = prices[-(VOL_WINDOW + 1):]
+    log_rets: List[float] = []
     for i in range(1, len(window)):
-        prev = window[i - 1]
-        cur  = window[i]
-        if prev <= 0: continue
-        rets.append((cur - prev) / prev)
+        p0, p1 = window[i - 1], window[i]
+        if p0 <= 0 or p1 <= 0: continue
+        log_rets.append(math.log(p1 / p0))
 
-    if len(rets) < 2:
-        return 0.5, 0.0
+    if len(log_rets) < 2:
+        return VOL_FLOOR
 
-    mean = sum(rets) / len(rets)
-    var  = sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1)
-    std  = max(var ** 0.5, 1e-8)
-    z    = (rets[-1] - mean) / std
-    fair = max(0.01, min(0.99, 0.5 + z * FAIR_MOVE_SCALE))
-    return fair, z
+    n    = len(log_rets)
+    mean = sum(log_rets) / n
+    var  = sum((r - mean) ** 2 for r in log_rets) / (n - 1)
+    std_per_sample = max(var ** 0.5, 1e-10)
 
+    # Annualise: there are 365.25*24*3600 / POLL_SECONDS samples per year
+    samples_per_year = (365.25 * 24 * 3600) / max(POLL_SECONDS, 1.0)
+    sigma_annual     = std_per_sample * math.sqrt(samples_per_year)
+
+    return max(VOL_FLOOR, min(VOL_CAP, sigma_annual))
+
+
+def model_fair_yes(
+    spot: float,
+    strike: float,
+    secs_remaining: float,
+    sigma: float,
+) -> float:
+    """
+    Fair value of a binary call option (pays $1 if spot > strike at expiry).
+
+    Formula:  fair_yes = Φ(d)
+    where     d = [ ln(S/K) ] / (σ √T)
+
+    We omit the drift term (½σ²T) because:
+      - T is very small (≤ 15 min = 0.0000285 years)
+      - The drift contribution is negligible vs. the diffusion term
+      - Keeping it simple reduces overfitting
+
+    Args:
+        spot:           current BTC price (USD)
+        strike:         market strike price (USD)
+        secs_remaining: seconds until the bucket closes
+        sigma:          annualised realised volatility (e.g. 0.80 = 80%)
+
+    Returns:
+        fair_yes in [0.01, 0.99]
+    """
+    if strike <= 0 or spot <= 0 or secs_remaining <= 0:
+        return 0.5
+
+    # Time in years
+    T = secs_remaining / (365.25 * 24 * 3600)
+
+    sqrt_T = math.sqrt(max(T, 1e-12))
+    sigma  = max(sigma, 1e-6)
+
+    d = math.log(spot / strike) / (sigma * sqrt_T)
+
+    fair = _norm_cdf(d)
+    return max(0.01, min(0.99, fair))
+
+
+# =============================================================================
+# Sizing
+# =============================================================================
 def compute_contracts(cash_usd: float, price_cents: int) -> int:
-    """
-    Triple-capped: MAX_POSITION_USD, MAX_CONTRACTS, MAX_NOTIONAL_PER_TICKER.
-    Uses real cash in LIVE, paper_cash in PAPER.
-    """
-    price_usd = max(price_cents / 100.0, 0.01)
-    risk_usd  = min(MAX_POSITION_USD, max(1.0, cash_usd * RISK_FRACTION))
-    from_risk    = int(risk_usd / price_usd)
+    price_usd     = max(price_cents / 100.0, 0.01)
+    risk_usd      = min(MAX_POSITION_USD, max(1.0, cash_usd * RISK_FRACTION))
+    from_risk     = int(risk_usd / price_usd)
     from_notional = int(MAX_NOTIONAL_PER_TICKER / price_usd)
     return max(1, min(from_risk, MAX_CONTRACTS, from_notional))
 
@@ -1054,10 +1194,10 @@ def compute_contracts(cash_usd: float, price_cents: int) -> int:
 # =============================================================================
 @dataclass
 class BotState:
-    paper_cash:              float          = 50.0
-    realized_pnl_lifetime:   float          = 0.0
-    trade_history_24h:       Optional[list] = None
-    last_trade_ts:           Optional[str]  = None
+    paper_cash:            float          = 50.0
+    realized_pnl_lifetime: float          = 0.0
+    trade_history_24h:     Optional[list] = None
+    last_trade_ts:         Optional[str]  = None
 
 def ensure_dirs() -> None:
     for p in (STATE_FILE, STATUS_FILE, _CB_FILE):
@@ -1085,7 +1225,9 @@ def load_state() -> BotState:
 def save_state(state: BotState) -> None:
     ensure_dirs()
     try:
-        STATE_FILE.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+        STATE_FILE.write_text(
+            json.dumps(asdict(state), indent=2), encoding="utf-8"
+        )
     except Exception as e:
         jlog("warning", "state_save_fail", error=str(e)[:200])
 
@@ -1096,25 +1238,26 @@ def prune_24h(state: BotState) -> None:
     now = datetime.now(timezone.utc)
     state.trade_history_24h = [
         t for t in state.trade_history_24h
-        if (dt := parse_iso(t.get("ts", ""))) and (now - dt) <= timedelta(hours=24)
+        if (dt := parse_iso(t.get("ts", "")))
+        and (now - dt) <= timedelta(hours=24)
     ]
 
-def summarize_24h(state: BotState) -> Tuple[int, float]:
-    prune_24h(state)
-    trades = len(state.trade_history_24h or [])
-    pnl    = sum(float(t.get("pnl", 0.0)) for t in (state.trade_history_24h or []))
-    return trades, pnl
-
-def record_trade_24h(state: BotState, typ: str, pnl_delta: float) -> None:
+def record_trade_24h(
+    state: BotState, typ: str, pnl_delta: float
+) -> None:
     if state.trade_history_24h is None:
         state.trade_history_24h = []
-    state.trade_history_24h.append({"ts": utc_iso(), "type": typ, "pnl": float(pnl_delta)})
+    state.trade_history_24h.append(
+        {"ts": utc_iso(), "type": typ, "pnl": float(pnl_delta)}
+    )
     prune_24h(state)
 
 def write_status(
     state: BotState, message: str, ticker: str,
-    mark_yes: Optional[float], fair_yes: float, z: float, edge: float,
-    cash_real: Optional[float] = None,
+    mark_yes: Optional[float], fair_yes: float,
+    spot: float, strike: Optional[float],
+    sigma: float, secs_remaining: Optional[float],
+    edge_cents: float, cash_real: Optional[float] = None,
 ) -> None:
     halted, halt_reason = cb_is_halted()
     pos = pos_any()
@@ -1129,7 +1272,6 @@ def write_status(
         "halt_reason": halt_reason,
         "ticker":      ticker,
         "cash_real":   cash_real,
-        "cash_paper":  state.paper_cash if not LIVE_MODE else None,
         "position": {
             "ticker":      pos.ticker      if pos else None,
             "side":        pos.side        if pos else None,
@@ -1138,10 +1280,13 @@ def write_status(
             "open_ts":     pos.open_ts     if pos else None,
         },
         "model": {
-            "mark_yes": mark_yes,
-            "fair_yes": fair_yes,
-            "z":        z,
-            "edge":     edge,
+            "spot":           spot,
+            "strike":         strike,
+            "sigma_annual":   round(sigma, 4),
+            "secs_remaining": secs_remaining,
+            "mark_yes":       mark_yes,
+            "fair_yes":       round(fair_yes, 4),
+            "edge_cents":     round(edge_cents, 2),
         },
         "circuit_breaker": {
             "daily_loss":    _cb.daily_loss,
@@ -1160,15 +1305,17 @@ def write_status(
 # Trading logic — ENTER
 # =============================================================================
 def maybe_enter(
-    state:     BotState,
-    client:    KalshiClient,
-    ticker:    str,
-    bucket_ts: str,
-    book:      BookState,
-    mark_yes:  float,
-    fair_yes:  float,
-    z:         float,
-    cash_real: Optional[float],
+    state:          BotState,
+    client:         KalshiClient,
+    ticker:         str,
+    bucket_ts:      str,
+    book:           BookState,
+    fair_yes:       float,
+    secs_remaining: float,
+    cash_real:      Optional[float],
+    spot:           float,
+    strike:         float,
+    sigma:          float,
 ) -> bool:
 
     # ── 1. Position check ──────────────────────────────────────────────────
@@ -1177,7 +1324,7 @@ def maybe_enter(
         if not ALLOW_PYRAMIDING:
             return False
         if existing.ticker != ticker:
-            return False  # never pyramid into a different ticker
+            return False
 
     # ── 2. Kill switch ─────────────────────────────────────────────────────
     if KILL_SWITCH:
@@ -1187,35 +1334,54 @@ def maybe_enter(
     if secs_since(state.last_trade_ts) < COOLDOWN_SECONDS:
         return False
 
-    # ── 4. z-score gate (MUST pass — high z = conviction) ─────────────────
-    #    This was the v2 bug: edge was passing even when z was too low.
-    #    Now BOTH conditions must independently pass.
-    if abs(z) < MIN_CONVICTION_Z:
+    # ── 4. Time-in-bucket guards ───────────────────────────────────────────
+    #    Don't trade when there's too little time left (too risky) or
+    #    too much time left (model uncertainty is too high).
+    if secs_remaining < MIN_SECS_BEFORE_EXPIRY:
+        jlog("debug", "enter_skip_too_close_to_expiry",
+             secs_remaining=round(secs_remaining, 1),
+             min=MIN_SECS_BEFORE_EXPIRY)
+        return False
+    if secs_remaining > MAX_SECS_BEFORE_EXPIRY:
+        jlog("debug", "enter_skip_too_far_from_expiry",
+             secs_remaining=round(secs_remaining, 1),
+             max=MAX_SECS_BEFORE_EXPIRY)
         return False
 
-    # ── 5. Edge gate ───────────────────────────────────────────────────────
-    edge = fair_yes - mark_yes
-    if edge >= EDGE_ENTER:
-        side = "YES"
-    elif edge <= -EDGE_ENTER:
-        side = "NO"
-    else:
-        return False  # edge not large enough
-
-    # ── 6. Book quality ────────────────────────────────────────────────────
+    # ── 5. Book quality ────────────────────────────────────────────────────
     book_ok, book_reason = book_quality_ok(book)
     if not book_ok:
-        jlog("info", "enter_skip_book", reason=book_reason, ticker=ticker)
+        jlog("debug", "enter_skip_book", reason=book_reason, ticker=ticker)
+        return False
+
+    if book.mark_yes is None:
+        return False
+
+    # ── 6. Edge gate — based on fair_yes vs book mid (in CENTS) ───────────
+    #    Positive edge → model says YES is cheap → buy YES
+    #    Negative edge → model says NO is cheap  → buy NO
+    #    We require at least MIN_EDGE_CENTS of mispricing.
+    edge_cents = (fair_yes - book.mark_yes) * 100
+
+    if edge_cents >= MIN_EDGE_CENTS:
+        side = "YES"
+    elif edge_cents <= -MIN_EDGE_CENTS:
+        side = "NO"
+    else:
+        jlog("debug", "enter_skip_insufficient_edge",
+             edge_cents=round(edge_cents, 2),
+             min=MIN_EDGE_CENTS)
         return False
 
     # ── 7. Entry price (slippage check) ───────────────────────────────────
     price_cents = compute_entry_price_cents(book, side)
     if price_cents is None:
-        jlog("info", "enter_skip_slippage", side=side, ticker=ticker)
+        jlog("debug", "enter_skip_slippage", side=side, ticker=ticker)
         return False
 
     # ── 8. Sizing ──────────────────────────────────────────────────────────
-    cash      = cash_real if (LIVE_MODE and cash_real is not None) else state.paper_cash
+    cash      = cash_real if (LIVE_MODE and cash_real is not None) \
+                else state.paper_cash
     contracts = compute_contracts(cash, price_cents)
     if contracts <= 0:
         jlog("info", "enter_skip_zero_contracts")
@@ -1237,12 +1403,13 @@ def maybe_enter(
         jlog("info", "enter_blocked_by_cb", reason=reason)
         return False
 
-    # ── 11. Persist CREATED before sending ────────────────────────────────
+    # ── 11. Persist CREATED ────────────────────────────────────────────────
     coid = uuid.uuid4().hex
     upsert_trade(
         trade_key=trade_key, ticker=ticker, bucket_ts=bucket_ts,
         intent="ENTER", side=side, status="CREATED",
-        contracts=contracts, price_cents=price_cents, client_order_id=coid,
+        contracts=contracts, price_cents=price_cents,
+        client_order_id=coid,
     )
 
     # ── 12. Submit ─────────────────────────────────────────────────────────
@@ -1259,24 +1426,22 @@ def maybe_enter(
             intent="ENTER", side=side, status="SUBMITTED",
             order_id=order_id, client_order_id=coid,
         )
-
-        # Persist position
         pos_save(PositionSnapshot(
             ticker=ticker, side=side, contracts=contracts,
             entry_price=price_cents / 100.0,
             open_ts=utc_iso(), trade_key=trade_key,
         ))
-
-        # Paper cash deduction
         if not LIVE_MODE:
             state.paper_cash -= (price_cents / 100.0) * contracts
-
         state.last_trade_ts = utc_iso()
         record_trade_24h(state, "ENTER", 0.0)
 
         jlog("info", "ENTER_SUBMITTED",
              ticker=ticker, side=side, contracts=contracts,
-             price_cents=price_cents, z=round(z, 3), edge=round(edge, 3),
+             price_cents=price_cents,
+             spot=round(spot, 2), strike=round(strike, 2),
+             sigma=round(sigma, 4), secs_remaining=round(secs_remaining, 1),
+             fair_yes=round(fair_yes, 4), edge_cents=round(edge_cents, 2),
              order_id=order_id)
         # No Telegram on ENTER — only EXIT sends an alert
         return True
@@ -1287,7 +1452,8 @@ def maybe_enter(
              error=err_str[:300], trade_key=trade_key)
         upsert_trade(
             trade_key=trade_key, ticker=ticker, bucket_ts=bucket_ts,
-            intent="ENTER", side=side, status="FAILED", reason=err_str[:200],
+            intent="ENTER", side=side, status="FAILED",
+            reason=err_str[:200],
         )
         if "insufficient_balance" not in err_str:
             cb_increment_error()
@@ -1297,17 +1463,14 @@ def maybe_enter(
 # Trading logic — EXIT
 # =============================================================================
 def maybe_exit(
-    state:     BotState,
-    client:    KalshiClient,
-    book:      BookState,
-    mark_yes:  float,
-    fair_yes:  float,
-    z:         float,
-    bucket_ts: str,
-    force:     bool = False,
-    cash_real: Optional[float] = None,
+    state:          BotState,
+    client:         KalshiClient,
+    book:           BookState,
+    fair_yes:       float,
+    bucket_ts:      str,
+    force:          bool = False,
+    cash_real:      Optional[float] = None,
 ) -> bool:
-    # Always operate on the ACTUALLY held ticker
     pos = pos_any()
     if pos is None:
         return False
@@ -1324,13 +1487,18 @@ def maybe_exit(
     if not force and secs_since(state.last_trade_ts) < COOLDOWN_SECONDS:
         return False
 
-    # Exit signal
-    edge         = fair_yes - mark_yes
-    should_exit  = False
-    if side == "YES":
-        should_exit = edge <= EDGE_EXIT
+    # Exit signal: edge has collapsed (model no longer says we're right)
+    if book.mark_yes is None and not force:
+        return False
+
+    if book.mark_yes is not None:
+        edge_cents = (fair_yes - book.mark_yes) * 100
+        if side == "YES":
+            should_exit = edge_cents <= EXIT_EDGE_CENTS
+        else:
+            should_exit = edge_cents >= -EXIT_EDGE_CENTS
     else:
-        should_exit = edge >= -EDGE_EXIT
+        should_exit = False
 
     if force or (KILL_SWITCH and CLOSE_ON_KILL_SWITCH):
         should_exit = True
@@ -1346,18 +1514,17 @@ def maybe_exit(
              trade_key=trade_key, status=existing_status)
         return False
 
-    # Exit price
     price_cents = compute_exit_price_cents(book, side)
     if price_cents is None:
         jlog("warning", "exit_skip_no_price", ticker=ticker, side=side)
         return False
 
-    # Persist CREATED
     coid = uuid.uuid4().hex
     upsert_trade(
         trade_key=trade_key, ticker=ticker, bucket_ts=bucket_ts,
         intent="EXIT", side=side, status="CREATED",
-        contracts=contracts, price_cents=price_cents, client_order_id=coid,
+        contracts=contracts, price_cents=price_cents,
+        client_order_id=coid,
     )
 
     try:
@@ -1380,7 +1547,6 @@ def maybe_exit(
         record_trade_24h(state, "EXIT", pnl)
         if pnl < 0:
             cb_record_realized_loss(abs(pnl))
-
         if not LIVE_MODE:
             state.paper_cash += exit_price * contracts
 
@@ -1389,7 +1555,9 @@ def maybe_exit(
 
         jlog("info", "EXIT_SUBMITTED",
              ticker=ticker, side=side, contracts=contracts,
-             price_cents=price_cents, pnl=round(pnl, 4), order_id=order_id)
+             price_cents=price_cents, pnl=round(pnl, 4),
+             order_id=order_id)
+
         bal_str = f"${cash_real:.2f}" if cash_real is not None else "check app"
         send_telegram(
             f"{'🔴' if pnl < 0 else '🟢'} Johnny5 EXIT\n"
@@ -1405,14 +1573,15 @@ def maybe_exit(
              error=err_str[:300], trade_key=trade_key)
         upsert_trade(
             trade_key=trade_key, ticker=ticker, bucket_ts=bucket_ts,
-            intent="EXIT", side=side, status="FAILED", reason=err_str[:200],
+            intent="EXIT", side=side, status="FAILED",
+            reason=err_str[:200],
         )
         if "insufficient_balance" not in err_str:
             cb_increment_error()
         return False
 
 # =============================================================================
-# Boot: reconcile real Kalshi positions with local DB
+# Boot reconciliation
 # =============================================================================
 def reconcile_live_positions(client: KalshiClient) -> None:
     if not LIVE_MODE:
@@ -1426,24 +1595,25 @@ def reconcile_live_positions(client: KalshiClient) -> None:
         ticker = rp.get("ticker") or rp.get("market_ticker") or ""
         if not ticker or SERIES_TICKER not in ticker:
             continue
-
         yes_qty = int(rp.get("yes_position") or rp.get("position") or 0)
-        no_qty  = int(rp.get("no_position")  or 0)
-
+        no_qty  = int(rp.get("no_position") or 0)
         if yes_qty > 0 and pos_get(ticker) is None:
-            jlog("warning", "reconcile_orphan_yes", ticker=ticker, qty=yes_qty)
+            jlog("warning", "reconcile_orphan_yes",
+                 ticker=ticker, qty=yes_qty)
             pos_save(PositionSnapshot(
                 ticker=ticker, side="YES", contracts=yes_qty,
-                entry_price=0.50, open_ts=utc_iso(), trade_key="reconciled",
+                entry_price=0.50, open_ts=utc_iso(),
+                trade_key="reconciled",
             ))
         if no_qty > 0 and pos_get(ticker) is None:
-            jlog("warning", "reconcile_orphan_no", ticker=ticker, qty=no_qty)
+            jlog("warning", "reconcile_orphan_no",
+                 ticker=ticker, qty=no_qty)
             pos_save(PositionSnapshot(
                 ticker=ticker, side="NO", contracts=no_qty,
-                entry_price=0.50, open_ts=utc_iso(), trade_key="reconciled",
+                entry_price=0.50, open_ts=utc_iso(),
+                trade_key="reconciled",
             ))
 
-    # Warn about stale local positions not found in Kalshi
     with _pos_lock:
         held_tickers = list(_positions.keys())
     for ticker in held_tickers:
@@ -1454,8 +1624,8 @@ def reconcile_live_positions(client: KalshiClient) -> None:
             for rp in real_positions
         )
         if not kalshi_has_it:
-            jlog("warning", "reconcile_stale_local_position", ticker=ticker)
-
+            jlog("warning", "reconcile_stale_local_position",
+                 ticker=ticker)
     jlog("info", "reconcile_done")
 
 # =============================================================================
@@ -1470,6 +1640,34 @@ def dbg_every(key: str, seconds: float) -> bool:
         _last_dbg[key] = now
         return True
     return False
+
+# =============================================================================
+# Market detail cache (strike + close_time; refreshed per market per loop)
+# =============================================================================
+_market_cache: Dict[str, Dict[str, Any]] = {}
+
+def get_market_cached(
+    client: KalshiClient, ticker: str
+) -> Dict[str, Any]:
+    """
+    Fetch and cache full market details.  Cache expires after 60s so we
+    don't hammer the API, but still pick up any corrections.
+    """
+    cached = _market_cache.get(ticker)
+    if cached:
+        age = time.time() - cached.get("_fetched_at", 0)
+        if age < 60:
+            return cached
+    try:
+        data = client.get_market(ticker)
+        # Kalshi wraps the market in a 'market' key
+        m = data.get("market", data)
+        m["_fetched_at"] = time.time()
+        _market_cache[ticker] = m
+        return m
+    except Exception as e:
+        jlog("warning", "market_cache_miss", ticker=ticker, error=str(e)[:200])
+        return _market_cache.get(ticker, {})
 
 # =============================================================================
 # Main loop
@@ -1489,7 +1687,8 @@ def main() -> None:
         jlog("warning", "BOOT_ALREADY_HALTED", reason=_cb.halt_reason)
         send_telegram(
             f"⚠️ Johnny5 booted HALTED: {_cb.halt_reason}\n"
-            f"To re-arm: UPDATE j5_circuit_breaker SET halted=false WHERE id=1; then redeploy."
+            f"Re-arm: UPDATE j5_circuit_breaker SET halted=false "
+            f"WHERE id=1; then redeploy."
         )
 
     pos_load_db()
@@ -1511,11 +1710,13 @@ def main() -> None:
         jlog("info", "LIVE_BALANCE_AT_BOOT", cash_usd=real_cash)
         if real_cash is not None and real_cash < 2.0:
             jlog("warning", "LOW_BALANCE_AT_BOOT", cash_usd=real_cash)
-            send_telegram(f"⚠️ Johnny5: low balance at boot: ${real_cash:.2f}")
+            send_telegram(
+                f"⚠️ Johnny5: low balance at boot: ${real_cash:.2f}"
+            )
 
     prices:          List[float] = []
     loop_id:         int         = 0
-    null_book_count: int         = 0   # consecutive loops where held position has null book
+    null_book_count: int         = 0
 
     while True:
         loop_id += 1
@@ -1529,9 +1730,10 @@ def main() -> None:
                 time.sleep(max(10.0, POLL_SECONDS))
                 continue
 
-            # ── Fetch BTC price ────────────────────────────────────────────
+            # ── Fetch BTC spot price ───────────────────────────────────────
             try:
-                prices.append(kraken_last_price())
+                spot = kraken_last_price()
+                prices.append(spot)
                 cb_clear_error()
             except Exception as e:
                 jlog("warning", "kraken_fail", error=str(e)[:200])
@@ -1539,8 +1741,8 @@ def main() -> None:
                 time.sleep(max(10.0, POLL_SECONDS))
                 continue
 
-            if len(prices) > LOOKBACK * 10:
-                prices = prices[-LOOKBACK * 10:]
+            if len(prices) > max(VOL_WINDOW + 10, 400):
+                prices = prices[-(VOL_WINDOW + 10):]
 
             # ── Refresh real balance every 30s ─────────────────────────────
             if LIVE_MODE and dbg_every("balance", 30):
@@ -1548,36 +1750,40 @@ def main() -> None:
                 if real_cash is not None:
                     jlog("debug", "balance_refresh", cash_usd=real_cash)
 
-            # ── Model ──────────────────────────────────────────────────────
-            fair_yes, z = model_fair_yes(prices)
+            # ── Compute volatility ─────────────────────────────────────────
+            sigma = realized_vol_annualised(prices)
 
-            # ── EXIT PATH — always on held ticker, not picked market ───────
+            # ── EXIT PATH — always on held ticker ─────────────────────────
             current_pos = pos_any()
-            pos_book:  Optional[BookState] = None
-            pos_mark:  Optional[float]     = None
+            pos_book:       Optional[BookState] = None
+            pos_fair_yes:   float               = 0.5
+            pos_mark:       Optional[float]     = None
+            pos_strike:     Optional[float]     = None
+            pos_secs_rem:   Optional[float]     = None
 
             if current_pos:
                 pos_ticker = current_pos.ticker
                 try:
+                    # Get full market details (strike + close time)
+                    mkt      = get_market_cached(client, pos_ticker)
+                    pos_secs_rem = secs_until_close(mkt)
+                    pos_strike   = extract_strike(mkt)
+
                     pos_ob   = client.get_orderbook(pos_ticker)
                     pos_book = parse_book(pos_ob)
                     pos_mark = pos_book.mark_yes
-                    if pos_mark is None:
-                        pos_mark = current_pos.entry_price  # fallback
 
-                    if DEBUG_MARK and dbg_every("mark_pos", 60):
-                        jlog("debug", "MARK_DEBUG_POS",
-                             ticker=pos_ticker,
-                             best_yes=pos_book.best_yes_bid,
-                             best_no=pos_book.best_no_bid,
-                             mark=pos_mark,
-                             spread=pos_book.spread_cents)
+                    # Recompute fair value on the held position's ticker
+                    if (pos_strike is not None
+                            and pos_secs_rem is not None
+                            and pos_secs_rem > 0):
+                        pos_fair_yes = model_fair_yes(
+                            spot, pos_strike, pos_secs_rem, sigma
+                        )
+                    else:
+                        pos_fair_yes = pos_mark or 0.5
 
                     # ── Expired-market guard ───────────────────────────────
-                    # If both sides of the book are null for N consecutive loops,
-                    # the market has almost certainly expired/closed. Kalshi will
-                    # settle it automatically; we just need to clear our local
-                    # state so the bot can move on to the next market.
                     book_is_dead = (pos_book.best_yes_bid is None
                                     and pos_book.best_no_bid is None)
                     if book_is_dead:
@@ -1587,45 +1793,49 @@ def main() -> None:
                              consecutive=null_book_count,
                              limit=NULL_BOOK_EXPIRE_LOOPS)
                         if null_book_count >= NULL_BOOK_EXPIRE_LOOPS:
-                            jlog("warning", "MARKET_EXPIRED_CLEARING_POSITION",
+                            jlog("warning",
+                                 "MARKET_EXPIRED_CLEARING_POSITION",
                                  ticker=pos_ticker,
                                  contracts=current_pos.contracts,
                                  side=current_pos.side,
                                  entry_price=current_pos.entry_price,
                                  null_loops=null_book_count)
                             send_telegram(
-                                f"⚠️ Johnny5: market {pos_ticker} appears expired "
-                                f"(null book for {null_book_count} loops).\n"
-                                f"Clearing local position ({current_pos.side} "
-                                f"x{current_pos.contracts} @ {current_pos.entry_price:.2f}).\n"
-                                f"Kalshi will settle automatically — check your account."
+                                f"⚠️ Johnny5: market {pos_ticker} expired "
+                                f"(null book {null_book_count} loops).\n"
+                                f"Cleared local position — "
+                                f"check Kalshi for settlement."
                             )
                             pos_delete(pos_ticker)
                             null_book_count = 0
                     else:
-                        # Book is live — reset the counter
                         null_book_count = 0
-
-                        force_exit    = KILL_SWITCH and CLOSE_ON_KILL_SWITCH
-                        mark_for_exit = float(pos_mark or current_pos.entry_price)
-
+                        force_exit = KILL_SWITCH and CLOSE_ON_KILL_SWITCH
                         if pos_book.ok or force_exit:
                             maybe_exit(
                                 state=state, client=client,
                                 book=pos_book,
-                                mark_yes=mark_for_exit,
-                                fair_yes=fair_yes,
-                                z=z,
+                                fair_yes=pos_fair_yes,
                                 bucket_ts=pos_ticker,
                                 force=force_exit,
                                 cash_real=real_cash,
                             )
+
+                    if DEBUG_MODEL and dbg_every("model_pos", 30):
+                        jlog("debug", "MODEL_POS",
+                             ticker=pos_ticker,
+                             spot=round(spot, 2),
+                             strike=pos_strike,
+                             secs_rem=round(pos_secs_rem or 0, 1),
+                             sigma=round(sigma, 4),
+                             fair_yes=round(pos_fair_yes, 4),
+                             mark=pos_mark)
+
                 except Exception as e:
-                    jlog("warning", "pos_book_fail",
+                    jlog("warning", "pos_loop_error",
                          ticker=pos_ticker, error=str(e)[:200])
                     cb_increment_error()
             else:
-                # No position held — keep counter at zero
                 null_book_count = 0
 
             # ── ENTER PATH ─────────────────────────────────────────────────
@@ -1633,41 +1843,64 @@ def main() -> None:
                 try:
                     markets = client.list_open_markets()
                     m       = pick_best_active_market(markets)
+
                     if m and m.get("ticker"):
                         ticker    = str(m["ticker"])
                         bucket_ts = bucket_ts_for_market(m)
 
-                        if DEBUG_PICK and dbg_every("pick", 60):
-                            jlog("debug", "PICK_DEBUG", ticker=ticker,
-                                 vol=m.get("volume"), oi=m.get("open_interest"))
-
-                        ob   = client.get_orderbook(ticker)
-                        book = parse_book(ob)
-
-                        if book.mark_yes is not None:
-                            edge = fair_yes - book.mark_yes
-
-                            if DEBUG_MARK and dbg_every("mark_enter", 60):
-                                jlog("debug", "MARK_DEBUG_ENTER",
-                                     ticker=ticker,
-                                     best_yes=book.best_yes_bid,
-                                     best_no=book.best_no_bid,
-                                     mark=book.mark_yes,
-                                     spread=book.spread_cents,
-                                     fair=fair_yes, z=round(z, 4),
-                                     edge=round(edge, 4))
-
-                            maybe_enter(
-                                state=state, client=client,
-                                ticker=ticker, bucket_ts=bucket_ts,
-                                book=book, mark_yes=book.mark_yes,
-                                fair_yes=fair_yes, z=z,
-                                cash_real=real_cash,
-                            )
+                        # Time remaining in bucket
+                        t_rem = secs_until_close(m)
+                        if t_rem is None:
+                            jlog("debug", "enter_skip_no_close_time",
+                                 ticker=ticker)
                         else:
-                            if dbg_every("bad_book", 30):
-                                jlog("debug", "skip_bad_book",
-                                     ticker=ticker, spread=book.spread_cents)
+                            # Fetch full market for strike
+                            mkt    = get_market_cached(client, ticker)
+                            strike = extract_strike(mkt)
+
+                            if strike is None:
+                                if dbg_every("no_strike", 60):
+                                    jlog("warning",
+                                         "enter_skip_no_strike",
+                                         ticker=ticker,
+                                         market_keys=list(mkt.keys())[:15])
+                            else:
+                                fair_yes = model_fair_yes(
+                                    spot, strike, t_rem, sigma
+                                )
+
+                                ob   = client.get_orderbook(ticker)
+                                book = parse_book(ob)
+
+                                edge_cents = (
+                                    (fair_yes - (book.mark_yes or 0.5)) * 100
+                                )
+
+                                if DEBUG_MODEL and dbg_every("model_enter", 30):
+                                    jlog("debug", "MODEL_ENTER",
+                                         ticker=ticker,
+                                         spot=round(spot, 2),
+                                         strike=round(strike, 2),
+                                         secs_rem=round(t_rem, 1),
+                                         sigma=round(sigma, 4),
+                                         fair_yes=round(fair_yes, 4),
+                                         mark=book.mark_yes,
+                                         edge_cents=round(edge_cents, 2))
+
+                                if DEBUG_PICK and dbg_every("pick", 60):
+                                    jlog("debug", "PICK_DEBUG",
+                                         ticker=ticker,
+                                         vol=m.get("volume"),
+                                         oi=m.get("open_interest"))
+
+                                maybe_enter(
+                                    state=state, client=client,
+                                    ticker=ticker, bucket_ts=bucket_ts,
+                                    book=book, fair_yes=fair_yes,
+                                    secs_remaining=t_rem,
+                                    cash_real=real_cash,
+                                    spot=spot, strike=strike, sigma=sigma,
+                                )
                     else:
                         if dbg_every("no_market", 60):
                             jlog("info", "no_open_market")
@@ -1677,17 +1910,20 @@ def main() -> None:
                     cb_increment_error()
 
             # ── Status write ───────────────────────────────────────────────
-            cur      = pos_any()
-            t_mark   = pos_mark if pos_mark else (
-                pos_book.mark_yes if pos_book and pos_book.ok else None
-            )
-            edge_disp = fair_yes - (t_mark or fair_yes)
-
+            cur = pos_any()
             write_status(
                 state=state, message="running",
                 ticker=cur.ticker if cur else "",
-                mark_yes=t_mark, fair_yes=fair_yes,
-                z=z, edge=edge_disp, cash_real=real_cash,
+                mark_yes=pos_mark,
+                fair_yes=pos_fair_yes,
+                spot=spot,
+                strike=pos_strike,
+                sigma=sigma,
+                secs_remaining=pos_secs_rem,
+                edge_cents=(
+                    (pos_fair_yes - (pos_mark or pos_fair_yes)) * 100
+                ),
+                cash_real=real_cash,
             )
             save_state(state)
 

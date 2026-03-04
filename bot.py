@@ -17,6 +17,31 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+def send_telegram(message: str):
+    try:
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+        if not token or not chat_id:
+            log.warning("Telegram not configured. Skipping Telegram message.")
+            return
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": True,
+        }
+
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            log.error(f"Telegram send failed: {r.status_code} {r.text}")
+        else:
+            log.info("Telegram notification sent")
+
+    except Exception as e:
+        log.error(f"Telegram send exception: {e}")
+
 
 # =============================================================================
 # Safe env helpers (handles blank Railway vars)
@@ -138,7 +163,7 @@ def start_health_server() -> None:
                 self.send_response(404)
                 self.end_headers()
 
-        def log_message(self, fmt: str, *args: Any) -> None:
+        def _message(self, fmt: str, *args: Any) -> None:
             return
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
@@ -532,7 +557,7 @@ def compute_contracts(cash: float, price_prob: float) -> int:
 
 
 # =============================================================================
-# Trade logging (ONLY on trades)
+# Trade ging (ONLY on trades)
 # =============================================================================
 
 def log_trade(
@@ -588,6 +613,9 @@ def log_trade(
         flush=True,
     )
 
+send_telegram("Johnny5 Telegram is live ✅")
+
+while True:
 
 # =============================================================================
 # Trading logic

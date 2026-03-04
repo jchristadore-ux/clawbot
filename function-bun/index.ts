@@ -48,12 +48,21 @@ async function loadPrivateKey(): Promise<string | null> {
   return null;
 }
 
-async function signedKalshiHeaders(method: string, path: string): Promise<Record<string, string>> {
+async function signedKalshiHeaders(
+  method: string,
+  path: string,
+  bodyString?: string,
+): Promise<Record<string, string>> {
   const key = await loadPrivateKey();
   if (!KALSHI_KEY_ID || !key) return {};
 
   const ts = Date.now().toString();
-  const payload = `${ts}${method.toUpperCase()}${path}`;
+
+  // IMPORTANT:
+  // For POST/PUT, include the exact request body string in the signature payload.
+  // For GET/DELETE, bodyString should be undefined.
+  const payload = `${ts}${method.toUpperCase()}${path}${bodyString ?? ""}`;
+
   const signer = createSign("RSA-SHA256");
   signer.update(payload);
   signer.end();
@@ -80,7 +89,8 @@ app.get("/", (c) =>
 app.get("/health", async (c) => {
   try {
     const path = "/trade-api/v2/exchange/status";
-    const headers = await signedKalshiHeaders("GET", path);
+    const bodyString = JSON.stringify(orderPayload);
+    const headers = await signedKalshiHeaders("POST", path, bodyString);
     const resp = await fetch(`${KALSHI_BASE_URL}${path}`, { method: "GET", headers });
     const body = await resp.json();
     return c.json({ ok: resp.ok, upstream_status: resp.status, kalshi: body }, resp.ok ? 200 : 502);
@@ -137,7 +147,7 @@ app.post("/order", async (c) => {
     const resp = await fetch(`${KALSHI_BASE_URL}${path}`, {
       method: "POST",
       headers,
-      body: JSON.stringify(orderPayload),
+      body: bodyString,
     });
 
     const text = await resp.text();

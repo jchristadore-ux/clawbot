@@ -52,20 +52,26 @@ async function loadPrivateKey(): Promise<string | null> {
   return null;
 }
 
-async function signedKalshiHeaders(method: string, path: string, bodyString?: string): Promise<Record<string, string>> {
+async function signedKalshiHeaders(
+  method: string,
+  path: string,
+  bodyString?: string
+): Promise<Record<string, string>> {
+
   const key = await loadPrivateKey();
   if (!KALSHI_KEY_ID || !key) return {};
 
   const ts = Date.now().toString();
 
-  // IMPORTANT:
-  // For POST/PUT: include the exact body string in the signature payload.
-  // For GET/DELETE: bodyString should be undefined.
   const payload = `${ts}${method.toUpperCase()}${path}${bodyString ?? ""}`;
 
   const signer = createSign("RSA-SHA256");
-  signer.update(payload);
+
+  // IMPORTANT: sign UTF8 buffer
+  signer.update(Buffer.from(payload, "utf8"));
+
   signer.end();
+
   const signature = signer.sign(key, "base64");
 
   return {

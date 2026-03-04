@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { createSign, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { constants } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const KALSHI_BASE_URL = (process.env.KALSHI_BASE_URL || "https://api.elections.kalshi.com").replace(/\/$/, "");
@@ -52,27 +53,28 @@ async function loadPrivateKey(): Promise<string | null> {
   return null;
 }
 
-async function signedKalshiHeaders(
-  method: string,
-  path: string,
-  bodyString?: string
-): Promise<Record<string, string>> {
-
+async function signedKalshiHeaders(method: string, path: string): Promise<Record<string, string>> {
   const key = await loadPrivateKey();
   if (!KALSHI_KEY_ID || !key) return {};
 
   const ts = Date.now().toString();
 
-  const payload = `${ts}${method.toUpperCase()}${path}${bodyString ?? ""}`;
+  // Kalshi: signature is over timestamp + method + path (no body)
+  const payload = `${ts}${method.toUpperCase()}${path}`;
 
-  const signer = createSign("RSA-SHA256");
-
-  // IMPORTANT: sign UTF8 buffer
-  signer.update(Buffer.from(payload, "utf8"));
-
+  const signer = createSign("sha256");
+  signer.update(payload);
   signer.end();
 
-  const signature = signer.sign(key, "base64");
+  // Kalshi expects RSA-PSS (not PKCS#1 v1.5)
+  const signature = signer.sign(
+    {
+      key,
+      padding: constants.RSA_PKCS1_PSS_PADDING,
+      saltLength: 32, // standard for SHA256
+    },
+    "base64",
+  );
 
   return {
     "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
@@ -95,7 +97,7 @@ app.get("/", (c) =>
 app.get("/health", async (c) => {
   try {
     const path = "/trade-api/v2/exchange/status";
-    const headers = await signedKalshiHeaders("GET", path);
+    const headers = await Headers("GET", path);
 
     if (!headers["KALSHI-ACCESS-KEY"]) {
       return c.json({ ok: false, error: "missing Kalshi credentials" }, 500);
@@ -151,20 +153,15 @@ app.post("/order", async (c) => {
   try {
     const path = "/trade-api/v2/portfolio/orders";
 
-    // Sign the exact string we will send
     const bodyString = JSON.stringify(orderPayload);
-    const headers = await signedKalshiHeaders("POST", path, bodyString);
-
-    if (!headers["KALSHI-ACCESS-KEY"]) {
-      return c.json({ ok: false, error: "missing Kalshi credentials" }, 500);
-    }
+    const headers = await signedKalshiHeaders("POST", path);
 
     const resp = await fetch(`${KALSHI_BASE_URL}${path}`, {
       method: "POST",
       headers,
       body: bodyString,
-    });
-
+});
+    
     const text = await resp.text();
     let parsed: unknown = text;
     try {

@@ -371,7 +371,7 @@ class KalshiClient:
     def get_orderbook(self, ticker: str) -> Dict[str, Any]:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
 
-        def place_order(self, action: str, ticker: str, side: str, contracts: int, price_cents: int) -> Dict[str, Any]:
+    def place_order(self, action: str, ticker: str, side: str, contracts: int, price_cents: int) -> Dict[str, Any]:
         # Routes order placement through the Bun gateway (modest-patience) to avoid Python RSA signing issues.
         # Requires env var in clawbot-worker:
         #   KALSHI_ORDER_GATEWAY_URL=https://modest-patience-production-651b.up.railway.app

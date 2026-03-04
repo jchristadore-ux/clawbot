@@ -371,48 +371,46 @@ class KalshiClient:
     def get_orderbook(self, ticker: str) -> Dict[str, Any]:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
 
-    def place_order(self, action: str, ticker: str, side: str, contracts: int, price_cents: int) -> Dict[str, Any]:
-    """
-    Routes order placement through the Bun gateway (modest-patience) to avoid Python RSA signing issues.
-    Set KALSHI_ORDER_GATEWAY_URL to your modest-patience URL, e.g.:
-      https://modest-patience-production-651b.up.railway.app
-    """
-    # Paper mode: simulate success
-    if not LIVE_MODE:
-        return {"ok": True, "paper": True}
+        def place_order(self, action: str, ticker: str, side: str, contracts: int, price_cents: int) -> Dict[str, Any]:
+        # Routes order placement through the Bun gateway (modest-patience) to avoid Python RSA signing issues.
+        # Requires env var in clawbot-worker:
+        #   KALSHI_ORDER_GATEWAY_URL=https://modest-patience-production-651b.up.railway.app
 
-    gateway = env_str("KALSHI_ORDER_GATEWAY_URL", "").rstrip("/")
-    if not gateway:
-        raise RuntimeError("KALSHI_ORDER_GATEWAY_URL is required in LIVE_MODE")
+        # Paper mode: simulate success
+        if not LIVE_MODE:
+            return {"ok": True, "paper": True}
 
-    if action not in ("buy", "sell"):
-        raise ValueError("action must be buy or sell")
-    if side not in ("YES", "NO"):
-        raise ValueError("side must be YES or NO")
+        gateway = env_str("KALSHI_ORDER_GATEWAY_URL", "").rstrip("/")
+        if not gateway:
+            raise RuntimeError("KALSHI_ORDER_GATEWAY_URL is required in LIVE_MODE")
 
-    payload: Dict[str, Any] = {
-        "ticker": ticker,
-        "action": action,
-        "type": "limit",
-        "side": side,
-        "count": int(contracts),
-    }
-    if side == "YES":
-        payload["yes_price"] = int(price_cents)
-    else:
-        payload["no_price"] = int(price_cents)
+        if action not in ("buy", "sell"):
+            raise ValueError("action must be buy or sell")
+        if side not in ("YES", "NO"):
+            raise ValueError("side must be YES or NO")
 
-    r = requests.post(f"{gateway}/order", json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Order gateway HTTP {r.status_code}: {(r.text or '')[:300]}")
-    out = r.json()
-    if not isinstance(out, dict):
-        raise RuntimeError("Order gateway returned non-JSON object")
-    if not out.get("ok"):
-        raise RuntimeError(f"Order gateway rejected order: {json.dumps(out)[:300]}")
-    return out
+        payload: Dict[str, Any] = {
+            "ticker": ticker,
+            "action": action,
+            "type": "limit",
+            "side": side,
+            "count": int(contracts),
+        }
+        if side == "YES":
+            payload["yes_price"] = int(price_cents)
+        else:
+            payload["no_price"] = int(price_cents)
 
-
+        r = requests.post(f"{gateway}/order", json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Order gateway HTTP {r.status_code}: {(r.text or '')[:300]}")
+        out = r.json()
+        if not isinstance(out, dict):
+            raise RuntimeError("Order gateway returned non-JSON object")
+        if not out.get("ok"):
+            raise RuntimeError(f"Order gateway rejected order: {json.dumps(out)[:300]}")
+        return out
+    
 # =============================================================================
 # Market selection (prefer liquid active bucket)
 # =============================================================================

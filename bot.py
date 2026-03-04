@@ -1278,11 +1278,7 @@ def maybe_enter(
              ticker=ticker, side=side, contracts=contracts,
              price_cents=price_cents, z=round(z, 3), edge=round(edge, 3),
              order_id=order_id)
-        send_telegram(
-            f"✅ Johnny5 ENTER\n"
-            f"Ticker: {ticker} | Side: {side} | Qty: {contracts} | Price: {price_cents}¢\n"
-            f"Edge: {edge*100:.1f}% | z: {z:.2f} | Cash avail: ${cash:.2f}"
-        )
+        # No Telegram on ENTER — only EXIT sends an alert
         return True
 
     except RuntimeError as e:
@@ -1309,6 +1305,7 @@ def maybe_exit(
     z:         float,
     bucket_ts: str,
     force:     bool = False,
+    cash_real: Optional[float] = None,
 ) -> bool:
     # Always operate on the ACTUALLY held ticker
     pos = pos_any()
@@ -1393,10 +1390,12 @@ def maybe_exit(
         jlog("info", "EXIT_SUBMITTED",
              ticker=ticker, side=side, contracts=contracts,
              price_cents=price_cents, pnl=round(pnl, 4), order_id=order_id)
+        bal_str = f"${cash_real:.2f}" if cash_real is not None else "check app"
         send_telegram(
             f"{'🔴' if pnl < 0 else '🟢'} Johnny5 EXIT\n"
-            f"Ticker: {ticker} | Side: {side} | Qty: {contracts} | Price: {price_cents}¢\n"
-            f"PnL: ${pnl:.2f} | Lifetime: ${state.realized_pnl_lifetime:.2f}"
+            f"Ticker: {ticker} | {side} x{contracts} @ {price_cents}¢\n"
+            f"PnL this trade: ${pnl:+.2f}\n"
+            f"Kalshi balance: {bal_str}"
         )
         return True
 
@@ -1619,6 +1618,7 @@ def main() -> None:
                                 z=z,
                                 bucket_ts=pos_ticker,
                                 force=force_exit,
+                                cash_real=real_cash,
                             )
                 except Exception as e:
                     jlog("warning", "pos_book_fail",

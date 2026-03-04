@@ -57,8 +57,6 @@ async function signedKalshiHeaders(
   if (!KALSHI_KEY_ID || !key) return {};
 
   const ts = Date.now().toString();
-
-  // Use the function parameter `body` (never a free variable)
   const payload = `${ts}${method.toUpperCase()}${path}${body ?? ""}`;
 
   const signer = createSign("RSA-SHA256");
@@ -87,8 +85,7 @@ app.get("/", (c) =>
 app.get("/health", async (c) => {
   try {
     const path = "/trade-api/v2/exchange/status";
-    const bodyString = JSON.stringify(orderPayload);
-    const headers = await signedKalshiHeaders("POST", path, bodyString);
+    const headers = await signedKalshiHeaders("GET", path);
     const resp = await fetch(`${KALSHI_BASE_URL}${path}`, { method: "GET", headers });
     const body = await resp.json();
     return c.json({ ok: resp.ok, upstream_status: resp.status, kalshi: body }, resp.ok ? 200 : 502);

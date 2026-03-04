@@ -898,8 +898,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        send_telegram("Johnny5 Telegram is live ✅")
-    except Exception:
-        pass
     main()

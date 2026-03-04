@@ -141,7 +141,7 @@ KRAKEN_TICKER_URL = env_str("KRAKEN_TICKER_URL", "https://api.kraken.com/0/publi
 # Strategy
 LOOKBACK         = env_int("LOOKBACK", 20)
 FAIR_MOVE_SCALE  = env_float("FAIR_MOVE_SCALE", 0.15)
-MIN_CONVICTION_Z = env_float("MIN_CONVICTION_Z", 1.2)   # BOTH z AND edge must pass
+MIN_CONVICTION_Z = env_float("MIN_CONVICTION_Z", 1.5)   # BOTH z AND edge must pass independently
 EDGE_ENTER       = env_float("EDGE_ENTER", 0.08)
 EDGE_EXIT        = env_float("EDGE_EXIT", 0.02)
 
@@ -158,8 +158,8 @@ MAX_ORDERS_PER_HOUR = env_int("MAX_ORDERS_PER_HOUR", 10)
 MAX_CONSEC_ERRORS   = env_int("MAX_CONSECUTIVE_ERRORS", 5)
 
 # Timing
-MIN_HOLD_SECONDS   = env_int("MIN_HOLD_SECONDS", 90)
-COOLDOWN_SECONDS   = env_int("COOLDOWN_SECONDS", 45)
+MIN_HOLD_SECONDS   = env_int("MIN_HOLD_SECONDS", 120)
+COOLDOWN_SECONDS   = env_int("COOLDOWN_SECONDS", 120)
 MIN_ORDER_INTERVAL = env_float("MIN_ORDER_INTERVAL_SECONDS", 5.0)
 
 # Book quality
@@ -168,6 +168,11 @@ MAX_BID_CENTS       = env_int("MAX_BID_CENTS", 97)
 MAX_SPREAD_CENTS    = env_int("MAX_SPREAD_CENTS", 8)
 MIN_DEPTH_CONTRACTS = env_int("MIN_DEPTH_CONTRACTS", 3)
 MAX_SLIPPAGE_CENTS  = env_int("MAX_SLIPPAGE_CENTS", 4)
+
+# Expired-market guard: clear local position after this many consecutive
+# null-book loops (best_yes=null AND best_no=null) on a held ticker.
+# At POLL_SECONDS=10, 6 loops = ~60s of dead book before giving up.
+NULL_BOOK_EXPIRE_LOOPS = env_int("NULL_BOOK_EXPIRE_LOOPS", 6)
 
 # Control switches
 KILL_SWITCH          = env_bool("KILL_SWITCH", False)
@@ -1509,8 +1514,9 @@ def main() -> None:
             jlog("warning", "LOW_BALANCE_AT_BOOT", cash_usd=real_cash)
             send_telegram(f"⚠️ Johnny5: low balance at boot: ${real_cash:.2f}")
 
-    prices:  List[float] = []
-    loop_id: int         = 0
+    prices:          List[float] = []
+    loop_id:         int         = 0
+    null_book_count: int         = 0   # consecutive loops where held position has null book
 
     while True:
         loop_id += 1
@@ -1568,23 +1574,59 @@ def main() -> None:
                              mark=pos_mark,
                              spread=pos_book.spread_cents)
 
-                    force_exit    = KILL_SWITCH and CLOSE_ON_KILL_SWITCH
-                    mark_for_exit = float(pos_mark or current_pos.entry_price)
+                    # ── Expired-market guard ───────────────────────────────
+                    # If both sides of the book are null for N consecutive loops,
+                    # the market has almost certainly expired/closed. Kalshi will
+                    # settle it automatically; we just need to clear our local
+                    # state so the bot can move on to the next market.
+                    book_is_dead = (pos_book.best_yes_bid is None
+                                    and pos_book.best_no_bid is None)
+                    if book_is_dead:
+                        null_book_count += 1
+                        jlog("warning", "null_book_on_held_position",
+                             ticker=pos_ticker,
+                             consecutive=null_book_count,
+                             limit=NULL_BOOK_EXPIRE_LOOPS)
+                        if null_book_count >= NULL_BOOK_EXPIRE_LOOPS:
+                            jlog("warning", "MARKET_EXPIRED_CLEARING_POSITION",
+                                 ticker=pos_ticker,
+                                 contracts=current_pos.contracts,
+                                 side=current_pos.side,
+                                 entry_price=current_pos.entry_price,
+                                 null_loops=null_book_count)
+                            send_telegram(
+                                f"⚠️ Johnny5: market {pos_ticker} appears expired "
+                                f"(null book for {null_book_count} loops).\n"
+                                f"Clearing local position ({current_pos.side} "
+                                f"x{current_pos.contracts} @ {current_pos.entry_price:.2f}).\n"
+                                f"Kalshi will settle automatically — check your account."
+                            )
+                            pos_delete(pos_ticker)
+                            null_book_count = 0
+                    else:
+                        # Book is live — reset the counter
+                        null_book_count = 0
 
-                    if pos_book.ok or force_exit:
-                        maybe_exit(
-                            state=state, client=client,
-                            book=pos_book,
-                            mark_yes=mark_for_exit,
-                            fair_yes=fair_yes,
-                            z=z,
-                            bucket_ts=pos_ticker,  # ticker = stable bucket for exit
-                            force=force_exit,
-                        )
+                        force_exit    = KILL_SWITCH and CLOSE_ON_KILL_SWITCH
+                        mark_for_exit = float(pos_mark or current_pos.entry_price)
+
+                        if pos_book.ok or force_exit:
+                            maybe_exit(
+                                state=state, client=client,
+                                book=pos_book,
+                                mark_yes=mark_for_exit,
+                                fair_yes=fair_yes,
+                                z=z,
+                                bucket_ts=pos_ticker,
+                                force=force_exit,
+                            )
                 except Exception as e:
                     jlog("warning", "pos_book_fail",
                          ticker=pos_ticker, error=str(e)[:200])
                     cb_increment_error()
+            else:
+                # No position held — keep counter at zero
+                null_book_count = 0
 
             # ── ENTER PATH ─────────────────────────────────────────────────
             if not KILL_SWITCH and pos_any() is None:

@@ -613,15 +613,6 @@ def log_trade(
         flush=True,
     )
 
-    # Telegram: notify on successful boot (optional)
-    try:
-        send_telegram("Johnny5 Telegram is live ✅")
-    except Exception as _e:
-        pass
-
-    while True:
-        try:
-
 # =============================================================================
 # Trading logic
 # =============================================================================
@@ -892,4 +883,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        send_telegram("Johnny5 Telegram is live ✅")
+    except Exception:
+        pass
     main()

@@ -631,10 +631,15 @@ def log_trade(
     # Telegram: ONLY notify on ENTER
     if event == "ENTER":
         try:
+            # Estimated risk/cost at entry (simple: price * contracts)
+            risk_usd = float(exec_price) * int(contracts)
+
             msg = (
-                f"ENTER ✅ {ticker}\n"
+                "🤖 Johnny5 — TRADE EXECUTED ✅\n"
+                f"Ticker: {ticker}\n"
                 f"Side: {side} | Contracts: {contracts} | Price: {exec_price:.2f}\n"
-                f"Edge: {edge:.4f} | z: {z:.2f}\n"
+                f"Risk (est): ${risk_usd:.2f}\n"
+                f"Edge: {edge*100:.2f}% | z: {z:.2f}\n"
                 f"Cash: ${state.cash:.2f} | Equity: ${equity_total:.2f}\n"
                 f"PnL 24h (realized): ${pnl_24h:.2f} | Lifetime (realized): ${state.realized_pnl_lifetime:.2f}"
             )

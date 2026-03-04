@@ -296,8 +296,8 @@ class KalshiClient:
             except Exception as e:
                 self.private_key = None
                 print(json.dumps({"ts": utc_iso(), "event": "BOOT_WARN", "msg": f"private_key_load_failed: {str(e)[:200]}"}), flush=True)
-        else:
-            print(json.dumps({"ts": utc_iso(), "event": "BOOT_WARN", "msg": "no_private_key_found"}), flush=True)
+            else:
+                print(json.dumps({"ts": utc_iso(), "event": "BOOT_WARN", "msg": "no_private_key_found"}), flush=True)
 
     @staticmethod
     def _resolve_private_key_material() -> str:

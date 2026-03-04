@@ -587,6 +587,7 @@ def log_trade(
 
     equity_total = state.cash + unrealized
 
+    # Always print the trade log (ENTER + EXIT)
     print(
         json.dumps(
             {
@@ -612,6 +613,20 @@ def log_trade(
         ),
         flush=True,
     )
+
+    # Telegram: ONLY notify on ENTER
+    if event == "ENTER":
+        try:
+            msg = (
+                f"ENTER ✅ {ticker}\n"
+                f"Side: {side} | Contracts: {contracts} | Price: {exec_price:.2f}\n"
+                f"Edge: {edge:.4f} | z: {z:.2f}\n"
+                f"Cash: ${state.cash:.2f} | Equity: ${equity_total:.2f}\n"
+                f"PnL 24h (realized): ${pnl_24h:.2f} | Lifetime (realized): ${state.realized_pnl_lifetime:.2f}"
+            )
+            send_telegram(msg)
+        except Exception:
+            pass
 
 # =============================================================================
 # Trading logic

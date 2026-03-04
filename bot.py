@@ -1393,7 +1393,7 @@ def maybe_exit(
         bal_str = f"${cash_real:.2f}" if cash_real is not None else "check app"
         send_telegram(
             f"{'🔴' if pnl < 0 else '🟢'} Johnny5 EXIT\n"
-            f"Ticker: {ticker} | {side} x{contracts} @ {price_cents}¢\n"
+            f"{side} x{contracts} @ {price_cents}¢\n"
             f"PnL this trade: ${pnl:+.2f}\n"
             f"Kalshi balance: {bal_str}"
         )

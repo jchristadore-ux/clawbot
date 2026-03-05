@@ -6,6 +6,7 @@
     "start": "bun run index.ts"
   },
   "dependencies": {
-    "hono": "4.6.10"
+    "hono": "4.6.10",
+    "postgres": "3.4.4"
   }
 }

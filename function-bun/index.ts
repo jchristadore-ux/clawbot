@@ -1,16 +1,14 @@
 import { Hono } from "hono";
 import { createSign, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { constants } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const KALSHI_BASE_URL = (process.env.KALSHI_BASE_URL || "https://api.elections.kalshi.com").replace(/\/$/, "");
-const KALSHI_KEY_ID = (process.env.KALSHI_API_KEY_ID || "").trim();
-const KALSHI_PRIVATE_KEY_PEM = (process.env.KALSHI_PRIVATE_KEY_PEM || "").trim();
-const KALSHI_PRIVATE_KEY_PATH = (process.env.KALSHI_PRIVATE_KEY_PATH || "").trim();
+const KALSHI_KEY_ID = process.env.KALSHI_API_KEY_ID || "";
+const KALSHI_PRIVATE_KEY_PEM = process.env.KALSHI_PRIVATE_KEY_PEM || "";
+const KALSHI_PRIVATE_KEY_PATH = process.env.KALSHI_PRIVATE_KEY_PATH || "";
 
 type Side = "YES" | "NO";
-type Action = "buy" | "sell";
 
 function asString(x: unknown): string | null {
   if (typeof x !== "string") return null;
@@ -24,30 +22,27 @@ function asNumber(x: unknown): number | null {
 }
 
 async function loadPrivateKey(): Promise<string | null> {
-  // Preferred: direct PEM
-  if (KALSHI_PRIVATE_KEY_PEM) return KALSHI_PRIVATE_KEY_PEM;
+  if (KALSHI_PRIVATE_KEY_PEM.trim()) return KALSHI_PRIVATE_KEY_PEM.trim();
 
-  // Next: path or inline
-  if (!KALSHI_PRIVATE_KEY_PATH) return null;
+  const raw = KALSHI_PRIVATE_KEY_PATH.trim();
+  if (!raw) return null;
 
-  if (KALSHI_PRIVATE_KEY_PATH.includes("BEGIN")) return KALSHI_PRIVATE_KEY_PATH;
+  if (raw.includes("BEGIN")) return raw;
 
-  // File path
   try {
-    if (KALSHI_PRIVATE_KEY_PATH.length < 512) {
-      const text = await readFile(KALSHI_PRIVATE_KEY_PATH, "utf-8");
-      if (text.includes("BEGIN")) return text.trim();
+    if (raw.length < 512) {
+      const text = await readFile(raw, "utf-8");
+      if (text.includes("BEGIN")) return text;
     }
   } catch {
-    // ignore
+    // fallthrough
   }
 
-  // Base64 PEM
   try {
-    const decoded = Buffer.from(KALSHI_PRIVATE_KEY_PATH, "base64").toString("utf-8");
-    if (decoded.includes("BEGIN")) return decoded.trim();
+    const decoded = Buffer.from(raw, "base64").toString("utf-8");
+    if (decoded.includes("BEGIN")) return decoded;
   } catch {
-    // ignore
+    // fallthrough
   }
 
   return null;
@@ -58,23 +53,11 @@ async function signedKalshiHeaders(method: string, path: string): Promise<Record
   if (!KALSHI_KEY_ID || !key) return {};
 
   const ts = Date.now().toString();
-
-  // Kalshi: signature is over timestamp + method + path (no body)
   const payload = `${ts}${method.toUpperCase()}${path}`;
-
-  const signer = createSign("sha256");
+  const signer = createSign("RSA-SHA256");
   signer.update(payload);
   signer.end();
-
-  // Kalshi expects RSA-PSS (not PKCS#1 v1.5)
-  const signature = signer.sign(
-    {
-      key,
-      padding: constants.RSA_PKCS1_PSS_PADDING,
-      saltLength: 32, // standard for SHA256
-    },
-    "base64",
-  );
+  const signature = signer.sign(key, "base64");
 
   return {
     "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
@@ -97,12 +80,7 @@ app.get("/", (c) =>
 app.get("/health", async (c) => {
   try {
     const path = "/trade-api/v2/exchange/status";
-    const headers = await Headers("GET", path);
-
-    if (!headers["KALSHI-ACCESS-KEY"]) {
-      return c.json({ ok: false, error: "missing Kalshi credentials" }, 500);
-    }
-
+    const headers = await signedKalshiHeaders("GET", path);
     const resp = await fetch(`${KALSHI_BASE_URL}${path}`, { method: "GET", headers });
     const body = await resp.json();
     return c.json({ ok: resp.ok, upstream_status: resp.status, kalshi: body }, resp.ok ? 200 : 502);
@@ -120,18 +98,16 @@ app.post("/order", async (c) => {
   }
 
   const ticker = asString(body?.ticker);
-  const side = (asString(body?.side)?.toUpperCase() as Side | null) ?? null;
-  const action = (asString(body?.action)?.toLowerCase() as Action | null) ?? "buy";
-  const type = asString(body?.type)?.toLowerCase() || "limit";
-
+  const side = asString(body?.side)?.toUpperCase() as Side | undefined;
   const count = asNumber(body?.count ?? body?.contracts);
   const yesPrice = asNumber(body?.yes_price ?? body?.yesPrice);
   const noPrice = asNumber(body?.no_price ?? body?.noPrice);
+  const action = asString(body?.action)?.toLowerCase() || "buy";
+  const type = asString(body?.type)?.toLowerCase() || "limit";
 
   if (!ticker) return c.json({ ok: false, error: "ticker is required" }, 400);
   if (side !== "YES" && side !== "NO") return c.json({ ok: false, error: 'side must be "YES" or "NO"' }, 400);
   if (!count || count <= 0) return c.json({ ok: false, error: "count/contracts must be > 0" }, 400);
-  if (action !== "buy" && action !== "sell") return c.json({ ok: false, error: 'action must be "buy" or "sell"' }, 400);
 
   const orderPayload: Record<string, unknown> = {
     ticker,
@@ -152,16 +128,18 @@ app.post("/order", async (c) => {
 
   try {
     const path = "/trade-api/v2/portfolio/orders";
-
-    const bodyString = JSON.stringify(orderPayload);
     const headers = await signedKalshiHeaders("POST", path);
+
+    if (!headers["KALSHI-ACCESS-KEY"]) {
+      return c.json({ ok: false, error: "missing Kalshi credentials" }, 500);
+    }
 
     const resp = await fetch(`${KALSHI_BASE_URL}${path}`, {
       method: "POST",
       headers,
-      body: bodyString,
-});
-    
+      body: JSON.stringify(orderPayload),
+    });
+
     const text = await resp.text();
     let parsed: unknown = text;
     try {
@@ -181,6 +159,47 @@ app.post("/order", async (c) => {
     );
   } catch (error) {
     return c.json({ ok: false, error: String(error) }, 500);
+  }
+});
+
+// ── /setup-db — creates bot_updates table, hit once in browser ───────────────
+const DATABASE_URL = process.env.DATABASE_URL || "";
+
+app.get("/setup-db", async (c) => {
+  if (!DATABASE_URL) {
+    return c.json({ ok: false, error: "DATABASE_URL env var not set on this service" }, 500);
+  }
+
+  try {
+    // Use postgres.js (built into Bun) to run the CREATE TABLE
+    const { default: postgres } = await import("postgres");
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
+
+    await sql`
+      CREATE TABLE IF NOT EXISTS bot_updates (
+        id          SERIAL PRIMARY KEY,
+        created_at  TIMESTAMPTZ DEFAULT NOW(),
+        version     TEXT NOT NULL,
+        code        TEXT NOT NULL,
+        applied     BOOLEAN DEFAULT FALSE,
+        applied_at  TIMESTAMPTZ
+      )
+    `;
+
+    // Verify table exists
+    const rows = await sql`
+      SELECT COUNT(*) as count FROM bot_updates
+    `;
+
+    await sql.end();
+
+    return c.json({
+      ok: true,
+      message: "bot_updates table created (or already existed)",
+      row_count: rows[0].count,
+    });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
   }
 });
 

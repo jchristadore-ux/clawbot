@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { createSign, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import postgres from "postgres";
 
 const PORT = Number(process.env.PORT || 3000);
 const KALSHI_BASE_URL = (process.env.KALSHI_BASE_URL || "https://api.elections.kalshi.com").replace(/\/$/, "");
@@ -171,8 +172,6 @@ app.get("/setup-db", async (c) => {
   }
 
   try {
-    // Use postgres.js (built into Bun) to run the CREATE TABLE
-    const { default: postgres } = await import("postgres");
     const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
 
     await sql`
@@ -186,11 +185,7 @@ app.get("/setup-db", async (c) => {
       )
     `;
 
-    // Verify table exists
-    const rows = await sql`
-      SELECT COUNT(*) as count FROM bot_updates
-    `;
-
+    const rows = await sql`SELECT COUNT(*) as count FROM bot_updates`;
     await sql.end();
 
     return c.json({

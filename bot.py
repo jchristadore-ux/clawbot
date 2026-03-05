@@ -25,6 +25,120 @@ except ImportError:
     _HOT_RELOAD_AVAILABLE = False
     def check_hot_reload(): pass
 
+
+# =============================================================================
+# Postgres log writer — intercepts stdout, mirrors every line to bot_logs table
+# =============================================================================
+
+import queue as _queue
+import sys as _sys
+
+_log_queue: "_queue.Queue[str]" = _queue.Queue(maxsize=2000)
+_DB_LOG_ENABLED = bool(os.getenv("DATABASE_URL", "").strip())
+
+class _TeeWriter:
+    """Writes to real stdout AND queues lines for Postgres insertion."""
+    def __init__(self, real):
+        self._real = real
+
+    def write(self, s):
+        self._real.write(s)
+        if _DB_LOG_ENABLED and s.strip():
+            try:
+                _log_queue.put_nowait(s.strip())
+            except _queue.Full:
+                pass  # drop if queue full — never block the bot
+
+    def flush(self):
+        self._real.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+def _start_db_log_worker():
+    """Background thread: drains queue and bulk-inserts into bot_logs."""
+    import psycopg2
+
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if not db_url:
+        return
+
+    def _ensure_table(conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_logs (
+                    id          BIGSERIAL PRIMARY KEY,
+                    ts          TIMESTAMPTZ DEFAULT NOW(),
+                    message     TEXT NOT NULL,
+                    event       TEXT,
+                    severity    TEXT DEFAULT 'info'
+                );
+                CREATE INDEX IF NOT EXISTS bot_logs_ts_idx ON bot_logs (ts DESC);
+            """)
+        conn.commit()
+
+    def _parse_event(line: str) -> str:
+        try:
+            d = json.loads(line)
+            return str(d.get("event", ""))[:64]
+        except Exception:
+            return ""
+
+    def _severity(line: str) -> str:
+        low = line.lower()
+        if "error" in low or "exception" in low:
+            return "error"
+        if "enter" in low or "exit" in low or "trade" in low:
+            return "trade"
+        if "boot" in low or "hot_reload" in low:
+            return "system"
+        return "info"
+
+    def worker():
+        conn = None
+        while True:
+            try:
+                if conn is None or conn.closed:
+                    conn = psycopg2.connect(db_url, connect_timeout=5)
+                    conn.autocommit = False
+                    _ensure_table(conn)
+
+                # Collect up to 50 lines or wait 3s
+                batch = []
+                try:
+                    batch.append(_log_queue.get(timeout=3))
+                except _queue.Empty:
+                    continue
+                while len(batch) < 50:
+                    try:
+                        batch.append(_log_queue.get_nowait())
+                    except _queue.Empty:
+                        break
+
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        "INSERT INTO bot_logs (message, event, severity) VALUES (%s, %s, %s)",
+                        [(line, _parse_event(line), _severity(line)) for line in batch],
+                    )
+                conn.commit()
+
+            except Exception:
+                try:
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
+                conn = None
+                time.sleep(5)
+
+    t = threading.Thread(target=worker, daemon=True, name="db-log-writer")
+    t.start()
+
+# Activate stdout tee + start background worker
+if _DB_LOG_ENABLED:
+    _sys.stdout = _TeeWriter(_sys.stdout)
+    _start_db_log_worker()
+
 def send_telegram(message: str):
     try:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()

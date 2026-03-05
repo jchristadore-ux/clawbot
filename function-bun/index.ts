@@ -198,6 +198,67 @@ app.get("/setup-db", async (c) => {
   }
 });
 
+// ── /logs — proxies Railway GraphQL to avoid browser CORS ────────────────────
+const RAILWAY_TOKEN = process.env.RAILWAY_TOKEN || "";
+const RAILWAY_PROJECT_ID = process.env.RAILWAY_PROJECT_ID || "469c280f-68f1-4293-beab-19dceeedde7e";
+const RAILWAY_SERVICE_ID = process.env.RAILWAY_SERVICE_ID || "0a405cac-8993-49bc-8589-e7349e380e48";
+const RAILWAY_GQL = "https://backboard.railway.app/graphql/v2";
+
+app.get("/logs", async (c) => {
+  if (!RAILWAY_TOKEN) {
+    return c.json({ ok: false, error: "RAILWAY_TOKEN not set on this service" }, 500);
+  }
+
+  try {
+    // Step 1: get latest deployment ID
+    const r1 = await fetch(RAILWAY_GQL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
+      body: JSON.stringify({
+        query: `query { deployments(input: { projectId: "${RAILWAY_PROJECT_ID}", serviceId: "${RAILWAY_SERVICE_ID}" }, first: 1) { edges { node { id status createdAt } } } }`,
+      }),
+    });
+    const d1 = await r1.json() as any;
+    if (d1.errors) return c.json({ ok: false, error: d1.errors[0]?.message }, 500);
+
+    const dep = d1?.data?.deployments?.edges?.[0]?.node;
+    if (!dep) return c.json({ ok: false, error: "No deployment found" }, 404);
+
+    // Step 2: get logs for that deployment
+    const tail = Number(c.req.query("tail") || 300);
+    const r2 = await fetch(RAILWAY_GQL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
+      body: JSON.stringify({
+        query: `query { deploymentLogs(deploymentId: "${dep.id}", tail: ${tail}) { timestamp message severity } }`,
+      }),
+    });
+    const d2 = await r2.json() as any;
+    if (d2.errors) return c.json({ ok: false, error: d2.errors[0]?.message }, 500);
+
+    const logs = d2?.data?.deploymentLogs || [];
+
+    return c.json({
+      ok: true,
+      deployment_id: dep.id,
+      deployment_status: dep.status,
+      count: logs.length,
+      logs,
+    }, 200, {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET",
+    });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
+  }
+});
+
+app.options("/logs", (c) => c.text("", 204, {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+}));
+
 Bun.serve({
   hostname: "0.0.0.0",
   port: PORT,

@@ -56,26 +56,12 @@ class _TeeWriter:
         return getattr(self._real, name)
 
 def _start_db_log_worker():
-    """Background thread: drains queue and bulk-inserts into bot_logs."""
-    import psycopg2
+    """Background thread: drains queue and POSTs logs to Bun gateway /ingest-logs.
+    Uses requests (already a dependency) — no native libs needed."""
 
-    db_url = os.getenv("DATABASE_URL", "").strip()
-    if not db_url:
+    gateway = os.getenv("KALSHI_ORDER_GATEWAY_URL", "").rstrip("/")
+    if not gateway:
         return
-
-    def _ensure_table(conn):
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS bot_logs (
-                    id          BIGSERIAL PRIMARY KEY,
-                    ts          TIMESTAMPTZ DEFAULT NOW(),
-                    message     TEXT NOT NULL,
-                    event       TEXT,
-                    severity    TEXT DEFAULT 'info'
-                );
-                CREATE INDEX IF NOT EXISTS bot_logs_ts_idx ON bot_logs (ts DESC);
-            """)
-        conn.commit()
 
     def _parse_event(line: str) -> str:
         try:
@@ -95,14 +81,8 @@ def _start_db_log_worker():
         return "info"
 
     def worker():
-        conn = None
         while True:
             try:
-                if conn is None or conn.closed:
-                    conn = psycopg2.connect(db_url, connect_timeout=5)
-                    conn.autocommit = False
-                    _ensure_table(conn)
-
                 # Collect up to 50 lines or wait 3s
                 batch = []
                 try:
@@ -115,27 +95,25 @@ def _start_db_log_worker():
                     except _queue.Empty:
                         break
 
-                with conn.cursor() as cur:
-                    cur.executemany(
-                        "INSERT INTO bot_logs (message, event, severity) VALUES (%s, %s, %s)",
-                        [(line, _parse_event(line), _severity(line)) for line in batch],
-                    )
-                conn.commit()
-
+                payload = [
+                    {"message": line, "event": _parse_event(line), "severity": _severity(line)}
+                    for line in batch
+                ]
+                requests.post(
+                    f"{gateway}/ingest-logs",
+                    json=payload,
+                    timeout=5,
+                )
             except Exception:
-                try:
-                    if conn:
-                        conn.close()
-                except Exception:
-                    pass
-                conn = None
                 time.sleep(5)
 
     t = threading.Thread(target=worker, daemon=True, name="db-log-writer")
     t.start()
 
 # Activate stdout tee + start background worker
-if _DB_LOG_ENABLED:
+# Enabled if we have the gateway URL (uses requests, no native deps)
+_LOG_SHIP_ENABLED = bool(os.getenv("KALSHI_ORDER_GATEWAY_URL", "").strip())
+if _LOG_SHIP_ENABLED:
     _sys.stdout = _TeeWriter(_sys.stdout)
     _start_db_log_worker()
 

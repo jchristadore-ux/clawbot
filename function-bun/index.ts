@@ -258,6 +258,51 @@ app.get("/logs", async (c) => {
   }
 });
 
+app.post("/ingest-logs", async (c) => {
+  if (!DATABASE_URL) return c.json({ ok: false, error: "DATABASE_URL not set" }, 500);
+
+  let body: any;
+  try { body = await c.req.json(); } catch { return c.json({ ok: false, error: "bad JSON" }, 400); }
+  if (!Array.isArray(body) || body.length === 0) return c.json({ ok: true, inserted: 0 });
+
+  try {
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
+
+    // Ensure table exists
+    await sql`
+      CREATE TABLE IF NOT EXISTS bot_logs (
+        id BIGSERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ DEFAULT NOW(),
+        message TEXT NOT NULL,
+        event TEXT,
+        severity TEXT DEFAULT 'info'
+      )
+    `;
+    await sql`CREATE INDEX IF NOT EXISTS bot_logs_ts_idx ON bot_logs (ts DESC)`;
+
+    const rows = body.map((r: any) => ({
+      message: String(r.message || "").slice(0, 2000),
+      event: String(r.event || "").slice(0, 64),
+      severity: String(r.severity || "info").slice(0, 20),
+    }));
+
+    await sql`INSERT INTO bot_logs ${sql(rows, "message", "event", "severity")}`;
+    await sql.end();
+
+    return c.json({ ok: true, inserted: rows.length }, 200, {
+      "Access-Control-Allow-Origin": "*",
+    });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
+  }
+});
+
+app.options("/ingest-logs", (c) => c.text("", 204, {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+}));
+
 app.options("/logs", (c) => c.text("", 204, {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",

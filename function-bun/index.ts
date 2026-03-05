@@ -210,40 +210,42 @@ app.get("/logs", async (c) => {
   }
 
   try {
-    // Step 1: get latest deployment ID
+    // Try last 5 deployments and merge their logs
     const r1 = await fetch(RAILWAY_GQL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
       body: JSON.stringify({
-        query: `query { deployments(input: { projectId: "${RAILWAY_PROJECT_ID}", serviceId: "${RAILWAY_SERVICE_ID}" }, first: 1) { edges { node { id status createdAt } } } }`,
+        query: `query { deployments(input: { projectId: "${RAILWAY_PROJECT_ID}", serviceId: "${RAILWAY_SERVICE_ID}" }, first: 5) { edges { node { id status createdAt } } } }`,
       }),
     });
     const d1 = await r1.json() as any;
     if (d1.errors) return c.json({ ok: false, error: d1.errors[0]?.message }, 500);
 
-    const dep = d1?.data?.deployments?.edges?.[0]?.node;
-    if (!dep) return c.json({ ok: false, error: "No deployment found" }, 404);
+    const deps = d1?.data?.deployments?.edges?.map((e: any) => e.node) || [];
+    if (!deps.length) return c.json({ ok: false, error: "No deployments found" }, 404);
 
-    // Step 2: get logs for that deployment
-    const r2 = await fetch(RAILWAY_GQL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
-      body: JSON.stringify({
-        query: `query { deploymentLogs(deploymentId: "${dep.id}") { timestamp message severity } }`,
-      }),
-    });
-    const d2 = await r2.json() as any;
-    if (d2.errors) return c.json({ ok: false, error: d2.errors[0]?.message }, 500);
+    // Fetch logs from up to 5 most recent deployments and merge
+    let allLogs: any[] = [];
+    for (const dep of deps) {
+      const r2 = await fetch(RAILWAY_GQL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
+        body: JSON.stringify({
+          query: `query { deploymentLogs(deploymentId: "${dep.id}") { timestamp message severity } }`,
+        }),
+      });
+      const d2 = await r2.json() as any;
+      if (!d2.errors && d2?.data?.deploymentLogs?.length) {
+        allLogs = allLogs.concat(d2.data.deploymentLogs);
+      }
+    }
 
-    const logs = d2?.data?.deploymentLogs || [];
+    // Sort by timestamp ascending
+    allLogs.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    // Keep last 500
+    if (allLogs.length > 500) allLogs = allLogs.slice(-500);
 
-    return c.json({
-      ok: true,
-      deployment_id: dep.id,
-      deployment_status: dep.status,
-      count: logs.length,
-      logs,
-    }, 200, {
+    return c.json({ ok: true, count: allLogs.length, logs: allLogs }, 200, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET",
     });

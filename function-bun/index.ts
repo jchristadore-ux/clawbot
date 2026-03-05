@@ -185,13 +185,27 @@ app.get("/setup-db", async (c) => {
       )
     `;
 
+    await sql`
+      CREATE TABLE IF NOT EXISTS bot_logs (
+        id          BIGSERIAL PRIMARY KEY,
+        ts          TIMESTAMPTZ DEFAULT NOW(),
+        message     TEXT NOT NULL,
+        event       TEXT,
+        severity    TEXT DEFAULT 'info'
+      )
+    `;
+
+    await sql`CREATE INDEX IF NOT EXISTS bot_logs_ts_idx ON bot_logs (ts DESC)`;
+
     const rows = await sql`SELECT COUNT(*) as count FROM bot_updates`;
+    const logRows = await sql`SELECT COUNT(*) as count FROM bot_logs`;
     await sql.end();
 
     return c.json({
       ok: true,
-      message: "bot_updates table created (or already existed)",
-      row_count: rows[0].count,
+      message: "bot_updates + bot_logs tables ready",
+      bot_updates_rows: rows[0].count,
+      bot_logs_rows: logRows[0].count,
     });
   } catch (err) {
     return c.json({ ok: false, error: String(err) }, 500);
@@ -205,47 +219,37 @@ const RAILWAY_SERVICE_ID = process.env.RAILWAY_SERVICE_ID || "0a405cac-8993-49bc
 const RAILWAY_GQL = "https://backboard.railway.app/graphql/v2";
 
 app.get("/logs", async (c) => {
-  if (!RAILWAY_TOKEN) {
-    return c.json({ ok: false, error: "RAILWAY_TOKEN not set on this service" }, 500);
+  if (!DATABASE_URL) {
+    return c.json({ ok: false, error: "DATABASE_URL not set" }, 500);
   }
 
   try {
-    // Try last 5 deployments and merge their logs
-    const r1 = await fetch(RAILWAY_GQL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
-      body: JSON.stringify({
-        query: `query { deployments(input: { projectId: "${RAILWAY_PROJECT_ID}", serviceId: "${RAILWAY_SERVICE_ID}" }, first: 5) { edges { node { id status createdAt } } } }`,
-      }),
-    });
-    const d1 = await r1.json() as any;
-    if (d1.errors) return c.json({ ok: false, error: d1.errors[0]?.message }, 500);
+    const limit = Math.min(500, Number(c.req.query("limit") || 300));
+    const since = c.req.query("since"); // ISO timestamp for polling
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
 
-    const deps = d1?.data?.deployments?.edges?.map((e: any) => e.node) || [];
-    if (!deps.length) return c.json({ ok: false, error: "No deployments found" }, 404);
-
-    // Fetch logs from up to 5 most recent deployments and merge
-    let allLogs: any[] = [];
-    for (const dep of deps) {
-      const r2 = await fetch(RAILWAY_GQL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
-        body: JSON.stringify({
-          query: `query { deploymentLogs(deploymentId: "${dep.id}") { timestamp message severity } }`,
-        }),
-      });
-      const d2 = await r2.json() as any;
-      if (!d2.errors && d2?.data?.deploymentLogs?.length) {
-        allLogs = allLogs.concat(d2.data.deploymentLogs);
-      }
+    let logs: any[];
+    if (since) {
+      logs = await sql`
+        SELECT id, ts AS timestamp, message, event, severity
+        FROM bot_logs
+        WHERE ts > ${since}::timestamptz
+        ORDER BY ts ASC
+        LIMIT ${limit}
+      `;
+    } else {
+      logs = await sql`
+        SELECT id, ts AS timestamp, message, event, severity
+        FROM bot_logs
+        ORDER BY ts DESC
+        LIMIT ${limit}
+      `;
+      logs = logs.reverse();
     }
 
-    // Sort by timestamp ascending
-    allLogs.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-    // Keep last 500
-    if (allLogs.length > 500) allLogs = allLogs.slice(-500);
+    await sql.end();
 
-    return c.json({ ok: true, count: allLogs.length, logs: allLogs }, 200, {
+    return c.json({ ok: true, count: logs.length, logs }, 200, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET",
     });

@@ -225,12 +225,11 @@ app.get("/logs", async (c) => {
     if (!dep) return c.json({ ok: false, error: "No deployment found" }, 404);
 
     // Step 2: get logs for that deployment
-    const tail = Number(c.req.query("tail") || 300);
     const r2 = await fetch(RAILWAY_GQL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${RAILWAY_TOKEN}` },
       body: JSON.stringify({
-        query: `query { deploymentLogs(deploymentId: "${dep.id}", tail: ${tail}) { timestamp message severity } }`,
+        query: `query { deploymentLogs(deploymentId: "${dep.id}") { timestamp message severity } }`,
       }),
     });
     const d2 = await r2.json() as any;

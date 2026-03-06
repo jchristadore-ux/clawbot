@@ -211,7 +211,7 @@ def parse_iso(ts: str) -> Optional[datetime]:
 # Config (all defaults safe)
 # =============================================================================
 
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v7_RAW_DUMP"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v8_DIRECT_BIDS"
 
 # Kalshi API
 KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -1229,8 +1229,20 @@ def main() -> None:
                 oi = m.get("open_interest") or m.get("openInterest") or m.get("oi")
                 print(json.dumps({"ts": utc_iso(), "event": "PICK_DEBUG", "ticker": ticker, "volume": vol, "open_interest": oi}), flush=True)
 
-            ob = client.get_orderbook(ticker)
-            best_yes_bid, best_no_bid = parse_best_bids(ob)
+            # Read bids directly from market object — avoids extra API call
+            # Kalshi returns yes_bid/no_bid as integers in cents
+            raw_yes_bid = m.get("yes_bid") or m.get("yes_bid_dollars") and int(round(float(m["yes_bid_dollars"]) * 100))
+            raw_no_bid  = m.get("no_bid")  or m.get("no_bid_dollars")  and int(round(float(m["no_bid_dollars"])  * 100))
+            try:
+                best_yes_bid = int(raw_yes_bid) if raw_yes_bid is not None else None
+                best_no_bid  = int(raw_no_bid)  if raw_no_bid  is not None else None
+            except (TypeError, ValueError):
+                best_yes_bid = None
+                best_no_bid  = None
+
+            if dbg_every("bids_debug", 60):
+                print(f"BIDS_DEBUG yes_bid={best_yes_bid} no_bid={best_no_bid} raw_yes={raw_yes_bid} raw_no={raw_no_bid}", flush=True)
+
             mark_yes = mark_yes_from_bids(best_yes_bid, best_no_bid)
 
             if DEBUG_MARK and dbg_every("mark", 60):

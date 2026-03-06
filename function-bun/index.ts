@@ -175,6 +175,14 @@ app.get("/setup-db", async (c) => {
     const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
 
     await sql`
+      CREATE TABLE IF NOT EXISTS j5_equity (
+        key TEXT PRIMARY KEY DEFAULT 'main',
+        cash NUMERIC(12,4) NOT NULL DEFAULT 0,
+        lifetime_pnl NUMERIC(12,4) NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `;
+    await sql`
       CREATE TABLE IF NOT EXISTS bot_updates (
         id          SERIAL PRIMARY KEY,
         created_at  TIMESTAMPTZ DEFAULT NOW(),
@@ -296,6 +304,70 @@ app.post("/ingest-logs", async (c) => {
     return c.json({ ok: false, error: String(err) }, 500);
   }
 });
+
+// ── /balance — fetch real Kalshi balance (cents → dollars) ─────────────────
+app.get("/balance", async (c) => {
+  try {
+    const path = "/trade-api/v2/portfolio/balance";
+    const headers = await signedKalshiHeaders("GET", path);
+    if (!headers["KALSHI-ACCESS-KEY"]) {
+      return c.json({ ok: false, error: "missing Kalshi credentials" }, 500);
+    }
+    const resp = await fetch(`${KALSHI_BASE_URL}${path}`, { method: "GET", headers });
+    const body = await resp.json() as any;
+    // Kalshi returns balance in cents
+    const cents = body?.balance ?? body?.available_balance ?? null;
+    const dollars = cents !== null ? cents / 100 : null;
+    return c.json({ ok: resp.ok, balance: cents, balance_dollars: dollars, raw: body }, 
+      resp.ok ? 200 : 502, { "Access-Control-Allow-Origin": "*" });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
+  }
+});
+
+// ── /equity — read current equity from Postgres ──────────────────────────────
+app.get("/equity", async (c) => {
+  if (!DATABASE_URL) return c.json({ ok: false, error: "no DATABASE_URL" }, 500);
+  try {
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
+    const rows = await sql`SELECT cash, lifetime_pnl, updated_at FROM j5_equity WHERE key = 'main' LIMIT 1`;
+    await sql.end();
+    if (rows.length === 0) return c.json({ ok: true, exists: false, cash: null, lifetime_pnl: null });
+    return c.json({ ok: true, exists: true, cash: Number(rows[0].cash), lifetime_pnl: Number(rows[0].lifetime_pnl), updated_at: rows[0].updated_at },
+      200, { "Access-Control-Allow-Origin": "*" });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
+  }
+});
+
+// ── /set-equity — manual override: set cash and optionally lifetime_pnl ──────
+app.post("/set-equity", async (c) => {
+  if (!DATABASE_URL) return c.json({ ok: false, error: "no DATABASE_URL" }, 500);
+  try {
+    const body = await c.req.json() as any;
+    const cash = Number(body?.cash);
+    const lifetime_pnl = body?.lifetime_pnl !== undefined ? Number(body.lifetime_pnl) : 0;
+    if (isNaN(cash) || cash < 0) return c.json({ ok: false, error: "cash must be a non-negative number" }, 400);
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
+    await sql`
+      INSERT INTO j5_equity (key, cash, lifetime_pnl, updated_at)
+      VALUES ('main', ${cash}, ${lifetime_pnl}, NOW())
+      ON CONFLICT (key) DO UPDATE
+        SET cash = EXCLUDED.cash,
+            lifetime_pnl = EXCLUDED.lifetime_pnl,
+            updated_at = EXCLUDED.updated_at
+    `;
+    await sql.end();
+    return c.json({ ok: true, cash, lifetime_pnl, msg: "equity updated — bot will use this on next restart" },
+      200, { "Access-Control-Allow-Origin": "*" });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
+  }
+});
+
+app.options("/balance", (c) => c.text("", 204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS" }));
+app.options("/equity", (c) => c.text("", 204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS" }));
+app.options("/set-equity", (c) => c.text("", 204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS" }));
 
 // ── /hot-reload-check — bot polls this to get pending code updates ───────────
 app.get("/hot-reload-check", async (c) => {

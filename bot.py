@@ -356,69 +356,49 @@ def save_state(state: BotState) -> None:
     pg_save_equity(state.cash, state.realized_pnl_lifetime)
 
 # =============================================================================
-# Postgres equity persistence — survives container restarts
+# Equity persistence — via Bun gateway (no extra dependencies needed)
 # =============================================================================
 
-def _pg_connect():
-    """Return a psycopg2 connection or None if unavailable."""
-    try:
-        import psycopg2
-        db_url = os.getenv("DATABASE_URL", "").strip()
-        if not db_url:
-            return None
-        return psycopg2.connect(db_url, connect_timeout=5)
-    except Exception:
-        return None
+def _gateway() -> str:
+    return os.getenv("KALSHI_ORDER_GATEWAY_URL", "").rstrip("/")
 
 def pg_load_equity() -> tuple:
-    """
-    Returns (cash, lifetime_pnl) from Postgres, or (None, None) if unavailable.
-    Reads from j5_equity table — single row keyed to 'main'.
-    """
-    conn = _pg_connect()
-    if not conn:
+    """Fetch cash + lifetime_pnl from gateway /equity endpoint."""
+    gw = _gateway()
+    if not gw:
         return None, None
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT cash, lifetime_pnl, updated_at
-                FROM j5_equity WHERE key = 'main' LIMIT 1
-            """)
-            row = cur.fetchone()
-            if row:
-                print(json.dumps({
-                    "ts": utc_iso(), "event": "EQUITY_LOADED",
-                    "cash": float(row[0]), "lifetime_pnl": float(row[1]),
-                    "updated_at": str(row[2]),
-                }), flush=True)
-                return float(row[0]), float(row[1])
+        r = requests.get(f"{gw}/equity", timeout=5)
+        if r.status_code != 200:
             return None, None
+        data = r.json()
+        if not data.get("exists") or data.get("cash") is None:
+            return None, None
+        cash = float(data["cash"])
+        pnl = float(data.get("lifetime_pnl") or 0.0)
+        print(json.dumps({
+            "ts": utc_iso(), "event": "EQUITY_LOADED",
+            "cash": round(cash, 4), "lifetime_pnl": round(pnl, 4),
+            "source": "gateway",
+        }), flush=True)
+        return cash, pnl
     except Exception as e:
         print(json.dumps({"ts": utc_iso(), "event": "EQUITY_LOAD_ERR", "err": str(e)[:200]}), flush=True)
         return None, None
-    finally:
-        conn.close()
 
 def pg_save_equity(cash: float, lifetime_pnl: float) -> None:
-    """Upsert cash + lifetime_pnl into j5_equity."""
-    conn = _pg_connect()
-    if not conn:
+    """Save cash + lifetime_pnl via gateway /init-equity endpoint."""
+    gw = _gateway()
+    if not gw:
         return
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO j5_equity (key, cash, lifetime_pnl, updated_at)
-                VALUES ('main', %s, %s, NOW())
-                ON CONFLICT (key) DO UPDATE
-                SET cash = EXCLUDED.cash,
-                    lifetime_pnl = EXCLUDED.lifetime_pnl,
-                    updated_at = EXCLUDED.updated_at
-            """, (cash, lifetime_pnl))
-        conn.commit()
-    except Exception as e:
-        print(json.dumps({"ts": utc_iso(), "event": "EQUITY_SAVE_ERR", "err": str(e)[:200]}), flush=True)
-    finally:
-        conn.close()
+        requests.get(
+            f"{gw}/init-equity",
+            params={"cash": round(cash, 4), "lifetime_pnl": round(lifetime_pnl, 4)},
+            timeout=5,
+        )
+    except Exception:
+        pass  # never crash the bot on equity save failure
 
 def fetch_real_kalshi_balance() -> float:
     """

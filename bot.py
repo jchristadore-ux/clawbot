@@ -211,7 +211,7 @@ def parse_iso(ts: str) -> Optional[datetime]:
 # Config (all defaults safe)
 # =============================================================================
 
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v6_FILL_HARDENED"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v7_RAW_DUMP"
 
 # Kalshi API
 KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -580,7 +580,22 @@ class KalshiClient:
     def list_open_markets(self) -> List[Dict[str, Any]]:
         data = self._request("GET", f"/trade-api/v2/markets?series_ticker={SERIES_TICKER}&status=open")
         markets = data.get("markets", [])
-        return markets if isinstance(markets, list) else []
+        if not isinstance(markets, list):
+            return []
+        # Dump first market raw so we can see exact field names and timestamp formats
+        if markets and dbg_every("market_raw_dump", 120):
+            m0 = markets[0]
+            keys = list(m0.keys()) if isinstance(m0, dict) else []
+            # Print as plain text so Railway doesn't swallow it
+            print(f"MARKET_RAW_DUMP total={len(markets)} keys={keys}", flush=True)
+            for k in ["ticker","open_time","close_time","open_ts","close_ts","close_date","expiration_time","status"]:
+                if k in m0:
+                    print(f"  MARKET_FIELD {k}={repr(m0[k])}", flush=True)
+        elif not markets and dbg_every("market_empty", 60):
+            print(f"MARKET_RAW_DUMP total=0 data_keys={list(data.keys())}", flush=True)
+            for k, v in list(data.items())[:5]:
+                print(f"  DATA_FIELD {k}={repr(v)[:80]}", flush=True)
+        return markets
 
     def get_orderbook(self, ticker: str) -> Dict[str, Any]:
         return self._request("GET", f"/trade-api/v2/markets/{ticker}/orderbook")
@@ -724,11 +739,7 @@ def pick_best_active_market(markets: List[Dict[str, Any]]) -> Optional[Dict[str,
         if not ot or not ct:
             # Log first failure so we can see the raw field values
             if dbg_every("ts_parse_fail", 60):
-                print(json.dumps({
-                    "ts": utc_iso(), "event": "MARKET_TS_FAIL",
-                    "ticker": m.get("ticker"), "raw_ot": str(raw_ot)[:50], "raw_ct": str(raw_ct)[:50],
-                    "msg": "could not parse open/close time — check timestamp format",
-                }), flush=True)
+                print(f"MARKET_TS_FAIL ticker={m.get('ticker')} raw_ot={repr(raw_ot)[:50]} raw_ct={repr(raw_ct)[:50]}", flush=True)
             continue
         if ot <= now < ct:
             vol = _as_float(m.get("volume") or m.get("volume_24h") or m.get("vol"))

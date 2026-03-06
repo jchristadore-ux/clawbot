@@ -211,7 +211,7 @@ def parse_iso(ts: str) -> Optional[datetime]:
 # Config (all defaults safe)
 # =============================================================================
 
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v8_DIRECT_BIDS"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v9_VERBOSE"
 
 # Kalshi API
 KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -986,6 +986,7 @@ def maybe_enter(
 
     edge = fair_yes - mark_yes
     if abs(z) < MIN_CONVICTION_Z:
+        print(f"SKIP_Z z={z:.3f} need={MIN_CONVICTION_Z}", flush=True)
         return False
 
     adaptive_edge = get_adaptive_edge()
@@ -995,15 +996,14 @@ def maybe_enter(
 
     if edge >= adaptive_edge:
         side = "YES"
-        # buy at implied YES ask = 100 - best_no_bid
         entry_cents = max(1, min(99, 100 - best_no_bid))
         entry_price = entry_cents / 100.0
     elif edge <= -adaptive_edge:
         side = "NO"
-        # buy at implied NO ask = 100 - best_yes_bid
         entry_cents = max(1, min(99, 100 - best_yes_bid))
         entry_price = entry_cents / 100.0
     else:
+        print(f"SKIP_EDGE edge={edge:.3f} need=+/-{adaptive_edge:.3f} z={z:.3f}", flush=True)
         return False
 
     contracts = compute_contracts(state.cash, float(entry_price))
@@ -1278,14 +1278,12 @@ def main() -> None:
             fair_yes, z = model_fair_yes(prices)
             edge = fair_yes - mark_yes
 
-            # Log waiting for price history warmup
-            if len(prices) < LOOKBACK and dbg_every("warmup", 30):
-                print(json.dumps({
-                    "ts": utc_iso(), "event": "NO_TRADE",
-                    "reason": "warming_up",
-                    "prices_collected": len(prices),
-                    "lookback_needed": LOOKBACK,
-                }), flush=True)
+            if len(prices) < LOOKBACK:
+                if dbg_every("warmup", 15):
+                    print(f"WARMUP {len(prices)}/{LOOKBACK} prices collected", flush=True)
+            else:
+                if dbg_every("model", 15):
+                    print(f"MODEL fair={fair_yes:.3f} mark={mark_yes:.3f} edge={edge:.3f} z={z:.3f} prices={len(prices)}", flush=True)
 
             # Log when bucket already traded
             if bucket_already_traded(ticker) and dbg_every("bucket_skip", 60):

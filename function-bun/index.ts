@@ -340,6 +340,30 @@ app.get("/equity", async (c) => {
   }
 });
 
+// ── /init-equity — GET version for browser use: /init-equity?cash=23.43&lifetime_pnl=0 ──
+app.get("/init-equity", async (c) => {
+  if (!DATABASE_URL) return c.json({ ok: false, error: "no DATABASE_URL" }, 500);
+  try {
+    const cash = Number(c.req.query("cash"));
+    const lifetime_pnl = Number(c.req.query("lifetime_pnl") ?? "0");
+    if (isNaN(cash) || cash <= 0) return c.json({ ok: false, error: "provide ?cash=23.43 in the URL" }, 400);
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
+    await sql`
+      INSERT INTO j5_equity (key, cash, lifetime_pnl, updated_at)
+      VALUES ('main', ${cash}, ${lifetime_pnl}, NOW())
+      ON CONFLICT (key) DO UPDATE
+        SET cash = EXCLUDED.cash,
+            lifetime_pnl = EXCLUDED.lifetime_pnl,
+            updated_at = EXCLUDED.updated_at
+    `;
+    await sql.end();
+    return c.json({ ok: true, cash, lifetime_pnl, msg: "equity set — redeploy clawbot-worker now" },
+      200, { "Access-Control-Allow-Origin": "*" });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) }, 500);
+  }
+});
+
 // ── /set-equity — manual override: set cash and optionally lifetime_pnl ──────
 app.post("/set-equity", async (c) => {
   if (!DATABASE_URL) return c.json({ ok: false, error: "no DATABASE_URL" }, 500);

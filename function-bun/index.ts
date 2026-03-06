@@ -297,6 +297,47 @@ app.post("/ingest-logs", async (c) => {
   }
 });
 
+// ── /hot-reload-check — bot polls this to get pending code updates ───────────
+app.get("/hot-reload-check", async (c) => {
+  if (!DATABASE_URL) return c.json({ pending: false });
+  try {
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
+    const rows = await sql`
+      SELECT id, version, code FROM bot_updates
+      WHERE applied = false
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    await sql.end();
+    if (rows.length === 0) return c.json({ pending: false }, 200, { "Access-Control-Allow-Origin": "*" });
+    const row = rows[0];
+    return c.json({ pending: true, id: row.id, version: row.version, code: row.code }, 200, {
+      "Access-Control-Allow-Origin": "*",
+    });
+  } catch (err) {
+    return c.json({ pending: false, error: String(err) });
+  }
+});
+
+// ── /hot-reload-applied — bot calls this after applying update ───────────────
+app.post("/hot-reload-applied", async (c) => {
+  if (!DATABASE_URL) return c.json({ ok: false });
+  try {
+    const body = await c.req.json() as any;
+    const id = body?.id;
+    if (!id) return c.json({ ok: false, error: "missing id" }, 400);
+    const sql = postgres(DATABASE_URL, { ssl: "prefer", max: 1, idle_timeout: 5 });
+    await sql`UPDATE bot_updates SET applied = true, applied_at = NOW() WHERE id = ${id}`;
+    await sql.end();
+    return c.json({ ok: true }, 200, { "Access-Control-Allow-Origin": "*" });
+  } catch (err) {
+    return c.json({ ok: false, error: String(err) });
+  }
+});
+
+app.options("/hot-reload-check", (c) => c.text("", 204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS" }));
+app.options("/hot-reload-applied", (c) => c.text("", 204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS" }));
+
 app.options("/ingest-logs", (c) => c.text("", 204, {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",

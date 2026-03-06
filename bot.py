@@ -239,7 +239,7 @@ KRAKEN_TICKER_URL = env_str("KRAKEN_TICKER_URL", "https://api.kraken.com/0/publi
 # Strategy
 LOOKBACK = env_int("LOOKBACK", 20)
 FAIR_MOVE_SCALE = env_float("FAIR_MOVE_SCALE", 0.15)
-MIN_CONVICTION_Z = env_float("MIN_CONVICTION_Z", 1.0)
+MIN_CONVICTION_Z = env_float("MIN_CONVICTION_Z", 1.5)  # default 1.5 — env var overrides
 EDGE_ENTER = env_float("EDGE_ENTER", 0.07)
 EDGE_EXIT = env_float("EDGE_EXIT", 0.02)
 

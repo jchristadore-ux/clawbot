@@ -211,7 +211,7 @@ def parse_iso(ts: str) -> Optional[datetime]:
 # Config (all defaults safe)
 # =============================================================================
 
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v2_ADAPTIVE"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v3_EQUITY_SYNC"
 
 # Kalshi API
 KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -320,16 +320,127 @@ def load_state() -> BotState:
     if not STATE_FILE.exists():
         s = BotState()
         s.trade_history_24h = []
-        return s
-    raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    s = BotState(**raw)
-    if s.trade_history_24h is None:
-        s.trade_history_24h = []
+    else:
+        try:
+            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            s = BotState(**raw)
+            if s.trade_history_24h is None:
+                s.trade_history_24h = []
+        except Exception:
+            s = BotState()
+            s.trade_history_24h = []
+
+    # ── Override cash + lifetime_pnl from Postgres (survives restarts) ──────
+    pg_cash, pg_pnl = pg_load_equity()
+    if pg_cash is not None:
+        s.cash = pg_cash
+        s.realized_pnl_lifetime = pg_pnl if pg_pnl is not None else 0.0
+        print(json.dumps({
+            "ts": utc_iso(), "event": "STATE_RESTORED",
+            "cash": round(s.cash, 4), "lifetime_pnl": round(s.realized_pnl_lifetime, 4),
+            "source": "postgres",
+        }), flush=True)
+    else:
+        print(json.dumps({
+            "ts": utc_iso(), "event": "STATE_RESTORED",
+            "cash": round(s.cash, 4), "lifetime_pnl": round(s.realized_pnl_lifetime, 4),
+            "source": "file_or_default",
+        }), flush=True)
+
     return s
 
 def save_state(state: BotState) -> None:
     ensure_dirs()
     STATE_FILE.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+    # Also persist to Postgres so equity survives container restarts
+    pg_save_equity(state.cash, state.realized_pnl_lifetime)
+
+# =============================================================================
+# Postgres equity persistence — survives container restarts
+# =============================================================================
+
+def _pg_connect():
+    """Return a psycopg2 connection or None if unavailable."""
+    try:
+        import psycopg2
+        db_url = os.getenv("DATABASE_URL", "").strip()
+        if not db_url:
+            return None
+        return psycopg2.connect(db_url, connect_timeout=5)
+    except Exception:
+        return None
+
+def pg_load_equity() -> tuple:
+    """
+    Returns (cash, lifetime_pnl) from Postgres, or (None, None) if unavailable.
+    Reads from j5_equity table — single row keyed to 'main'.
+    """
+    conn = _pg_connect()
+    if not conn:
+        return None, None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cash, lifetime_pnl, updated_at
+                FROM j5_equity WHERE key = 'main' LIMIT 1
+            """)
+            row = cur.fetchone()
+            if row:
+                print(json.dumps({
+                    "ts": utc_iso(), "event": "EQUITY_LOADED",
+                    "cash": float(row[0]), "lifetime_pnl": float(row[1]),
+                    "updated_at": str(row[2]),
+                }), flush=True)
+                return float(row[0]), float(row[1])
+            return None, None
+    except Exception as e:
+        print(json.dumps({"ts": utc_iso(), "event": "EQUITY_LOAD_ERR", "err": str(e)[:200]}), flush=True)
+        return None, None
+    finally:
+        conn.close()
+
+def pg_save_equity(cash: float, lifetime_pnl: float) -> None:
+    """Upsert cash + lifetime_pnl into j5_equity."""
+    conn = _pg_connect()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO j5_equity (key, cash, lifetime_pnl, updated_at)
+                VALUES ('main', %s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE
+                SET cash = EXCLUDED.cash,
+                    lifetime_pnl = EXCLUDED.lifetime_pnl,
+                    updated_at = EXCLUDED.updated_at
+            """, (cash, lifetime_pnl))
+        conn.commit()
+    except Exception as e:
+        print(json.dumps({"ts": utc_iso(), "event": "EQUITY_SAVE_ERR", "err": str(e)[:200]}), flush=True)
+    finally:
+        conn.close()
+
+def fetch_real_kalshi_balance() -> float:
+    """
+    Fetches real cash balance from Kalshi via the Bun gateway /balance endpoint.
+    Returns float or None if unavailable.
+    """
+    gateway = os.getenv("KALSHI_ORDER_GATEWAY_URL", "").rstrip("/")
+    if not gateway:
+        return None
+    try:
+        r = requests.get(f"{gateway}/balance", timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        bal = data.get("balance")
+        if bal is not None:
+            return float(bal) / 100.0  # Kalshi returns cents
+        return None
+    except Exception as e:
+        print(json.dumps({"ts": utc_iso(), "event": "BALANCE_FETCH_ERR", "err": str(e)[:200]}), flush=True)
+        return None
+
 
 def prune_24h(state: BotState) -> None:
     if state.trade_history_24h is None:
@@ -991,6 +1102,33 @@ def main() -> None:
     state = load_state()
     client = KalshiClient()
     prices: List[float] = []
+
+    # ── Seed equity from real Kalshi balance if Postgres has no record ────────
+    pg_cash, _ = pg_load_equity()
+    if pg_cash is None:
+        real_balance = fetch_real_kalshi_balance()
+        if real_balance is not None and real_balance > 0:
+            state.cash = real_balance
+            pg_save_equity(state.cash, state.realized_pnl_lifetime)
+            print(json.dumps({
+                "ts": utc_iso(), "event": "EQUITY_SEEDED",
+                "cash": round(state.cash, 4),
+                "source": "kalshi_real_balance",
+                "msg": "seeded from real Kalshi balance — Postgres had no record",
+            }), flush=True)
+            send_telegram(
+                f"🏦 Johnny5 — Equity Synced\n"
+                f"Real Kalshi balance: ${real_balance:.2f}\n"
+                f"Bot cash set to: ${state.cash:.2f}\n"
+                f"Lifetime PnL reset to: $0.00"
+            )
+        else:
+            # Fallback: use START_EQUITY but warn loudly
+            print(json.dumps({
+                "ts": utc_iso(), "event": "EQUITY_WARN",
+                "cash": round(state.cash, 4),
+                "msg": "could not fetch real balance — using START_EQUITY, update manually via /set-equity",
+            }), flush=True)
 
     print(
         json.dumps(

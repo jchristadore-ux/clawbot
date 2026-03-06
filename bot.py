@@ -17,105 +17,127 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# Hot-reload: polls Postgres for new bot.py code, re-execs if found
-try:
-    from hot_reload import check_hot_reload
-    _HOT_RELOAD_AVAILABLE = True
-except ImportError:
-    _HOT_RELOAD_AVAILABLE = False
-    def check_hot_reload(): pass
-
-
 # =============================================================================
-# Postgres log writer — intercepts stdout, mirrors every line to bot_logs table
+# HOT-RELOAD — polls Postgres for new bot.py, re-execs if found
 # =============================================================================
-
-import queue as _queue
 import sys as _sys
+_hot_reload_last_check: float = 0.0
+HOT_RELOAD_INTERVAL = float(os.getenv("HOT_RELOAD_INTERVAL", "60"))
 
-_log_queue: "_queue.Queue[str]" = _queue.Queue(maxsize=2000)
-_DB_LOG_ENABLED = bool(os.getenv("DATABASE_URL", "").strip())
+def check_hot_reload() -> None:
+    global _hot_reload_last_check
+    now = time.time()
+    if now - _hot_reload_last_check < HOT_RELOAD_INTERVAL:
+        return
+    _hot_reload_last_check = now
 
-class _TeeWriter:
-    """Writes to real stdout AND queues lines for Postgres insertion."""
-    def __init__(self, real):
-        self._real = real
-
-    def write(self, s):
-        self._real.write(s)
-        if _DB_LOG_ENABLED and s.strip():
-            try:
-                _log_queue.put_nowait(s.strip())
-            except _queue.Full:
-                pass  # drop if queue full — never block the bot
-
-    def flush(self):
-        self._real.flush()
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-def _start_db_log_worker():
-    """Background thread: drains queue and POSTs logs to Bun gateway /ingest-logs.
-    Uses requests (already a dependency) — no native libs needed."""
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if not db_url:
+        return
 
     gateway = os.getenv("KALSHI_ORDER_GATEWAY_URL", "").rstrip("/")
     if not gateway:
         return
 
-    def _parse_event(line: str) -> str:
-        try:
-            d = json.loads(line)
-            return str(d.get("event", ""))[:64]
-        except Exception:
-            return ""
+    try:
+        r = requests.get(f"{gateway}/hot-reload-check", timeout=5)
+        if r.status_code != 200:
+            return
+        data = r.json()
+        if not data.get("pending"):
+            return
+        code = data.get("code", "")
+        row_id = data.get("id")
+        if not code or not row_id:
+            return
 
-    def _severity(line: str) -> str:
-        low = line.lower()
-        if "error" in low or "exception" in low:
-            return "error"
-        if "enter" in low or "exit" in low or "trade" in low:
-            return "trade"
-        if "boot" in low or "hot_reload" in low:
-            return "system"
-        return "info"
+        # Write new bot.py
+        bot_path = _sys.argv[0]
+        with open(bot_path, "w", encoding="utf-8") as f:
+            f.write(code)
 
-    def worker():
-        while True:
-            try:
-                # Collect up to 50 lines or wait 3s
-                batch = []
-                try:
-                    batch.append(_log_queue.get(timeout=3))
-                except _queue.Empty:
-                    continue
-                while len(batch) < 50:
-                    try:
-                        batch.append(_log_queue.get_nowait())
-                    except _queue.Empty:
-                        break
+        # Mark as applied
+        requests.post(f"{gateway}/hot-reload-applied", json={"id": row_id}, timeout=5)
 
-                payload = [
-                    {"message": line, "event": _parse_event(line), "severity": _severity(line)}
-                    for line in batch
-                ]
-                requests.post(
-                    f"{gateway}/ingest-logs",
-                    json=payload,
-                    timeout=5,
-                )
-            except Exception:
-                time.sleep(5)
+        print(json.dumps({"ts": utc_iso(), "event": "HOT_RELOAD", "id": row_id, "msg": "restarting"}), flush=True)
+        time.sleep(1)
+        os.execv(_sys.executable, [_sys.executable] + _sys.argv)
+    except Exception as e:
+        pass  # never crash the bot on hot-reload failure
 
-    t = threading.Thread(target=worker, daemon=True, name="db-log-writer")
-    t.start()
 
-# Activate stdout tee + start background worker
-# Enabled if we have the gateway URL (uses requests, no native deps)
-_LOG_SHIP_ENABLED = bool(os.getenv("KALSHI_ORDER_GATEWAY_URL", "").strip())
-if _LOG_SHIP_ENABLED:
-    _sys.stdout = _TeeWriter(_sys.stdout)
-    _start_db_log_worker()
+# =============================================================================
+# ONE_TRADE_PER_BUCKET — prevents churn / flip-flopping within a bucket
+# =============================================================================
+_traded_buckets: set = set()  # set of tickers we've already traded this session
+
+def mark_bucket_traded(ticker: str) -> None:
+    _traded_buckets.add(ticker)
+
+def bucket_already_traded(ticker: str) -> bool:
+    return ticker in _traded_buckets
+
+def purge_old_buckets(active_ticker: str) -> None:
+    """Keep only the active ticker; purge expired ones to avoid memory growth."""
+    global _traded_buckets
+    _traded_buckets = {t for t in _traded_buckets if t == active_ticker}
+
+
+# =============================================================================
+# PERFORMANCE MONITOR — tracks streaks and triggers self-healing
+# =============================================================================
+_perf: dict = {
+    "wins": 0,
+    "losses": 0,
+    "streak": 0,        # positive=win streak, negative=loss streak
+    "total_pnl": 0.0,
+    "last_action_ts": None,
+}
+COLD_STREAK_THRESHOLD = int(os.getenv("COLD_STREAK_THRESHOLD", "3"))  # consecutive losses before adapting
+HOT_STREAK_THRESHOLD = int(os.getenv("HOT_STREAK_THRESHOLD", "5"))    # consecutive wins = loosen edge
+
+def perf_record(pnl: float) -> None:
+    """Record trade outcome and update streak."""
+    _perf["total_pnl"] += pnl
+    _perf["last_action_ts"] = utc_iso()
+    if pnl > 0:
+        _perf["wins"] += 1
+        _perf["streak"] = max(1, _perf["streak"] + 1)
+    else:
+        _perf["losses"] += 1
+        _perf["streak"] = min(-1, _perf["streak"] - 1)
+
+    print(json.dumps({
+        "ts": utc_iso(),
+        "event": "PERF_UPDATE",
+        "wins": _perf["wins"],
+        "losses": _perf["losses"],
+        "streak": _perf["streak"],
+        "total_pnl": round(_perf["total_pnl"], 4),
+        "pnl_this_trade": round(pnl, 4),
+    }), flush=True)
+
+def get_adaptive_edge() -> float:
+    """Dynamically tighten/loosen edge threshold based on streak."""
+    base = EDGE_ENTER
+    streak = _perf["streak"]
+    if streak <= -COLD_STREAK_THRESHOLD:
+        # Cold streak: tighten edge requirement (be more selective)
+        tighten = min(0.15, abs(streak) * 0.02)
+        adapted = min(0.25, base + tighten)
+        print(json.dumps({
+            "ts": utc_iso(), "event": "PERF_ADAPT",
+            "reason": "cold_streak", "streak": streak,
+            "base_edge": base, "adapted_edge": round(adapted, 4),
+        }), flush=True)
+        return adapted
+    elif streak >= HOT_STREAK_THRESHOLD:
+        # Hot streak: slightly loosen (capture more opportunities)
+        loosen = min(0.03, streak * 0.005)
+        adapted = max(0.04, base - loosen)
+        return adapted
+    return base
+
 
 def send_telegram(message: str):
     try:
@@ -189,7 +211,7 @@ def parse_iso(ts: str) -> Optional[datetime]:
 # Config (all defaults safe)
 # =============================================================================
 
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_CLEAN_v1"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v2_ADAPTIVE"
 
 # Kalshi API
 KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -393,11 +415,12 @@ class KalshiClient:
         if pem:
             try:
                 self.private_key = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
+                print(json.dumps({"ts": utc_iso(), "event": "BOOT_INFO", "msg": "private_key_loaded_ok"}), flush=True)
             except Exception as e:
                 self.private_key = None
                 print(json.dumps({"ts": utc_iso(), "event": "BOOT_WARN", "msg": f"private_key_load_failed: {str(e)[:200]}"}), flush=True)
-            else:
-                print(json.dumps({"ts": utc_iso(), "event": "BOOT_WARN", "msg": "no_private_key_found"}), flush=True)
+        else:
+            print(json.dumps({"ts": utc_iso(), "event": "BOOT_WARN", "msg": "no_private_key_found"}), flush=True)
 
     @staticmethod
     def _resolve_private_key_material() -> str:
@@ -728,20 +751,35 @@ def log_trade(
         flush=True,
     )
 
-    # Telegram: ONLY notify on ENTER
+    # Telegram: notify on ENTER and EXIT
     if event == "ENTER":
         try:
-            # Estimated risk/cost at entry (simple: price * contracts)
             risk_usd = float(exec_price) * int(contracts)
-
+            streak = _perf["streak"]
+            streak_str = f"🔥 {streak} win streak" if streak >= 3 else f"🥶 {abs(streak)} loss streak" if streak <= -2 else "—"
             msg = (
-                "🤖 Johnny5 — TRADE EXECUTED ✅\n"
-                f"Ticker: {ticker}\n"
-                f"Side: {side} | Contracts: {contracts} | Price: {exec_price:.2f}\n"
-                f"Risk (est): ${risk_usd:.2f}\n"
-                f"Edge: {edge*100:.2f}% | z: {z:.2f}\n"
-                f"Cash: ${state.cash:.2f} | Equity: ${equity_total:.2f}\n"
-                f"PnL 24h (realized): ${pnl_24h:.2f} | Lifetime (realized): ${state.realized_pnl_lifetime:.2f}"
+                "🤖 Johnny5 — ENTERED ✅\n"
+                f"📊 {ticker}\n"
+                f"Side: {side} | {contracts} contracts @ {exec_price:.2f}\n"
+                f"💰 Risk: ${risk_usd:.2f} | Edge: {edge*100:.1f}% | z: {z:.2f}\n"
+                f"💵 Cash: ${state.cash:.2f} | Equity: ${equity_total:.2f}\n"
+                f"📈 PnL 24h: ${pnl_24h:.2f} | Lifetime: ${state.realized_pnl_lifetime:.2f}\n"
+                f"Streak: {streak_str}"
+            )
+            send_telegram(msg)
+        except Exception:
+            pass
+    elif event == "EXIT":
+        try:
+            pnl_emoji = "✅" if pnl_delta > 0 else "❌"
+            msg = (
+                f"🤖 Johnny5 — EXITED {pnl_emoji}\n"
+                f"📊 {ticker}\n"
+                f"Side: {side} | {contracts} contracts\n"
+                f"Entry: {entry_price:.2f} → Exit: {exec_price:.2f}\n"
+                f"PnL this trade: ${pnl_delta:.2f} {pnl_emoji}\n"
+                f"💵 Cash: ${state.cash:.2f} | Equity: ${equity_total:.2f}\n"
+                f"📈 PnL 24h: ${pnl_24h:.2f} | Lifetime: ${state.realized_pnl_lifetime:.2f}"
             )
             send_telegram(msg)
         except Exception:
@@ -767,6 +805,9 @@ def maybe_enter(
         return False
     if not can_trade_now(state):
         return False
+    # ONE_TRADE_PER_BUCKET: never re-enter a bucket we've already traded
+    if bucket_already_traded(ticker):
+        return False
 
     trades_24h, pnl_24h = summarize_24h(state)
     if pnl_24h <= -abs(MAX_DAILY_LOSS_24H):
@@ -776,15 +817,17 @@ def maybe_enter(
     if abs(z) < MIN_CONVICTION_Z:
         return False
 
+    adaptive_edge = get_adaptive_edge()
+
     side: Optional[str] = None
     entry_price: Optional[float] = None
 
-    if edge >= EDGE_ENTER:
+    if edge >= adaptive_edge:
         side = "YES"
         # buy at implied YES ask = 100 - best_no_bid
         entry_cents = max(1, min(99, 100 - best_no_bid))
         entry_price = entry_cents / 100.0
-    elif edge <= -EDGE_ENTER:
+    elif edge <= -adaptive_edge:
         side = "NO"
         # buy at implied NO ask = 100 - best_yes_bid
         entry_cents = max(1, min(99, 100 - best_yes_bid))
@@ -807,6 +850,8 @@ def maybe_enter(
     state.position_open_ts = utc_iso()
     state.last_trade_ts = utc_iso()
 
+    mark_bucket_traded(ticker)  # ONE_TRADE_PER_BUCKET
+
     log_trade(
         event="ENTER",
         state=state,
@@ -820,7 +865,7 @@ def maybe_enter(
         z=z,
         edge=edge,
         pnl_delta=0.0,
-        note="enter",
+        note=f"enter adaptive_edge={get_adaptive_edge():.3f}",
     )
     return True
 
@@ -844,6 +889,27 @@ def maybe_exit(
         return False
 
     edge = fair_yes - mark_yes
+
+    # HOLD_TO_EXPIRY: if we're close to expiry and in profit, let Kalshi settle it
+    hold_to_expiry = env_bool("HOLD_TO_EXPIRY", True)
+    if hold_to_expiry and state.position_open_ts:
+        # Estimate time in position - if bucket is likely < 90s from expiry, hold
+        open_dt = parse_iso(state.position_open_ts)
+        if open_dt:
+            secs_held = (datetime.now(timezone.utc) - open_dt).total_seconds()
+            # 15-min buckets = 900s total. If held > 810s, we're in the last 90s
+            if secs_held > 810:
+                # Check if we're in profit at current mark
+                if state.position_side == "YES":
+                    unrealized = (mark_yes - state.position_entry_price) * state.position_contracts
+                else:
+                    unrealized = ((1.0 - mark_yes) - state.position_entry_price) * state.position_contracts
+                if unrealized > 0:
+                    print(json.dumps({
+                        "ts": utc_iso(), "event": "HOLD_TO_EXPIRY_SKIP",
+                        "unrealized": round(unrealized, 4), "secs_held": round(secs_held),
+                    }), flush=True)
+                    return False  # hold it, let Kalshi pay us at settlement
 
     # Standard exit condition
     should_exit = False
@@ -874,6 +940,7 @@ def maybe_exit(
 
     pnl = (exit_price - entry_price) * contracts
     state.realized_pnl_lifetime += pnl
+    perf_record(pnl)  # update performance streak
 
     state.position_side = None
     state.position_entry_price = None
@@ -944,9 +1011,6 @@ def main() -> None:
 
     while True:
         try:
-            # Check for hot-deployed code updates (polls Postgres every 60s)
-            check_hot_reload()
-
             # Model input price
             prices.append(kraken_last_price())
             if len(prices) > LOOKBACK * 10:
@@ -956,12 +1020,15 @@ def main() -> None:
             markets = client.list_open_markets()
             m = pick_best_active_market(markets)
             if not m or not m.get("ticker"):
+                if dbg_every("no_market", 60):
+                    print(json.dumps({"ts": utc_iso(), "event": "NO_MARKET", "msg": "no_open_market_found"}), flush=True)
                 write_status(state, "no_open_market", ticker="", mark_yes=None, fair_yes=0.5, z=0.0, edge=0.0)
                 save_state(state)
                 time.sleep(max(5.0, POLL_SECONDS))
                 continue
 
             ticker = str(m["ticker"])
+            purge_old_buckets(ticker)  # clean up stale bucket records
 
             if DEBUG_PICK and dbg_every("pick", 60):
                 vol = m.get("volume") or m.get("volume_24h") or m.get("vol")
@@ -989,6 +1056,14 @@ def main() -> None:
 
             # Skip if book is missing / ghost
             if mark_yes is None:
+                if dbg_every("bad_book", 30):
+                    print(json.dumps({
+                        "ts": utc_iso(), "event": "NO_TRADE",
+                        "reason": "bad_or_ghost_book",
+                        "ticker": ticker,
+                        "best_yes_bid": best_yes_bid,
+                        "best_no_bid": best_no_bid,
+                    }), flush=True)
                 write_status(state, "skip_bad_or_one_sided_book", ticker=ticker, mark_yes=None, fair_yes=0.5, z=0.0, edge=0.0)
                 save_state(state)
                 time.sleep(max(3.0, POLL_SECONDS))
@@ -997,6 +1072,23 @@ def main() -> None:
             fair_yes, z = model_fair_yes(prices)
             edge = fair_yes - mark_yes
 
+            # Log waiting for price history warmup
+            if len(prices) < LOOKBACK and dbg_every("warmup", 30):
+                print(json.dumps({
+                    "ts": utc_iso(), "event": "NO_TRADE",
+                    "reason": "warming_up",
+                    "prices_collected": len(prices),
+                    "lookback_needed": LOOKBACK,
+                }), flush=True)
+
+            # Log when bucket already traded
+            if bucket_already_traded(ticker) and dbg_every("bucket_skip", 60):
+                print(json.dumps({
+                    "ts": utc_iso(), "event": "NO_TRADE",
+                    "reason": "bucket_already_traded",
+                    "ticker": ticker,
+                }), flush=True)
+
             # If kill-switch is on, allow only exit (optionally)
             _ = maybe_exit(state, client, ticker, int(best_yes_bid), int(best_no_bid), float(mark_yes), fair_yes, z)
             _ = maybe_enter(state, client, ticker, int(best_yes_bid), int(best_no_bid), float(mark_yes), fair_yes, z)
@@ -1004,6 +1096,7 @@ def main() -> None:
             write_status(state, "running", ticker=ticker, mark_yes=float(mark_yes), fair_yes=fair_yes, z=z, edge=edge)
             save_state(state)
 
+            check_hot_reload()  # check for code updates from Postgres
             time.sleep(max(1.0, POLL_SECONDS))
 
         except KeyboardInterrupt:

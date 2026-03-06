@@ -211,7 +211,7 @@ def parse_iso(ts: str) -> Optional[datetime]:
 # Config (all defaults safe)
 # =============================================================================
 
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v4_LIVE_FILLS"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v6_FILL_HARDENED"
 
 # Kalshi API
 KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -627,13 +627,37 @@ class KalshiClient:
         # Confirm the order actually filled (fok orders either fill fully or cancel)
         resp_body = out.get("response", {}) or {}
         order = resp_body.get("order", {}) or {}
-        status = order.get("status", "")
+        status = str(order.get("status", "")).lower().strip()
         filled_count = int(order.get("filled_count", 0) or 0)
+        remaining_count = int(order.get("remaining_count", 0) or 0)
 
-        if status == "canceled" or (status and status != "filled" and filled_count == 0):
+        # Log the raw order response so we can see exactly what Kalshi returns
+        print(json.dumps({
+            "ts": utc_iso(), "event": "ORDER_RESPONSE",
+            "action": action, "side": side, "contracts": contracts,
+            "status": status, "filled_count": filled_count,
+            "remaining_count": remaining_count,
+        }), flush=True)
+
+        # Hard fail on canceled
+        if status == "canceled":
             raise RuntimeError(
-                f"Order was not filled (status={status!r}, filled={filled_count}). "
-                f"Book may have moved — skipping this trade."
+                f"FOK order canceled (filled={filled_count}, remaining={remaining_count}). "
+                f"Book moved — skipping."
+            )
+
+        # Hard fail if status is unknown and nothing filled
+        if status not in ("filled", "resting", "") and filled_count == 0:
+            raise RuntimeError(
+                f"Order in unexpected state (status={status!r}, filled={filled_count}). "
+                f"Skipping to avoid phantom position."
+            )
+
+        # If resting (limit order not yet filled), treat as failure — we use FOK so this shouldn't happen
+        if status == "resting":
+            raise RuntimeError(
+                f"Order is resting (unfilled limit order) — expected FOK fill. "
+                f"Canceling to avoid ghost position."
             )
 
         print(json.dumps({
@@ -660,24 +684,51 @@ def _as_float(x: Any) -> float:
     return 0.0
 
 def _parse_ts_any(x: Any) -> Optional[datetime]:
+    """Parse timestamp from Kalshi API — handles unix int/float (seconds or millis) and ISO strings."""
+    if isinstance(x, (int, float)) and x > 0:
+        try:
+            # >1e11 = milliseconds, otherwise seconds
+            return datetime.fromtimestamp(x / 1000.0 if x > 1e11 else float(x), tz=timezone.utc)
+        except Exception:
+            return None
     if not isinstance(x, str) or not x:
         return None
     try:
         return datetime.fromisoformat(x.replace("Z", "+00:00"))
     except Exception:
-        return None
+        pass
+    try:
+        f = float(x)
+        if f > 0:
+            return datetime.fromtimestamp(f / 1000.0 if f > 1e11 else f, tz=timezone.utc)
+    except Exception:
+        pass
+    return None
 
 def pick_best_active_market(markets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     now = datetime.now(timezone.utc)
     active: List[Tuple[float, datetime, Dict[str, Any]]] = []
     fallback: List[Tuple[datetime, Dict[str, Any]]] = []
 
+    if not markets:
+        print(json.dumps({"ts": utc_iso(), "event": "MARKET_DEBUG", "msg": "API returned 0 markets"}), flush=True)
+        return None
+
     for m in markets:
         if not isinstance(m, dict):
             continue
-        ot = _parse_ts_any(m.get("open_time") or m.get("open_ts"))
-        ct = _parse_ts_any(m.get("close_time") or m.get("close_ts"))
+        raw_ot = m.get("open_time") or m.get("open_ts")
+        raw_ct = m.get("close_time") or m.get("close_ts")
+        ot = _parse_ts_any(raw_ot)
+        ct = _parse_ts_any(raw_ct)
         if not ot or not ct:
+            # Log first failure so we can see the raw field values
+            if dbg_every("ts_parse_fail", 60):
+                print(json.dumps({
+                    "ts": utc_iso(), "event": "MARKET_TS_FAIL",
+                    "ticker": m.get("ticker"), "raw_ot": str(raw_ot)[:50], "raw_ct": str(raw_ct)[:50],
+                    "msg": "could not parse open/close time — check timestamp format",
+                }), flush=True)
             continue
         if ot <= now < ct:
             vol = _as_float(m.get("volume") or m.get("volume_24h") or m.get("vol"))

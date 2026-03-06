@@ -211,7 +211,7 @@ def parse_iso(ts: str) -> Optional[datetime]:
 # Config (all defaults safe)
 # =============================================================================
 
-BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v3_EQUITY_SYNC"
+BOT_VERSION = "JOHNNY5_KALSHI_BTC15M_v4_LIVE_FILLS"
 
 # Kalshi API
 KALSHI_BASE_URL = env_str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
@@ -606,7 +606,7 @@ class KalshiClient:
         payload: Dict[str, Any] = {
             "ticker": ticker,
             "action": action,
-            "type": "limit",
+            "type": "fok",   # fill-or-kill: fills immediately or cancels — no resting unfilled orders
             "side": side,
             "count": int(contracts),
         }
@@ -623,6 +623,24 @@ class KalshiClient:
             raise RuntimeError("Order gateway returned non-JSON object")
         if not out.get("ok"):
             raise RuntimeError(f"Order gateway rejected order: {json.dumps(out)[:300]}")
+
+        # Confirm the order actually filled (fok orders either fill fully or cancel)
+        resp_body = out.get("response", {}) or {}
+        order = resp_body.get("order", {}) or {}
+        status = order.get("status", "")
+        filled_count = int(order.get("filled_count", 0) or 0)
+
+        if status == "canceled" or (status and status != "filled" and filled_count == 0):
+            raise RuntimeError(
+                f"Order was not filled (status={status!r}, filled={filled_count}). "
+                f"Book may have moved — skipping this trade."
+            )
+
+        print(json.dumps({
+            "ts": utc_iso(), "event": "ORDER_CONFIRMED",
+            "action": action, "side": side, "contracts": contracts,
+            "status": status, "filled_count": filled_count,
+        }), flush=True)
         return out
     
 # =============================================================================
@@ -929,10 +947,8 @@ def maybe_enter(
     contracts = compute_contracts(state.cash, float(entry_price))
 
     client.place_order("buy", ticker=ticker, side=side, contracts=contracts, price_cents=int(round(entry_price * 100)))
-
-    # Paper accounting (simple): pay entry_price per contract
-    if not LIVE_MODE:
-        state.cash -= float(entry_price) * contracts
+    # Deduct cost from cash (both live and paper — live order confirmed filled above)
+    state.cash -= float(entry_price) * contracts
 
     state.position_side = side
     state.position_entry_price = float(entry_price)
@@ -1024,10 +1040,8 @@ def maybe_exit(
     entry_price = state.position_entry_price
 
     client.place_order("sell", ticker=ticker, side=side, contracts=contracts, price_cents=int(round(exit_price * 100)))
-
-    # Paper accounting: receive exit_price per contract
-    if not LIVE_MODE:
-        state.cash += exit_price * contracts
+    # Add proceeds to cash (both live and paper — live order confirmed filled above)
+    state.cash += exit_price * contracts
 
     pnl = (exit_price - entry_price) * contracts
     state.realized_pnl_lifetime += pnl

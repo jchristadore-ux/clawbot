@@ -1538,8 +1538,14 @@ def main() -> None:
 
             if mark_yes is None:
                 if dbg_every("bad_book", 30):
+                    if best_yes_bid is not None and best_no_bid is None:
+                        skip_reason = "one_sided_book_yes_dominant"
+                    elif best_no_bid is not None and best_yes_bid is None:
+                        skip_reason = "one_sided_book_no_dominant"
+                    else:
+                        skip_reason = "bad_or_missing_book"
                     print(json.dumps({"ts": utc_iso(), "event": "SKIP",
-                                      "reason": "bad_or_missing_book", "ticker": ticker,
+                                      "reason": skip_reason, "ticker": ticker,
                                       "yes_bid": best_yes_bid, "no_bid": best_no_bid}), flush=True)
                 write_status(state, "skip_bad_book", ticker, None, 0.5, 0.0, 0.0, vol_regime)
                 save_state(state)

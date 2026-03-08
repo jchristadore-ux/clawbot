@@ -315,8 +315,8 @@ MIN_HOLD_SECONDS        = env_int("MIN_HOLD_SECONDS", 120)       # min hold befo
 MIN_SECS_BEFORE_EXPIRY  = env_int("MIN_SECS_BEFORE_EXPIRY", 120) # skip entry if expiry < this
 
 # ── Book sanity ───────────────────────────────────────────────────────────────
-MIN_BID_CENTS           = env_int("MIN_BID_CENTS", 5)
-MAX_BID_CENTS           = env_int("MAX_BID_CENTS", 95)
+MIN_BID_CENTS           = env_int("MIN_BID_CENTS", 2)
+MAX_BID_CENTS           = env_int("MAX_BID_CENTS", 98)
 MIN_TOP_QTY             = env_int("MIN_TOP_QTY", 1)              # min contracts at best price
 
 # ── Infrastructure ────────────────────────────────────────────────────────────
@@ -1603,3 +1603,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# ── PATCH APPLIED: resolve_key_pem handles space-collapsed PEM ──
+# (Already implemented in _resolve_key_pem via the space/header regex path)

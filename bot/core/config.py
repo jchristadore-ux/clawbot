@@ -2,7 +2,13 @@
 core/config.py — All configuration driven by environment variables.
 Every value has a safe default. No magic. No hidden state.
 
-See docs/env_vars.md for full documentation of each variable.
+v12 CHANGES:
+  - MIN_ENTRY_PRICE / MAX_ENTRY_PRICE: new price floor/ceiling (25c-75c)
+  - MAX_CONTRACTS_PER_TRADE: default reduced from 25 → 5
+  - STOP_LOSS_PCT: tightened from 0.30 → 0.25 (for expensive contracts)
+  - STOP_LOSS_PCT_CHEAP: new, wider stop for 25-50c entries (default 0.40)
+  - MIN_CONVICTION_Z: raised from 1.5 → 2.0
+  - EDGE_ENTER: raised from 0.07 → 0.08 (tighter entry filter)
 """
 from __future__ import annotations
 
@@ -50,7 +56,7 @@ def _float(name: str, default: float) -> float:
 @dataclass(frozen=True)
 class Config:
     # ── Identity ──────────────────────────────────────────────────────────────
-    BOT_VERSION: str = "JOHNNY5_KALSHI_BTC15M_v11"
+    BOT_VERSION: str = "JOHNNY5_KALSHI_BTC15M_v12"
 
     # ── Kalshi API ────────────────────────────────────────────────────────────
     KALSHI_BASE_URL: str = field(default_factory=lambda: _str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/"))
@@ -60,12 +66,12 @@ class Config:
     KALSHI_PRIVATE_KEY_PATH: str = field(default_factory=lambda: _str("KALSHI_PRIVATE_KEY_PATH"))
     SERIES_TICKER: str = field(default_factory=lambda: _str("SERIES_TICKER", "KXBTC15M").upper())
 
-    # ── Gateway (Bun RSA signing proxy) ───────────────────────────────────────
+    # ── Gateway ───────────────────────────────────────────────────────────────
     GATEWAY_URL: str = field(default_factory=lambda: _str("KALSHI_ORDER_GATEWAY_URL").rstrip("/"))
 
     # ── Mode ──────────────────────────────────────────────────────────────────
     LIVE_MODE: bool = field(default_factory=lambda: _bool("LIVE_MODE", False))
-    DRY_RUN: bool = field(default_factory=lambda: _bool("DRY_RUN", False))     # logs orders but never submits, even in LIVE
+    DRY_RUN: bool = field(default_factory=lambda: _bool("DRY_RUN", False))
     KILL_SWITCH: bool = field(default_factory=lambda: _bool("KILL_SWITCH", False))
     CLOSE_ON_KILL_SWITCH: bool = field(default_factory=lambda: _bool("CLOSE_ON_KILL_SWITCH", False))
 
@@ -80,21 +86,40 @@ class Config:
     BUCKET_MOVE_SCALE: float = field(default_factory=lambda: _float("BUCKET_MOVE_SCALE", 20.0))
     MOMENTUM_WEIGHT: float = field(default_factory=lambda: _float("MOMENTUM_WEIGHT", 0.10))
     OB_WEIGHT: float = field(default_factory=lambda: _float("OB_WEIGHT", 0.04))
-    MIN_CONVICTION_Z: float = field(default_factory=lambda: _float("MIN_CONVICTION_Z", 1.5))
 
-    # ── Edge thresholds ───────────────────────────────────────────────────────
-    EDGE_ENTER: float = field(default_factory=lambda: _float("EDGE_ENTER", 0.07))
+    # ── Conviction ── RAISED from 1.5 → 2.0 ──────────────────────────────────
+    # Higher bar = fewer trades but directionally cleaner
+    MIN_CONVICTION_Z: float = field(default_factory=lambda: _float("MIN_CONVICTION_Z", 2.0))
+
+    # ── Edge thresholds ── RAISED enter from 0.07 → 0.08 ─────────────────────
+    EDGE_ENTER: float = field(default_factory=lambda: _float("EDGE_ENTER", 0.08))
     EDGE_EXIT: float = field(default_factory=lambda: _float("EDGE_EXIT", 0.02))
+
+    # ── Price range filter (NEW in v12) ───────────────────────────────────────
+    # Only trade contracts priced between 25c and 75c
+    # Below 25c: lottery behavior, massive contract counts, uncontrollable variance
+    # Above 75c: near-certain outcome, tiny edge, not worth the capital
+    MIN_ENTRY_PRICE: float = field(default_factory=lambda: _float("MIN_ENTRY_PRICE", 0.25))
+    MAX_ENTRY_PRICE: float = field(default_factory=lambda: _float("MAX_ENTRY_PRICE", 0.75))
 
     # ── Risk / sizing ─────────────────────────────────────────────────────────
     START_EQUITY: float = field(default_factory=lambda: _float("START_EQUITY", 50.0))
     RISK_FRACTION: float = field(default_factory=lambda: _float("RISK_FRACTION", 0.05))
-    MAX_POSITION_USD: float = field(default_factory=lambda: _float("MAX_POSITION_USD", 5.0))
-    MAX_CONTRACTS_PER_TRADE: int = field(default_factory=lambda: _int("MAX_CONTRACTS_PER_TRADE", 25))
-    MAX_DAILY_LOSS: float = field(default_factory=lambda: _float("MAX_DAILY_LOSS", 8.0))
+    MAX_POSITION_USD: float = field(default_factory=lambda: _float("MAX_POSITION_USD", 3.0))
+
+    # Hard contract cap — REDUCED from 25 → 5 to kill lottery sizing ──────────
+    MAX_CONTRACTS_PER_TRADE: int = field(default_factory=lambda: _int("MAX_CONTRACTS_PER_TRADE", 5))
+
+    MAX_DAILY_LOSS: float = field(default_factory=lambda: _float("MAX_DAILY_LOSS", 6.0))
     MAX_DRAWDOWN_PCT: float = field(default_factory=lambda: _float("MAX_DRAWDOWN_PCT", 0.15))
-    STOP_LOSS_PCT: float = field(default_factory=lambda: _float("STOP_LOSS_PCT", 0.30))
-    KELLY_FRACTION: float = field(default_factory=lambda: _float("KELLY_FRACTION", 0.25))  # fractional Kelly cap
+
+    # Stop loss — TIERED in v12:
+    # STOP_LOSS_PCT applies to entries > 50c (tighter: 25%)
+    # STOP_LOSS_PCT_CHEAP applies to entries 25-50c (wider: 40%)
+    STOP_LOSS_PCT: float = field(default_factory=lambda: _float("STOP_LOSS_PCT", 0.25))
+    STOP_LOSS_PCT_CHEAP: float = field(default_factory=lambda: _float("STOP_LOSS_PCT_CHEAP", 0.40))
+
+    KELLY_FRACTION: float = field(default_factory=lambda: _float("KELLY_FRACTION", 0.25))
     VAR_DAILY_LIMIT: float = field(default_factory=lambda: _float("VAR_DAILY_LIMIT", 10.0))
 
     # ── Market quality filters ────────────────────────────────────────────────
@@ -102,7 +127,7 @@ class Config:
     MAX_BID_CENTS: int = field(default_factory=lambda: _int("MAX_BID_CENTS", 97))
     MIN_TOP_QTY: int = field(default_factory=lambda: _int("MIN_TOP_QTY", 2))
     MIN_SECS_BEFORE_EXPIRY: int = field(default_factory=lambda: _int("MIN_SECS_BEFORE_EXPIRY", 90))
-    MAX_SECS_BEFORE_EXPIRY: int = field(default_factory=lambda: _int("MAX_SECS_BEFORE_EXPIRY", 860))  # skip if bucket just opened
+    MAX_SECS_BEFORE_EXPIRY: int = field(default_factory=lambda: _int("MAX_SECS_BEFORE_EXPIRY", 860))
     MAX_SPREAD_CENTS: int = field(default_factory=lambda: _int("MAX_SPREAD_CENTS", 15))
 
     # ── Timing ────────────────────────────────────────────────────────────────
@@ -127,7 +152,6 @@ class Config:
     DEBUG_ERRORS: bool = field(default_factory=lambda: _bool("DEBUG_ERRORS", False))
 
     def validate(self) -> list[str]:
-        """Return list of configuration warnings (not errors — we run in paper mode if unconfigured)."""
         warnings = []
         if not self.KALSHI_API_KEY_ID:
             warnings.append("KALSHI_API_KEY_ID not set — read operations may fail")
@@ -139,10 +163,12 @@ class Config:
             warnings.append("LIVE_MODE=true AND DRY_RUN=true — no orders will be placed")
         if self.RISK_FRACTION > 0.15:
             warnings.append(f"RISK_FRACTION={self.RISK_FRACTION} is aggressive (>15%)")
-        if self.EDGE_ENTER < 0.04:
-            warnings.append(f"EDGE_ENTER={self.EDGE_ENTER} is very low (<4%) — consider 7%+")
+        if self.MIN_ENTRY_PRICE < 0.20:
+            warnings.append(f"MIN_ENTRY_PRICE={self.MIN_ENTRY_PRICE} is low — lottery trades possible")
+        if self.MAX_CONTRACTS_PER_TRADE > 8:
+            warnings.append(f"MAX_CONTRACTS_PER_TRADE={self.MAX_CONTRACTS_PER_TRADE} is high — consider ≤5")
         return warnings
 
 
-# Singleton — import this everywhere
+# Singleton
 cfg = Config()

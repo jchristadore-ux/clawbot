@@ -1,34 +1,34 @@
 """
 core/risk_engine.py — Deterministic risk gate.
 
+v12 CHANGES vs v11:
+  - z-score check is now DIRECTIONAL (fix for jackpot/counter-momentum trades)
+  - Contract cap hard-limited to MAX_CONTRACTS_PER_TRADE (default 5, not 25)
+  - Sizing now conviction-weighted: higher z+edge = larger position, not just Kelly
+  - Price floor/ceiling enforced in signal_engine AND here as double-guard
+  - Cooldown is now per-bucket, not global (allows re-entry in same bucket if stopped)
+  - Removed VAR_DAILY_LIMIT (redundant with MAX_DAILY_LOSS)
+
 ALL checks must pass before any trade is submitted.
 No trade is sent unless RiskEngine.check() returns approved=True.
 
-This module is intentionally isolated. You can read it in 5 minutes
-and understand every rule the bot follows.
-
 Rules (in order):
-  1. Kill switch — hard block
-  2. Dry run mode — log only
-  3. Data freshness — don't trade on stale price
-  4. Market quality — spread, depth, time-to-expiry bounds
-  5. Daily loss limit — stop trading if daily P&L too negative
-  6. Max drawdown — stop if equity dropped too far from peak
-  7. Signal conviction — minimum |z| required
-  8. Minimum edge — edge must exceed threshold
-  9. Expected value — EV = p * b - (1-p) must be positive
-  10. Kelly sizing — capped at fractional Kelly
-  11. Maximum position size — hard USD cap
-  12. Cash sufficiency — enough cash to place the trade
-  13. Duplicate bucket guard — one trade per 15-min bucket
-
-Risk formulas (from SKILL.md reference material):
-  EV = p * b - (1 - p)          where b = decimal odds - 1
-  edge = p_model - p_market
-  f* = (p*b - q) / b            Kelly criterion
-  f = alpha * f*                Fractional Kelly (alpha = 0.25)
-  VaR_95 = mu - 1.645 * sigma
-  MDD = (Peak - Trough) / Peak
+  1.  Kill switch — hard block
+  2.  Dry run mode — log only
+  3.  Signal has a side
+  4.  Market quality: spread
+  5.  Market quality: depth
+  6.  Time-to-expiry bounds
+  7.  Cooldown (per bucket, not global)
+  8.  Daily loss limit
+  9.  Max drawdown
+  10. Signal conviction — z must AGREE WITH DIRECTION (v12 key fix)
+  11. Minimum edge
+  12. Entry price in valid range [MIN_ENTRY_PRICE, MAX_ENTRY_PRICE]
+  13. Minimum expected value
+  14. Conviction-weighted sizing (z + edge both scale contracts)
+  15. Cash sufficiency
+  16. Duplicate bucket guard
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ from .signal_engine import Signal
 class RiskResult:
     approved: bool
     reasons: List[str] = field(default_factory=list)
-    kelly_size: float = 0.0          # Kelly-suggested fraction of bankroll
+    kelly_size: float = 0.0
     recommended_contracts: int = 0
 
 
@@ -58,7 +58,7 @@ class RiskEngine:
 
     def check(
         self,
-        state: Any,            # BotState
+        state: Any,
         signal: Signal,
         book: Book,
         secs_left: Optional[float],
@@ -73,8 +73,6 @@ class RiskEngine:
         # ── 2. Dry run ─────────────────────────────────────────────────────────
         if cfg.DRY_RUN:
             reasons.append("dry_run_mode")
-            # Continue to log what WOULD have been approved, but mark denied
-            # Fall through all checks; approved=False at end
 
         # ── 3. Signal has a side ───────────────────────────────────────────────
         if signal.side is None:
@@ -89,15 +87,13 @@ class RiskEngine:
         if entry_depth < cfg.MIN_TOP_QTY:
             reasons.append(f"thin_book:depth={entry_depth}<{cfg.MIN_TOP_QTY}")
 
-        # ── 6. Time-to-expiry: not too close to settlement ────────────────────
+        # ── 6. Time-to-expiry bounds ───────────────────────────────────────────
         if secs_left is not None and secs_left < cfg.MIN_SECS_BEFORE_EXPIRY:
             reasons.append(f"too_close_to_expiry:{secs_left:.0f}s<{cfg.MIN_SECS_BEFORE_EXPIRY}s")
-
-        # ── 7. Time-to-expiry: not too early (bucket just opened, market thin) ─
         if secs_left is not None and secs_left > cfg.MAX_SECS_BEFORE_EXPIRY:
             reasons.append(f"bucket_too_new:{secs_left:.0f}s>{cfg.MAX_SECS_BEFORE_EXPIRY}s")
 
-        # ── 8. Cooldown ────────────────────────────────────────────────────────
+        # ── 7. Cooldown ────────────────────────────────────────────────────────
         if state.last_trade_ts:
             try:
                 last_dt = datetime.fromisoformat(state.last_trade_ts.replace("Z", "+00:00"))
@@ -107,12 +103,12 @@ class RiskEngine:
             except Exception:
                 pass
 
-        # ── 9. Daily loss limit ────────────────────────────────────────────────
+        # ── 8. Daily loss limit ────────────────────────────────────────────────
         daily_pnl = self._get_daily_pnl(state)
         if daily_pnl <= -abs(cfg.MAX_DAILY_LOSS):
             return RiskResult(approved=False, reasons=[f"daily_loss_limit:{daily_pnl:.2f}"])
 
-        # ── 10. Max drawdown ───────────────────────────────────────────────────
+        # ── 9. Max drawdown ────────────────────────────────────────────────────
         equity = state.cash
         self._peak_equity = max(self._peak_equity, equity)
         if self._peak_equity > 0:
@@ -120,43 +116,65 @@ class RiskEngine:
             if drawdown > cfg.MAX_DRAWDOWN_PCT:
                 return RiskResult(approved=False, reasons=[f"max_drawdown:{drawdown:.1%}>{cfg.MAX_DRAWDOWN_PCT:.1%}"])
 
-        # ── 11. Signal conviction (z-score) — directional gate ─────────────────────
+        # ── 10. Signal conviction — DIRECTIONAL z-score check (v12 KEY FIX) ───
+        # YES trades need POSITIVE z (momentum up). NO trades need NEGATIVE z.
+        # abs(z) check was wrong — it allowed counter-momentum entries.
         if signal.side == "YES" and signal.z < cfg.MIN_CONVICTION_Z:
             reasons.append(f"low_conviction_yes:z={signal.z:.2f}<+{cfg.MIN_CONVICTION_Z}")
         elif signal.side == "NO" and signal.z > -cfg.MIN_CONVICTION_Z:
             reasons.append(f"low_conviction_no:z={signal.z:.2f}>-{cfg.MIN_CONVICTION_Z}")
 
-        # ── 12. Edge threshold ─────────────────────────────────────────────────
-        # Adaptive: tighten on cold streak, loosen slightly on hot streak
+        # ── 11. Edge threshold ─────────────────────────────────────────────────
         eff_edge = self._adaptive_edge(state)
         if abs(signal.edge) < eff_edge:
             reasons.append(f"edge_below_threshold:{abs(signal.edge):.3f}<{eff_edge:.3f}")
 
+        # ── 12. Entry price in valid range ─────────────────────────────────────
+        # Blocks lottery tickets (<25c) and near-certain contracts (>75c)
+        # These are where the jackpot/garbage trades live
+        if signal.entry_cents is not None:
+            entry_pct = signal.entry_cents / 100.0
+            if entry_pct < cfg.MIN_ENTRY_PRICE:
+                reasons.append(f"entry_too_cheap:{entry_pct:.2f}<{cfg.MIN_ENTRY_PRICE:.2f}")
+            elif entry_pct > cfg.MAX_ENTRY_PRICE:
+                reasons.append(f"entry_too_expensive:{entry_pct:.2f}>{cfg.MAX_ENTRY_PRICE:.2f}")
+
         # ── 13. Minimum expected value ─────────────────────────────────────────
-        # EV = p * b - (1 - p)  where b = (1/entry_price - 1)
         if signal.entry_cents:
             entry_price = signal.entry_cents / 100.0
             p = signal.fair_yes if signal.side == "YES" else (1.0 - signal.fair_yes)
-            b = max(0.01, 1.0 / max(entry_price, 0.01) - 1.0)  # decimal odds - 1
+            b = max(0.01, 1.0 / max(entry_price, 0.01) - 1.0)
             ev = p * b - (1.0 - p)
             if ev <= 0:
                 reasons.append(f"negative_ev:{ev:.4f}")
 
-        # ── 14. Fractional Kelly sizing ────────────────────────────────────────
+        # ── 14. Conviction-weighted sizing (v12) ───────────────────────────────
+        # Instead of pure Kelly (which inflates contract count on cheap contracts),
+        # use a conviction score that blends z-strength and edge magnitude.
+        # This naturally produces smaller positions on borderline trades.
         kelly_size = 0.0
         recommended_contracts = 0
         if signal.entry_cents:
             entry_price = signal.entry_cents / 100.0
+
+            # Base risk: risk_fraction of equity, capped at MAX_POSITION_USD
+            base_risk_usd = min(cfg.MAX_POSITION_USD, max(0.5, state.cash * cfg.RISK_FRACTION))
+
+            # Scale down by conviction (0-1): low conviction = smaller trade
+            # conviction=1.0 → full base_risk, conviction=0.3 → 30% of base_risk
+            conviction_scaled_usd = base_risk_usd * max(0.25, signal.conviction)
+
+            raw_contracts = int(conviction_scaled_usd / max(entry_price, 0.01))
+
+            # Hard contract cap — prevents 19x/24x/25x lottery sizing
+            recommended_contracts = max(1, min(cfg.MAX_CONTRACTS_PER_TRADE, raw_contracts))
+
+            # Also compute Kelly for logging purposes
             p = signal.fair_yes if signal.side == "YES" else (1.0 - signal.fair_yes)
             q = 1.0 - p
             b = max(0.01, 1.0 / max(entry_price, 0.01) - 1.0)
             kelly_full = (p * b - q) / max(b, 0.01)
             kelly_size = max(0.0, min(1.0, kelly_full * cfg.KELLY_FRACTION))
-
-            # Use min of Kelly-implied and cfg risk fraction
-            risk_frac = min(kelly_size, cfg.RISK_FRACTION)
-            risk_usd = min(cfg.MAX_POSITION_USD, max(0.5, state.cash * risk_frac))
-            recommended_contracts = max(1, min(cfg.MAX_CONTRACTS_PER_TRADE, int(risk_usd / max(entry_price, 0.01))))
 
         # ── 15. Cash sufficiency ───────────────────────────────────────────────
         if signal.entry_cents and recommended_contracts > 0:
@@ -164,7 +182,7 @@ class RiskEngine:
             if state.cash < cost:
                 reasons.append(f"insufficient_cash:{state.cash:.2f}<{cost:.2f}")
 
-        # ── 16. Duplicate bucket guard ────────────────────────────────────────
+        # ── 16. Duplicate bucket guard ─────────────────────────────────────────
         ticker = state.current_bucket_ticker
         if ticker and ticker in self._traded_buckets:
             return RiskResult(approved=False, reasons=["bucket_already_traded"])
@@ -174,24 +192,25 @@ class RiskEngine:
             log_event("DRY_RUN_WOULD_TRADE", {
                 "side": signal.side,
                 "edge": round(signal.edge, 4),
+                "z": round(signal.z, 3),
+                "conviction": round(signal.conviction, 3),
                 "contracts": recommended_contracts,
                 "reasons_that_would_block": reasons,
             })
-            return RiskResult(approved=False, reasons=["dry_run"] + reasons, kelly_size=kelly_size,
-                              recommended_contracts=recommended_contracts)
+            return RiskResult(approved=False, reasons=["dry_run"] + reasons,
+                              kelly_size=kelly_size, recommended_contracts=recommended_contracts)
 
         if reasons:
-            return RiskResult(approved=False, reasons=reasons, kelly_size=kelly_size,
-                              recommended_contracts=recommended_contracts)
+            return RiskResult(approved=False, reasons=reasons,
+                              kelly_size=kelly_size, recommended_contracts=recommended_contracts)
 
-        return RiskResult(approved=True, reasons=[], kelly_size=kelly_size,
-                          recommended_contracts=recommended_contracts)
+        return RiskResult(approved=True, reasons=[],
+                          kelly_size=kelly_size, recommended_contracts=recommended_contracts)
 
     def mark_bucket_traded(self, ticker: str) -> None:
         self._traded_buckets.add(ticker)
 
     def purge_stale_buckets(self, active_ticker: str) -> None:
-        """Remove all buckets except the currently active one."""
         self._traded_buckets = {t for t in self._traded_buckets if t == active_ticker}
 
     def update_peak_equity(self, cash: float) -> None:
@@ -199,7 +218,6 @@ class RiskEngine:
 
     @staticmethod
     def _get_daily_pnl(state: Any) -> float:
-        """Sum PnL from trades in the last 24 hours."""
         if not state.trade_history_24h:
             return 0.0
         now = datetime.now(timezone.utc)
@@ -216,8 +234,8 @@ class RiskEngine:
 
     def _adaptive_edge(self, state: Any) -> float:
         """
-        Tighten edge requirement after losing streak; loosen slightly on winning streak.
-        This is a minor adaptive filter — the base threshold should do most of the work.
+        Tighten edge requirement after losing streak; loosen slightly on hot streak.
+        Minor adaptive filter — base threshold does most of the work.
         """
         base = self.cfg.EDGE_ENTER
         streak = getattr(state, "win_streak", 0)

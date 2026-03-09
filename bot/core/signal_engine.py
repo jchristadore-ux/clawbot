@@ -1,13 +1,19 @@
 """
 core/signal_engine.py — Calibrated probability model for KXBTC15M.
 
+v12 CHANGES vs v11:
+  - Entry price floor/ceiling enforced HERE (not just in risk_engine)
+  - side assignment now requires z to AGREE with direction before setting side
+  - Edge scaled by z-conviction so marginal-z trades get smaller signals
+  - Cleaner separation: signal says WHAT, risk says WHETHER
+
 Model architecture:
   Three factors, composed additively around 0.5 base:
 
   Factor 1 (PRIMARY): BTC bucket move
     - Anchor: what % has BTC moved since this 15-min window opened?
-    - Time amplifier: early-bucket moves are less committed; late-bucket moves are more certain
-    - This is the core edge hypothesis: Kalshi orderbook reprices slowly relative to BTC spot
+    - Time amplifier: early-bucket moves are less committed; late-bucket moves more certain
+    - Core edge hypothesis: Kalshi orderbook reprices slowly vs BTC spot
 
   Factor 2 (SECONDARY): Short-term BTC momentum z-score
     - Z-score of most recent return vs rolling window
@@ -20,15 +26,13 @@ Model architecture:
 
   Composition: fair_yes = 0.5 + bucket_move + momentum_nudge + ob_nudge
 
-Output includes:
-  - fair_yes: model probability (0-1)
-  - mark_yes: market-implied probability (0-1)
-  - edge: fair_yes - mark_yes (positive = YES is underpriced)
-  - z: momentum z-score for conviction filter
-  - vol_regime: short/long vol ratio for regime flag
+Trade direction rules (NEW in v12):
+  - YES only if edge >= EDGE_ENTER AND z >= MIN_CONVICTION_Z (momentum agrees)
+  - NO  only if edge <= -EDGE_ENTER AND z <= -MIN_CONVICTION_Z (momentum agrees)
+  - Entry price must be in [MIN_ENTRY_PRICE, MAX_ENTRY_PRICE] range
+  - No trade if z and edge point in opposite directions
 
 IMPORTANT: This model is NOT validated. Do not assume edge is real.
-Run backtest/backtest_engine.py before risking real money.
 """
 from __future__ import annotations
 
@@ -51,6 +55,7 @@ class Signal:
     bucket_elapsed_frac: float
     side: Optional[str]      # "YES", "NO", or None (no trade signal)
     entry_cents: Optional[int]  # entry price in cents if side is set
+    conviction: float        # 0-1 scaled conviction score for sizing
 
 
 class SignalEngine:
@@ -111,29 +116,49 @@ class SignalEngine:
 
         # ── Compose ────────────────────────────────────────────────────────────
         if snap.bucket_start_price:
-            # Primary path: bucket move anchors the signal
             vol_dampener = 1.0 / max(1.0, vol_regime - 0.5)
             momentum_nudge = z * cfg.MOMENTUM_WEIGHT * vol_dampener
             fair_yes = 0.5 + bucket_move + momentum_nudge + ob_nudge
         else:
-            # Fallback (no bucket start yet): momentum only
             vol_dampener = 1.0 / max(1.0, vol_regime - 0.5)
             fair_yes = 0.5 + z * cfg.MOMENTUM_WEIGHT * vol_dampener + ob_nudge
 
         fair_yes = max(0.02, min(0.98, fair_yes))
         edge = fair_yes - mark_yes
 
+        # ── Conviction score (0-1) for position sizing ─────────────────────────
+        # Combines z strength + edge magnitude — used by risk engine for sizing
+        z_score = min(1.0, max(0.0, (abs(z) - cfg.MIN_CONVICTION_Z) / 3.0))
+        edge_score = min(1.0, max(0.0, (abs(edge) - cfg.EDGE_ENTER) / 0.30))
+        conviction = (z_score * 0.6 + edge_score * 0.4)
+
         # ── Trade direction ────────────────────────────────────────────────────
+        # v12: BOTH edge AND z must agree on direction. No more counter-momentum trades.
         side: Optional[str] = None
         entry_cents: Optional[int] = None
 
         if book.best_yes_bid is not None and book.best_no_bid is not None:
-            if edge >= cfg.EDGE_ENTER:
+
+            # Candidate YES entry price
+            yes_ask_cents = max(1, min(99, 100 - book.best_no_bid))
+            no_ask_cents  = max(1, min(99, 100 - book.best_yes_bid))
+
+            min_cents = int(cfg.MIN_ENTRY_PRICE * 100)
+            max_cents = int(cfg.MAX_ENTRY_PRICE * 100)
+
+            # YES: edge says underpriced AND momentum confirms upward
+            if (edge >= cfg.EDGE_ENTER
+                    and z >= cfg.MIN_CONVICTION_Z
+                    and min_cents <= yes_ask_cents <= max_cents):
                 side = "YES"
-                entry_cents = max(1, min(99, 100 - book.best_no_bid))  # buy at YES ask
-            elif edge <= -cfg.EDGE_ENTER:
+                entry_cents = yes_ask_cents
+
+            # NO: edge says YES overpriced AND momentum confirms downward
+            elif (edge <= -cfg.EDGE_ENTER
+                    and z <= -cfg.MIN_CONVICTION_Z
+                    and min_cents <= no_ask_cents <= max_cents):
                 side = "NO"
-                entry_cents = max(1, min(99, 100 - book.best_yes_bid))  # buy at NO ask
+                entry_cents = no_ask_cents
 
         if cfg.DEBUG_MODEL:
             log_event("SIGNAL", {
@@ -141,10 +166,12 @@ class SignalEngine:
                 "mark": round(mark_yes, 4),
                 "edge": round(edge, 4),
                 "z": round(z, 3),
+                "conviction": round(conviction, 3),
                 "vol_regime": round(vol_regime, 3),
                 "bucket_move_pct": round(bucket_move_pct * 100, 3),
                 "bucket_elapsed": round(snap.bucket_elapsed_frac, 3),
                 "side": side,
+                "entry_cents": entry_cents,
             }, throttle_key="signal_dbg", throttle_s=15)
 
         return Signal(
@@ -157,4 +184,5 @@ class SignalEngine:
             bucket_elapsed_frac=snap.bucket_elapsed_frac,
             side=side,
             entry_cents=entry_cents,
+            conviction=conviction,
         )

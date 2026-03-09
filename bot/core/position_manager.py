@@ -83,7 +83,6 @@ class PositionManager:
         # Sync equity to Postgres after entry
         self._store.push_equity_to_postgres(state)
 
-        _, daily_pnl = self._get_equity_summary(state)
         log_event("ENTER", {
             "ticker": ticker,
             "side": side,
@@ -97,15 +96,6 @@ class PositionManager:
             "mark_yes": round(signal.mark_yes, 4),
             "live": cfg.LIVE_MODE,
         })
-
-        mode_str = "🔴 LIVE" if cfg.LIVE_MODE else "🧪 PAPER"
-        send_telegram(
-            f"🤖 Johnny5 {mode_str} — ENTERED ✅\n"
-            f"📊 {ticker}\n"
-            f"Side: {side} | {contracts} contracts @ {entry_price:.2f}\n"
-            f"💰 Cost: ${cost:.2f} | Edge: {signal.edge*100:.1f}¢ | z: {signal.z:.2f}\n"
-            f"💵 Cash: ${state.cash:.2f} | Daily PnL: ${daily_pnl:.2f}"
-        )
         return True
 
     def maybe_exit(
@@ -237,17 +227,14 @@ class PositionManager:
             "live": cfg.LIVE_MODE,
         })
 
-        mode_str = "🔴 LIVE" if cfg.LIVE_MODE else "🧪 PAPER"
-        emoji = "✅" if pnl > 0 else "❌"
-        send_telegram(
-            f"🤖 Johnny5 {mode_str} — EXITED {emoji}\n"
-            f"📊 {ticker}\n"
-            f"Side: {old_side} | {contracts} contracts\n"
-            f"Entry: {entry_price:.2f} → Exit: {exit_price:.2f}\n"
-            f"PnL: ${pnl:.2f} {emoji}\n"
-            f"💵 Cash: ${state.cash:.2f} | Lifetime: ${state.realized_pnl_lifetime:.2f}\n"
-            f"Daily PnL: ${daily_pnl:.2f} | Streak: {state.win_streak:+d}"
-        )
+        # Only notify on winning trades
+        if pnl > 0:
+            send_telegram(
+                f"🟢 +${pnl:.2f}\n"
+                f"💵 Balance: ${state.cash:.2f}\n"
+                f"📅 Daily PnL: ${daily_pnl:.2f}\n"
+                f"🏦 Lifetime: ${state.realized_pnl_lifetime:.2f}"
+            )
         return True
 
     def _size_position(self, cash: float, entry_price: float, signal: Signal) -> int:

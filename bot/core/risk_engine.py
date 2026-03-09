@@ -120,9 +120,11 @@ class RiskEngine:
             if drawdown > cfg.MAX_DRAWDOWN_PCT:
                 return RiskResult(approved=False, reasons=[f"max_drawdown:{drawdown:.1%}>{cfg.MAX_DRAWDOWN_PCT:.1%}"])
 
-        # ── 11. Signal conviction (z-score) ────────────────────────────────────
-        if abs(signal.z) < cfg.MIN_CONVICTION_Z:
-            reasons.append(f"low_conviction:z={signal.z:.2f}<{cfg.MIN_CONVICTION_Z}")
+        # ── 11. Signal conviction (z-score) — directional gate ─────────────────────
+        if signal.side == "YES" and signal.z < cfg.MIN_CONVICTION_Z:
+            reasons.append(f"low_conviction_yes:z={signal.z:.2f}<+{cfg.MIN_CONVICTION_Z}")
+        elif signal.side == "NO" and signal.z > -cfg.MIN_CONVICTION_Z:
+            reasons.append(f"low_conviction_no:z={signal.z:.2f}>-{cfg.MIN_CONVICTION_Z}")
 
         # ── 12. Edge threshold ─────────────────────────────────────────────────
         # Adaptive: tighten on cold streak, loosen slightly on hot streak

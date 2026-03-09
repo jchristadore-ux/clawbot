@@ -1,12 +1,16 @@
 """
 core/position_manager.py — Entry and exit lifecycle.
 
-Coordinates:
-- Entry: size position, submit order, update state
-- Exit: determine exit trigger, submit sell, reconcile P&L
-- P&L accounting: both paper and live
-- Streak tracking for adaptive edge
-- Telegram notifications on ENTER and EXIT
+v12 CHANGES vs v11:
+  - _size_position now uses risk_result.recommended_contracts (conviction-weighted)
+    instead of recomputing its own sizing independently
+  - Stop loss is now PRICE-RANGE AWARE:
+    * For entries 25-50c: 35% stop (wider, these need room)
+    * For entries 50-75c: 25% stop (tighter, these are cleaner)
+  - Exit on bucket close added: if secs_left < 30 and position is profitable, hold.
+    If losing and secs_left < 30, exit immediately rather than riding to zero.
+  - Telegram now logs BOTH wins AND losses above $0.50 threshold
+    (blind to losses = dangerous in live mode)
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ from typing import Any, Optional
 from .execution_engine import ExecutionEngine
 from .feature_pipeline import Book
 from .notifier import log_event, send_telegram
-from .risk_engine import RiskEngine
+from .risk_engine import RiskEngine, RiskResult
 from .scheduler import utc_iso
 from .signal_engine import Signal
 from .state_store import BotState, StateStore
@@ -37,10 +41,12 @@ class PositionManager:
         ticker: str,
         book: Book,
         signal: Signal,
+        risk_result: Optional[RiskResult] = None,
     ) -> bool:
         """
         Place an entry order and update state.
-        Returns True if order was placed (filled or paper).
+        Uses risk_result.recommended_contracts if provided (conviction-weighted sizing).
+        Returns True if order was placed.
         """
         cfg = self.cfg
         side = signal.side
@@ -50,7 +56,12 @@ class PositionManager:
             return False
 
         entry_price = entry_cents / 100.0
-        contracts = self._size_position(state.cash, entry_price, signal)
+
+        # Use conviction-weighted contract count from risk engine if available
+        if risk_result and risk_result.recommended_contracts > 0:
+            contracts = risk_result.recommended_contracts
+        else:
+            contracts = self._size_position_fallback(state.cash, entry_price, signal)
 
         if contracts <= 0:
             log_event("SIZE_ZERO", {"cash": state.cash, "entry_price": entry_price})
@@ -79,8 +90,6 @@ class PositionManager:
 
         self._risk.mark_bucket_traded(ticker)
         StateStore.record_trade(state, "ENTER", 0.0)
-
-        # Sync equity to Postgres after entry
         self._store.push_equity_to_postgres(state)
 
         log_event("ENTER", {
@@ -92,6 +101,7 @@ class PositionManager:
             "cash_after": round(state.cash, 4),
             "edge": round(signal.edge, 4),
             "z": round(signal.z, 3),
+            "conviction": round(signal.conviction, 3),
             "fair_yes": round(signal.fair_yes, 4),
             "mark_yes": round(signal.mark_yes, 4),
             "live": cfg.LIVE_MODE,
@@ -119,7 +129,7 @@ class PositionManager:
         contracts = state.position_contracts
         mark_yes = book.mark_yes or 0.5
 
-        # ── Cooldown / min hold ────────────────────────────────────────────────
+        # ── Min hold ───────────────────────────────────────────────────────────
         if state.position_open_ts:
             try:
                 open_dt = datetime.fromisoformat(state.position_open_ts.replace("Z", "+00:00"))
@@ -134,19 +144,56 @@ class PositionManager:
         if held_secs < cfg.MIN_HOLD_SECONDS and not force_exit:
             return False
 
-        # ── Stop loss ──────────────────────────────────────────────────────────
+        # ── Stop loss — price-range aware (v12) ───────────────────────────────
+        # Cheap contracts (25-50c) are noisier, need more room.
+        # Expensive contracts (50-75c) are cleaner, tighter stop ok.
         stop_triggered = False
-        if side == "YES" and entry_price and mark_yes < entry_price * (1.0 - cfg.STOP_LOSS_PCT):
-            stop_triggered = True
-            log_event("STOP_LOSS", {"entry": entry_price, "mark": round(mark_yes, 4)})
-        elif side == "NO" and entry_price:
-            no_mark = 1.0 - mark_yes
-            no_entry = 1.0 - entry_price
-            if no_mark < no_entry * (1.0 - cfg.STOP_LOSS_PCT):
-                stop_triggered = True
-                log_event("STOP_LOSS", {"side": "NO", "no_entry": round(no_entry, 4), "no_mark": round(no_mark, 4)})
+        if entry_price:
+            if entry_price <= 0.50:
+                stop_pct = cfg.STOP_LOSS_PCT_CHEAP   # wider, default 0.40
+            else:
+                stop_pct = cfg.STOP_LOSS_PCT          # tighter, default 0.25
 
-        # ── Hold to expiry (winning trades) ───────────────────────────────────
+            if side == "YES" and mark_yes < entry_price * (1.0 - stop_pct):
+                stop_triggered = True
+                log_event("STOP_LOSS", {
+                    "entry": entry_price,
+                    "mark": round(mark_yes, 4),
+                    "stop_pct": stop_pct,
+                })
+            elif side == "NO":
+                no_mark = 1.0 - mark_yes
+                no_entry = 1.0 - entry_price
+                if no_mark < no_entry * (1.0 - stop_pct):
+                    stop_triggered = True
+                    log_event("STOP_LOSS", {
+                        "side": "NO",
+                        "no_entry": round(no_entry, 4),
+                        "no_mark": round(no_mark, 4),
+                        "stop_pct": stop_pct,
+                    })
+
+        # ── Bucket expiry handling (v12) ───────────────────────────────────────
+        # If < 30 seconds left: exit losers, hold winners to expiry
+        near_expiry = secs_left is not None and secs_left < 30
+        if near_expiry and not stop_triggered and not force_exit:
+            unrealized = self._unrealized_pnl(state, mark_yes)
+            if unrealized < 0:
+                # Losing with 30s left — don't ride to zero, take the loss now
+                stop_triggered = True
+                log_event("EXPIRY_EXIT_LOSER", {
+                    "unrealized": round(unrealized, 4),
+                    "secs_left": round(secs_left),
+                })
+            else:
+                # Winning — hold to expiry
+                log_event("HOLD_TO_EXPIRY", {
+                    "unrealized": round(unrealized, 4),
+                    "secs_left": round(secs_left),
+                }, throttle_key="hold_expiry", throttle_s=15)
+                return False
+
+        # ── Hold to expiry for winning positions (non-expiry case) ────────────
         if cfg.HOLD_TO_EXPIRY and not stop_triggered and not force_exit:
             if secs_left is not None and secs_left < 90:
                 unrealized = self._unrealized_pnl(state, mark_yes)
@@ -187,13 +234,11 @@ class PositionManager:
         state.cash += exit_price * contracts
         state.realized_pnl_lifetime += pnl
 
-        # Streak tracking
         if pnl > 0:
             state.win_streak = max(1, state.win_streak + 1)
         else:
             state.win_streak = min(-1, state.win_streak - 1)
 
-        # Clear position
         old_side = state.position_side
         state.position_side = None
         state.position_entry_price = None
@@ -204,7 +249,6 @@ class PositionManager:
 
         StateStore.record_trade(state, "EXIT", pnl)
 
-        # Reconcile with real balance in live mode
         if cfg.LIVE_MODE:
             self._store.sync_real_balance(state)
 
@@ -227,22 +271,28 @@ class PositionManager:
             "live": cfg.LIVE_MODE,
         })
 
-        # Only notify on winning trades
+        # v12: notify on BOTH wins AND significant losses (blind to losses is dangerous)
         if pnl > 0:
             send_telegram(
                 f"🟢 +${pnl:.2f}\n"
                 f"💵 Balance: ${state.cash:.2f}\n"
-                f"📅 Daily PnL: ${daily_pnl:.2f}\n"
+                f"📅 Daily: ${daily_pnl:.2f}\n"
                 f"🏦 Lifetime: ${state.realized_pnl_lifetime:.2f}"
+            )
+        elif pnl < -0.50:
+            send_telegram(
+                f"🔴 -${abs(pnl):.2f}\n"
+                f"💵 Balance: ${state.cash:.2f}\n"
+                f"📅 Daily: ${daily_pnl:.2f}"
             )
         return True
 
-    def _size_position(self, cash: float, entry_price: float, signal: Signal) -> int:
-        """Compute contract count using fractional Kelly + hard caps."""
+    def _size_position_fallback(self, cash: float, entry_price: float, signal: Signal) -> int:
+        """Fallback sizing if risk_result not provided. Uses conviction scaling."""
         cfg = self.cfg
-        # Kelly fraction already applied in risk engine; use simple risk_fraction here
-        risk_usd = min(cfg.MAX_POSITION_USD, max(0.5, cash * cfg.RISK_FRACTION))
-        contracts = int(risk_usd / max(entry_price, 0.01))
+        base_risk = min(cfg.MAX_POSITION_USD, max(0.5, cash * cfg.RISK_FRACTION))
+        scaled = base_risk * max(0.25, signal.conviction)
+        contracts = int(scaled / max(entry_price, 0.01))
         return max(1, min(cfg.MAX_CONTRACTS_PER_TRADE, contracts))
 
     @staticmethod

@@ -1,0 +1,11 @@
+{
+  "name": "johnny5-reminder-service",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.9"
+  }
+}

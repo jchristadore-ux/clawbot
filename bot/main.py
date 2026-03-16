@@ -1,115 +1,118 @@
+#!/usr/bin/env python3
 """
-main.py — Johnny5 v13 poll loop.
+main.py — Johnny5 v13
+Entry point. Wires together all core modules and runs the main loop.
 
-v13 KEY CHANGE: Exponential BAD_BOOK backoff + rate-limit sleep.
+v13 CHANGE vs v12: Exponential BAD_BOOK backoff + rate-limit sleep.
 
-The Mar 16 logs showed 81 RATE_LIMITED hits in a single day with zero trades.
-Root cause: the poll loop ran at full speed (poll every 8s) even when every
-single orderbook check returned BAD_BOOK. This burned ~450 API calls/hour on
-empty books.
+Root cause fixed: the poll loop was hitting the Kalshi API at full speed
+(every 8s) even during dead orderbook sessions. This caused 81 RATE_LIMITED
+events on Mar 16 with zero trades. v13 adds exponential backoff on
+consecutive BAD_BOOKs and an explicit sleep after any 429 response.
 
-Fix: track consecutive BAD_BOOK count per ticker. After each BAD_BOOK,
-sleep an additional BAD_BOOK_BACKOFF_BASE * consecutive seconds, capped at
-BAD_BOOK_BACKOFF_MAX. Reset on new bucket or good book. Also sleep
-RATE_LIMIT_BACKOFF seconds immediately after any 429 response.
-
-This reduces dead-session API calls from ~450/hr to ~60/hr while keeping
-reaction time to good books at < 10s.
+Backoff: each consecutive BAD_BOOK on the same ticker adds
+BAD_BOOK_BACKOFF_BASE seconds (default 2s), capped at BAD_BOOK_BACKOFF_MAX
+(default 60s). Resets on any new bucket or good book.
 """
 from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime, timezone
 
 from core.config import cfg
 from core.feature_pipeline import FeaturePipeline
 from core.kalshi_client import KalshiClient
-from core.market_selector import MarketSelector
+from core.market_selector import pick_best_active_market
 from core.notifier import log_event, send_telegram
 from core.position_manager import PositionManager
 from core.risk_engine import RiskEngine
 from core.scheduler import start_health_server, utc_iso
 from core.signal_engine import SignalEngine
-from core.state_store import BotState, StateStore
+from core.state_store import StateStore
 
 
 def main() -> None:
-    warnings = cfg.validate()
-    for w in warnings:
-        log_event("CONFIG_WARNING", {"msg": w})
-
     log_event("BOOT", {
         "version": cfg.BOT_VERSION,
         "live": cfg.LIVE_MODE,
         "series": cfg.SERIES_TICKER,
         "poll_s": cfg.POLL_SECONDS,
         "edge_enter": cfg.EDGE_ENTER,
+        "edge_exit": cfg.EDGE_EXIT,
         "min_z": cfg.MIN_CONVICTION_Z,
         "bad_book_backoff_base": cfg.BAD_BOOK_BACKOFF_BASE,
         "bad_book_backoff_max": cfg.BAD_BOOK_BACKOFF_MAX,
         "kill_switch": cfg.KILL_SWITCH,
+        "dry_run": cfg.DRY_RUN,
     })
 
     start_health_server(cfg.PORT)
 
-    client = KalshiClient(cfg)
     store = StateStore(cfg.STATE_FILE, cfg.GATEWAY_URL)
     state = store.load()
     store.sync_equity_from_postgres(state)
 
-    selector = MarketSelector(cfg, client)
+    client = KalshiClient(cfg)
     features = FeaturePipeline(cfg)
     signal_engine = SignalEngine(cfg)
     risk_engine = RiskEngine(cfg)
-    pos_manager = PositionManager(cfg, client, store)
+    position_mgr = PositionManager(cfg, client, store)
 
     consecutive_errors = 0
-    bad_book_streak = 0       # consecutive BAD_BOOK on current ticker
+    bad_book_streak = 0
     last_ticker = None
-
-    if cfg.LIVE_MODE:
-        send_telegram(f"🤖 Johnny5 {cfg.BOT_VERSION} started — LIVE MODE")
-    else:
-        log_event("PAPER_MODE", {"note": "LIVE_MODE=false — no real orders"})
 
     while True:
         loop_start = time.monotonic()
-
         try:
+            # ── 1. Kill switch ─────────────────────────────────────────────
             if cfg.KILL_SWITCH:
                 if state.has_position and cfg.CLOSE_ON_KILL_SWITCH:
                     log_event("KILL_SWITCH_CLOSE", {})
-                    # position manager will handle close on next book read
                 else:
                     log_event("KILL_SWITCH_IDLE", {}, throttle_key="ks_idle", throttle_s=300)
-                    time.sleep(cfg.POLL_SECONDS)
-                    continue
-
-            # ── Market selection ───────────────────────────────────────────
-            ticker, secs_left = selector.get_active_ticker()
-            if not ticker:
-                log_event("NO_MARKET", {"series": cfg.SERIES_TICKER})
-                bad_book_streak = 0
-                last_ticker = None
                 time.sleep(cfg.POLL_SECONDS)
                 continue
 
+            # ── 2. BTC price ───────────────────────────────────────────────
+            btc_price = features.fetch_btc_price()
+            if btc_price is None:
+                log_event("NO_BTC_PRICE", {}, throttle_key="no_btc", throttle_s=30)
+                time.sleep(max(5.0, cfg.POLL_SECONDS))
+                continue
+
+            features.update(btc_price)
+
+            # ── 3. Market discovery ────────────────────────────────────────
+            markets = client.list_open_markets()
+            market = pick_best_active_market(markets, cfg.SERIES_TICKER)
+            if market is None:
+                log_event("NO_MARKET", {"series": cfg.SERIES_TICKER})
+                bad_book_streak = 0
+                last_ticker = None
+                store.save(state)
+                time.sleep(max(5.0, cfg.POLL_SECONDS))
+                continue
+
+            ticker = market["ticker"]
+            secs_left = market.get("secs_left")
+
+            # ── 4. Bucket tracking ─────────────────────────────────────────
+            features.update_bucket(ticker, btc_price, secs_left)
+
+            # Reset backoff streak on new bucket
             if ticker != last_ticker:
-                log_event("NEW_BUCKET", {
-                    "ticker": ticker,
-                    "btc_open": round(features.current_btc_price or 0, 1),
-                    "secs_left": round(secs_left or 0),
-                })
                 bad_book_streak = 0
                 last_ticker = ticker
                 risk_engine.purge_stale_buckets(ticker)
 
-            # ── Orderbook ─────────────────────────────────────────────────
-            book = client.get_orderbook(ticker)
-            if book is None or not book.is_tradeable(cfg):
+            # ── 5. Orderbook ───────────────────────────────────────────────
+            ob = client.get_orderbook(ticker)
+            book = features.parse_orderbook(ob)
+
+            if book.mark_yes is None:
+                # BAD_BOOK — exponential backoff
                 bad_book_streak += 1
-                # Exponential backoff: base * streak, capped at max
                 extra_sleep = min(
                     cfg.BAD_BOOK_BACKOFF_BASE * bad_book_streak,
                     cfg.BAD_BOOK_BACKOFF_MAX
@@ -119,64 +122,48 @@ def main() -> None:
                     "streak": bad_book_streak,
                     "backoff_s": round(extra_sleep, 1),
                 })
+                store.save(state)
                 elapsed = time.monotonic() - loop_start
-                sleep_for = max(0, cfg.POLL_SECONDS + extra_sleep - elapsed)
-                time.sleep(sleep_for)
+                time.sleep(max(0, cfg.POLL_SECONDS + extra_sleep - elapsed))
                 continue
 
-            # Good book — reset backoff
+            # Good book — reset streak
             bad_book_streak = 0
             consecutive_errors = 0
 
-            # ── BTC price feed ─────────────────────────────────────────────
-            btc = client.get_btc_price()
-            if btc:
-                features.update_price(btc)
+            # ── 6. Signal ──────────────────────────────────────────────────
+            signal = signal_engine.compute(features.get_snapshot(), book)
 
-            # ── Feature snapshot ───────────────────────────────────────────
-            snap = features.snapshot(ticker, secs_left)
+            # ── 7. Exit check ──────────────────────────────────────────────
+            if state.has_position:
+                position_mgr.maybe_exit(state, ticker, book, signal, secs_left)
 
-            # ── Open position: check exit first ───────────────────────────
-            if state.has_position and state.position_ticker == ticker:
-                signal = signal_engine.compute(snap, book)
-                exited = pos_manager.maybe_exit(state, ticker, book, signal, secs_left)
-                if exited:
-                    store.save(state)
-
-            # ── No position: evaluate entry ────────────────────────────────
+            # ── 8. Entry check ─────────────────────────────────────────────
             elif not state.has_position:
-                if snap.is_warmed_up:
-                    signal = signal_engine.compute(snap, book)
-                    risk = risk_engine.check(state, signal, book, secs_left)
-
-                    if risk.approved:
-                        entered = pos_manager.enter(state, ticker, book, signal, risk)
-                        if entered:
-                            store.save(state)
-                    else:
-                        log_event("RISK_BLOCK", {
-                            "ticker": ticker,
-                            "reasons": risk.reasons,
-                            "edge": round(signal.edge, 4) if signal else None,
-                        }, throttle_key=f"risk_{ticker}", throttle_s=30)
+                risk_result = risk_engine.check(state, signal, book, secs_left)
+                if risk_result.approved:
+                    position_mgr.enter(state, ticker, book, signal, risk_result)
                 else:
-                    log_event("WARMUP", {
-                        "prices": snap.price_count,
-                        "needed": cfg.LOOKBACK_SHORT,
-                    }, throttle_key="warmup", throttle_s=60)
+                    log_event("RISK_BLOCK", {
+                        "ticker": ticker,
+                        "reasons": risk_result.reasons,
+                        "edge": round(signal.edge, 4),
+                    }, throttle_key="risk_block", throttle_s=20)
+
+            store.save(state)
 
         except KeyboardInterrupt:
             log_event("SHUTDOWN", {"reason": "keyboard_interrupt"})
             store.save(state)
+            send_telegram("🛑 Johnny5 stopped (KeyboardInterrupt)")
             sys.exit(0)
 
         except Exception as exc:
             consecutive_errors += 1
             err_str = str(exc)
 
-            # Detect rate limiting from exception message
-            is_rate_limited = "429" in err_str or "rate" in err_str.lower()
-
+            # Rate limit — back off immediately
+            is_rate_limited = "429" in err_str or ("rate" in err_str.lower() and "limit" in err_str.lower())
             if is_rate_limited:
                 log_event("RATE_LIMITED", {
                     "err": err_str[:100],
@@ -185,22 +172,27 @@ def main() -> None:
                 time.sleep(cfg.RATE_LIMIT_BACKOFF)
                 continue
 
-            log_event("ERROR", {"err": err_str[:200], "consecutive": consecutive_errors})
+            log_event("ERROR", {
+                "err": err_str[:400],
+                "consecutive": consecutive_errors,
+            }, throttle_key="main_err", throttle_s=10)
 
             if consecutive_errors >= cfg.CIRCUIT_BREAKER_THRESHOLD:
-                log_event("CIRCUIT_BREAKER", {
-                    "consecutive_errors": consecutive_errors,
-                    "last_err": err_str[:100],
-                })
-                send_telegram(f"🔴 Johnny5 circuit breaker triggered: {err_str[:80]}")
+                log_event("CIRCUIT_BREAKER", {"consecutive_errors": consecutive_errors})
+                send_telegram(f"⚠️ Johnny5 CIRCUIT BREAKER: {consecutive_errors} consecutive errors.")
                 consecutive_errors = 0
-                time.sleep(60)
-                continue
+                time.sleep(min(300, consecutive_errors * 15))
+            else:
+                time.sleep(max(10.0, cfg.POLL_SECONDS))
 
-        # ── Standard poll interval ─────────────────────────────────────────
+            try:
+                store.save(state)
+            except Exception:
+                pass
+
+        # ── Standard poll sleep ────────────────────────────────────────────
         elapsed = time.monotonic() - loop_start
-        sleep_for = max(0, cfg.POLL_SECONDS - elapsed)
-        time.sleep(sleep_for)
+        time.sleep(max(0, cfg.POLL_SECONDS - elapsed))
 
 
 if __name__ == "__main__":

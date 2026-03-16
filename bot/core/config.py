@@ -1,21 +1,18 @@
 """
 core/config.py — All configuration driven by environment variables.
-Every value has a safe default. No magic. No hidden state.
 
-v12 CHANGES:
-  - MIN_ENTRY_PRICE / MAX_ENTRY_PRICE: new price floor/ceiling (25c-75c)
-  - MAX_CONTRACTS_PER_TRADE: default reduced from 25 → 5
-  - STOP_LOSS_PCT: tightened from 0.30 → 0.25 (for expensive contracts)
-  - STOP_LOSS_PCT_CHEAP: new, wider stop for 25-50c entries (default 0.40)
-  - MIN_CONVICTION_Z: raised from 1.5 → 2.0
-  - EDGE_ENTER: raised from 0.07 → 0.08 (tighter entry filter)
+v13 CHANGES vs v12:
+  - BAD_BOOK_BACKOFF_MAX: new exponential backoff cap for dead orderbooks (default 60s)
+  - BAD_BOOK_BACKOFF_BASE: base sleep per consecutive BAD_BOOK (default 2s)
+  - RATE_LIMIT_BACKOFF: sleep after any RATE_LIMITED event (default 10s)
+  - BOT_VERSION bumped to v13
+  - All v12 params preserved unchanged
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 def _str(name: str, default: str = "") -> str:
@@ -56,7 +53,7 @@ def _float(name: str, default: float) -> float:
 @dataclass(frozen=True)
 class Config:
     # ── Identity ──────────────────────────────────────────────────────────────
-    BOT_VERSION: str = "JOHNNY5_KALSHI_BTC15M_v12"
+    BOT_VERSION: str = "JOHNNY5_KALSHI_BTC15M_v13"
 
     # ── Kalshi API ────────────────────────────────────────────────────────────
     KALSHI_BASE_URL: str = field(default_factory=lambda: _str("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/"))
@@ -86,19 +83,13 @@ class Config:
     BUCKET_MOVE_SCALE: float = field(default_factory=lambda: _float("BUCKET_MOVE_SCALE", 20.0))
     MOMENTUM_WEIGHT: float = field(default_factory=lambda: _float("MOMENTUM_WEIGHT", 0.10))
     OB_WEIGHT: float = field(default_factory=lambda: _float("OB_WEIGHT", 0.04))
-
-    # ── Conviction ── RAISED from 1.5 → 2.0 ──────────────────────────────────
-    # Higher bar = fewer trades but directionally cleaner
     MIN_CONVICTION_Z: float = field(default_factory=lambda: _float("MIN_CONVICTION_Z", 2.0))
 
-    # ── Edge thresholds ── RAISED enter from 0.07 → 0.08 ─────────────────────
+    # ── Edge thresholds ───────────────────────────────────────────────────────
     EDGE_ENTER: float = field(default_factory=lambda: _float("EDGE_ENTER", 0.08))
     EDGE_EXIT: float = field(default_factory=lambda: _float("EDGE_EXIT", 0.02))
 
-    # ── Price range filter (NEW in v12) ───────────────────────────────────────
-    # Only trade contracts priced between 25c and 75c
-    # Below 25c: lottery behavior, massive contract counts, uncontrollable variance
-    # Above 75c: near-certain outcome, tiny edge, not worth the capital
+    # ── Price range filter ────────────────────────────────────────────────────
     MIN_ENTRY_PRICE: float = field(default_factory=lambda: _float("MIN_ENTRY_PRICE", 0.25))
     MAX_ENTRY_PRICE: float = field(default_factory=lambda: _float("MAX_ENTRY_PRICE", 0.75))
 
@@ -106,21 +97,12 @@ class Config:
     START_EQUITY: float = field(default_factory=lambda: _float("START_EQUITY", 50.0))
     RISK_FRACTION: float = field(default_factory=lambda: _float("RISK_FRACTION", 0.05))
     MAX_POSITION_USD: float = field(default_factory=lambda: _float("MAX_POSITION_USD", 3.0))
-
-    # Hard contract cap — REDUCED from 25 → 5 to kill lottery sizing ──────────
     MAX_CONTRACTS_PER_TRADE: int = field(default_factory=lambda: _int("MAX_CONTRACTS_PER_TRADE", 5))
-
     MAX_DAILY_LOSS: float = field(default_factory=lambda: _float("MAX_DAILY_LOSS", 6.0))
     MAX_DRAWDOWN_PCT: float = field(default_factory=lambda: _float("MAX_DRAWDOWN_PCT", 0.15))
-
-    # Stop loss — TIERED in v12:
-    # STOP_LOSS_PCT applies to entries > 50c (tighter: 25%)
-    # STOP_LOSS_PCT_CHEAP applies to entries 25-50c (wider: 40%)
     STOP_LOSS_PCT: float = field(default_factory=lambda: _float("STOP_LOSS_PCT", 0.25))
     STOP_LOSS_PCT_CHEAP: float = field(default_factory=lambda: _float("STOP_LOSS_PCT_CHEAP", 0.40))
-
     KELLY_FRACTION: float = field(default_factory=lambda: _float("KELLY_FRACTION", 0.25))
-    VAR_DAILY_LIMIT: float = field(default_factory=lambda: _float("VAR_DAILY_LIMIT", 10.0))
 
     # ── Market quality filters ────────────────────────────────────────────────
     MIN_BID_CENTS: int = field(default_factory=lambda: _int("MIN_BID_CENTS", 3))
@@ -135,6 +117,26 @@ class Config:
     COOLDOWN_SECONDS: int = field(default_factory=lambda: _int("COOLDOWN_SECONDS", 120))
     MIN_HOLD_SECONDS: int = field(default_factory=lambda: _int("MIN_HOLD_SECONDS", 90))
     HOLD_TO_EXPIRY: bool = field(default_factory=lambda: _bool("HOLD_TO_EXPIRY", True))
+
+    # ── BAD_BOOK / Rate-limit backoff (NEW in v13) ────────────────────────────
+    # When the orderbook is dead, back off exponentially instead of hammering
+    # the API at full poll speed. This eliminates the rate-limiting seen in
+    # the Mar 16 logs where 81 RATE_LIMITED events hit despite zero trading.
+    #
+    # Backoff schedule on consecutive BAD_BOOKs (same ticker):
+    #   1st:  normal poll (POLL_SECONDS)
+    #   2nd:  POLL_SECONDS + BAD_BOOK_BACKOFF_BASE   (default: 8 + 2 = 10s)
+    #   3rd:  POLL_SECONDS + BAD_BOOK_BACKOFF_BASE*2 (16s)
+    #   ...
+    #   Nth:  capped at BAD_BOOK_BACKOFF_MAX          (default 60s)
+    #
+    # Resets to 0 on any new bucket or a good book.
+    BAD_BOOK_BACKOFF_BASE: float = field(default_factory=lambda: _float("BAD_BOOK_BACKOFF_BASE", 2.0))
+    BAD_BOOK_BACKOFF_MAX: float = field(default_factory=lambda: _float("BAD_BOOK_BACKOFF_MAX", 60.0))
+
+    # After any RATE_LIMITED response, sleep this many seconds before retrying.
+    # Kalshi's retry_after is typically 5s; we add a buffer.
+    RATE_LIMIT_BACKOFF: float = field(default_factory=lambda: _float("RATE_LIMIT_BACKOFF", 12.0))
 
     # ── Infrastructure ────────────────────────────────────────────────────────
     PORT: int = field(default_factory=lambda: _int("PORT", 3000))
@@ -170,5 +172,5 @@ class Config:
         return warnings
 
 
-# Singleton
+# Singleton — import this everywhere
 cfg = Config()

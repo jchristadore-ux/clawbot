@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-main.py — Johnny5 v13
-Entry point. Wires together all core modules and runs the main loop.
+main.py — Johnny5 v13 (patched)
 
-v13 CHANGE vs v12: Exponential BAD_BOOK backoff + rate-limit sleep.
+Changes from v13 initial:
+  1. NO_MARKET backoff — same exponential logic as BAD_BOOK.
+     The 06:00-09:00 UTC gap on Mar 19 produced 1,354 NO_MARKET events
+     in 90 minutes (8 calls/min). Now backs off on consecutive NO_MARKETs.
 
-Root cause fixed: the poll loop was hitting the Kalshi API at full speed
-(every 8s) even during dead orderbook sessions. This caused 81 RATE_LIMITED
-events on Mar 16 with zero trades. v13 adds exponential backoff on
-consecutive BAD_BOOKs and an explicit sleep after any 429 response.
+  2. MAX_SECS_BEFORE_EXPIRY raised to 900s in config. Separately, the
+     bucket_too_new check now uses a SOFT block (logs SKIP_NEW_BUCKET)
+     instead of accumulating in the RISK_BLOCK reasons — so the bot
+     still polls the book and can enter when secs_left drops into range
+     within the same bucket. This fixes the case where 18/30 buckets
+     were opening with secs_left > 860 and being silently blocked.
 
-Backoff: each consecutive BAD_BOOK on the same ticker adds
-BAD_BOOK_BACKOFF_BASE seconds (default 2s), capped at BAD_BOOK_BACKOFF_MAX
-(default 60s). Resets on any new bucket or good book.
+  3. SIGNAL debug logging added when DEBUG_MODEL=true — emits signal
+     quality every 30s when book is good so we can see exactly what
+     z/edge/conviction the model is producing without a trade firing.
+     Without this we're flying blind on whether the signal itself is
+     the issue vs the filters.
 """
 from __future__ import annotations
 
@@ -40,8 +46,10 @@ def main() -> None:
         "edge_enter": cfg.EDGE_ENTER,
         "edge_exit": cfg.EDGE_EXIT,
         "min_z": cfg.MIN_CONVICTION_Z,
+        "max_secs": cfg.MAX_SECS_BEFORE_EXPIRY,
         "bad_book_backoff_base": cfg.BAD_BOOK_BACKOFF_BASE,
         "bad_book_backoff_max": cfg.BAD_BOOK_BACKOFF_MAX,
+        "no_market_backoff_max": cfg.NO_MARKET_BACKOFF_MAX,
         "kill_switch": cfg.KILL_SWITCH,
         "dry_run": cfg.DRY_RUN,
     })
@@ -60,6 +68,7 @@ def main() -> None:
 
     consecutive_errors = 0
     bad_book_streak = 0
+    no_market_streak = 0
     last_ticker = None
 
     while True:
@@ -87,12 +96,25 @@ def main() -> None:
             markets = client.list_open_markets()
             market = pick_best_active_market(markets, cfg.SERIES_TICKER)
             if market is None:
-                log_event("NO_MARKET", {"series": cfg.SERIES_TICKER})
+                no_market_streak += 1
+                extra_sleep = min(
+                    cfg.BAD_BOOK_BACKOFF_BASE * no_market_streak,
+                    cfg.NO_MARKET_BACKOFF_MAX,
+                )
+                log_event("NO_MARKET", {
+                    "series": cfg.SERIES_TICKER,
+                    "streak": no_market_streak,
+                    "backoff_s": round(extra_sleep, 1),
+                })
                 bad_book_streak = 0
                 last_ticker = None
                 store.save(state)
-                time.sleep(max(5.0, cfg.POLL_SECONDS))
+                elapsed = time.monotonic() - loop_start
+                time.sleep(max(0, cfg.POLL_SECONDS + extra_sleep - elapsed))
                 continue
+
+            # Good market — reset NO_MARKET streak
+            no_market_streak = 0
 
             ticker = market["ticker"]
             secs_left = market.get("secs_left")
@@ -100,7 +122,6 @@ def main() -> None:
             # ── 4. Bucket tracking ─────────────────────────────────────────
             features.update_bucket(ticker, btc_price, secs_left)
 
-            # Reset backoff streak on new bucket
             if ticker != last_ticker:
                 bad_book_streak = 0
                 last_ticker = ticker
@@ -111,11 +132,10 @@ def main() -> None:
             book = features.parse_orderbook(ob)
 
             if book.mark_yes is None:
-                # BAD_BOOK — exponential backoff
                 bad_book_streak += 1
                 extra_sleep = min(
                     cfg.BAD_BOOK_BACKOFF_BASE * bad_book_streak,
-                    cfg.BAD_BOOK_BACKOFF_MAX
+                    cfg.BAD_BOOK_BACKOFF_MAX,
                 )
                 log_event("BAD_BOOK", {
                     "ticker": ticker,
@@ -134,21 +154,43 @@ def main() -> None:
             # ── 6. Signal ──────────────────────────────────────────────────
             signal = signal_engine.compute(features.get_snapshot(), book)
 
+            # Debug signal even when no trade fires — critical for diagnosis
+            if cfg.DEBUG_MODEL:
+                log_event("SIGNAL_PROBE", {
+                    "ticker": ticker,
+                    "fair": round(signal.fair_yes, 4),
+                    "mark": round(signal.mark_yes, 4),
+                    "edge": round(signal.edge, 4),
+                    "z": round(signal.z, 3),
+                    "side": signal.side,
+                    "entry_cents": signal.entry_cents,
+                    "secs_left": round(secs_left) if secs_left else None,
+                }, throttle_key="sig_probe", throttle_s=30)
+
             # ── 7. Exit check ──────────────────────────────────────────────
             if state.has_position:
                 position_mgr.maybe_exit(state, ticker, book, signal, secs_left)
 
             # ── 8. Entry check ─────────────────────────────────────────────
             elif not state.has_position:
-                risk_result = risk_engine.check(state, signal, book, secs_left)
-                if risk_result.approved:
-                    position_mgr.enter(state, ticker, book, signal, risk_result)
+                # Soft bucket-too-new check: log and skip but keep polling
+                # (old hard check in risk_engine blocked for entire bucket)
+                if secs_left is not None and secs_left > cfg.MAX_SECS_BEFORE_EXPIRY:
+                    log_event("SKIP_NEW_BUCKET", {
+                        "secs_left": round(secs_left),
+                        "max": cfg.MAX_SECS_BEFORE_EXPIRY,
+                    }, throttle_key=f"skip_new_{ticker}", throttle_s=60)
                 else:
-                    log_event("RISK_BLOCK", {
-                        "ticker": ticker,
-                        "reasons": risk_result.reasons,
-                        "edge": round(signal.edge, 4),
-                    }, throttle_key="risk_block", throttle_s=20)
+                    risk_result = risk_engine.check(state, signal, book, secs_left)
+                    if risk_result.approved:
+                        position_mgr.enter(state, ticker, book, signal, risk_result)
+                    else:
+                        log_event("RISK_BLOCK", {
+                            "ticker": ticker,
+                            "reasons": risk_result.reasons,
+                            "edge": round(signal.edge, 4),
+                            "z": round(signal.z, 3),
+                        }, throttle_key="risk_block", throttle_s=20)
 
             store.save(state)
 
@@ -162,7 +204,6 @@ def main() -> None:
             consecutive_errors += 1
             err_str = str(exc)
 
-            # Rate limit — back off immediately
             is_rate_limited = "429" in err_str or ("rate" in err_str.lower() and "limit" in err_str.lower())
             if is_rate_limited:
                 log_event("RATE_LIMITED", {

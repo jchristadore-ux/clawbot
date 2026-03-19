@@ -1,12 +1,15 @@
 """
 core/config.py — All configuration driven by environment variables.
 
-v13 CHANGES vs v12:
-  - BAD_BOOK_BACKOFF_MAX: new exponential backoff cap for dead orderbooks (default 60s)
-  - BAD_BOOK_BACKOFF_BASE: base sleep per consecutive BAD_BOOK (default 2s)
-  - RATE_LIMIT_BACKOFF: sleep after any RATE_LIMITED event (default 10s)
-  - BOT_VERSION bumped to v13
-  - All v12 params preserved unchanged
+v13 patch changes vs v13 initial:
+  - NO_MARKET_BACKOFF_MAX: new cap for NO_MARKET exponential backoff (default 30s)
+    Same base as BAD_BOOK (BAD_BOOK_BACKOFF_BASE), different cap since
+    NO_MARKET gaps are shorter (bucket rollover) vs BAD_BOOK (illiquid all day)
+  - MAX_SECS_BEFORE_EXPIRY: raised from 860 → 900. The old value blocked 18/30
+    buckets on Mar 19 because they open with secs_left ~860-892. Now the
+    bucket_too_new check is also moved to a soft skip in main.py (not in
+    risk_engine) so the bot keeps polling within the same bucket.
+  - BOT_VERSION bumped — still v13, patch noted in version string
 """
 from __future__ import annotations
 
@@ -109,7 +112,14 @@ class Config:
     MAX_BID_CENTS: int = field(default_factory=lambda: _int("MAX_BID_CENTS", 97))
     MIN_TOP_QTY: int = field(default_factory=lambda: _int("MIN_TOP_QTY", 2))
     MIN_SECS_BEFORE_EXPIRY: int = field(default_factory=lambda: _int("MIN_SECS_BEFORE_EXPIRY", 90))
-    MAX_SECS_BEFORE_EXPIRY: int = field(default_factory=lambda: _int("MAX_SECS_BEFORE_EXPIRY", 860))
+
+    # ── RAISED from 860 → 900 ────────────────────────────────────────────────
+    # Mar 19 data: 18 of 30 sampled buckets opened with secs_left 861-892,
+    # which were all blocked by the old 860s ceiling. A 15-min bucket is 900s
+    # total; setting the max to 900 means we start evaluating immediately when
+    # a new bucket opens. The soft skip in main.py handles the early window.
+    MAX_SECS_BEFORE_EXPIRY: int = field(default_factory=lambda: _int("MAX_SECS_BEFORE_EXPIRY", 900))
+
     MAX_SPREAD_CENTS: int = field(default_factory=lambda: _int("MAX_SPREAD_CENTS", 15))
 
     # ── Timing ────────────────────────────────────────────────────────────────
@@ -118,24 +128,17 @@ class Config:
     MIN_HOLD_SECONDS: int = field(default_factory=lambda: _int("MIN_HOLD_SECONDS", 90))
     HOLD_TO_EXPIRY: bool = field(default_factory=lambda: _bool("HOLD_TO_EXPIRY", True))
 
-    # ── BAD_BOOK / Rate-limit backoff (NEW in v13) ────────────────────────────
-    # When the orderbook is dead, back off exponentially instead of hammering
-    # the API at full poll speed. This eliminates the rate-limiting seen in
-    # the Mar 16 logs where 81 RATE_LIMITED events hit despite zero trading.
-    #
-    # Backoff schedule on consecutive BAD_BOOKs (same ticker):
-    #   1st:  normal poll (POLL_SECONDS)
-    #   2nd:  POLL_SECONDS + BAD_BOOK_BACKOFF_BASE   (default: 8 + 2 = 10s)
-    #   3rd:  POLL_SECONDS + BAD_BOOK_BACKOFF_BASE*2 (16s)
-    #   ...
-    #   Nth:  capped at BAD_BOOK_BACKOFF_MAX          (default 60s)
-    #
-    # Resets to 0 on any new bucket or a good book.
+    # ── BAD_BOOK backoff (v13) ────────────────────────────────────────────────
     BAD_BOOK_BACKOFF_BASE: float = field(default_factory=lambda: _float("BAD_BOOK_BACKOFF_BASE", 2.0))
     BAD_BOOK_BACKOFF_MAX: float = field(default_factory=lambda: _float("BAD_BOOK_BACKOFF_MAX", 60.0))
 
-    # After any RATE_LIMITED response, sleep this many seconds before retrying.
-    # Kalshi's retry_after is typically 5s; we add a buffer.
+    # ── NO_MARKET backoff (v13 patch) ─────────────────────────────────────────
+    # Uses same BAD_BOOK_BACKOFF_BASE but a shorter cap (30s vs 60s).
+    # NO_MARKET gaps are usually just bucket rollover (a few seconds), not
+    # hour-long dead sessions, so we don't need to back off as aggressively.
+    NO_MARKET_BACKOFF_MAX: float = field(default_factory=lambda: _float("NO_MARKET_BACKOFF_MAX", 30.0))
+
+    # ── Rate limit backoff ────────────────────────────────────────────────────
     RATE_LIMIT_BACKOFF: float = field(default_factory=lambda: _float("RATE_LIMIT_BACKOFF", 12.0))
 
     # ── Infrastructure ────────────────────────────────────────────────────────
@@ -172,5 +175,5 @@ class Config:
         return warnings
 
 
-# Singleton — import this everywhere
+# Singleton
 cfg = Config()
